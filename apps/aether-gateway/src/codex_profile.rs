@@ -509,7 +509,7 @@ pub(crate) fn codex_account_selection_key(
     key_name.trim().to_string()
 }
 
-fn codex_auth_account_id(auth_config_raw: Option<&str>) -> Option<String> {
+pub(crate) fn codex_auth_account_id(auth_config_raw: Option<&str>) -> Option<String> {
     let raw = auth_config_raw?.trim();
     if raw.is_empty() {
         return None;

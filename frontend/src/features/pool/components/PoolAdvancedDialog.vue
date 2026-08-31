@@ -731,12 +731,14 @@ import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { parseApiError } from '@/utils/errorParser'
 import {
+  getProvider,
   refreshCodexPoolClientProfiles,
   resolvePoolKeySelection,
   updateProvider,
 } from '@/api/endpoints'
 import {
   buildDefaultCodexClientHeaderProfiles,
+  buildCodexClientHeadersConfig,
   buildPoolCooldownFieldLayout,
   buildPoolCostFieldLayout,
   buildPoolHealthToggleCards,
@@ -747,7 +749,6 @@ import {
 import type {
   PoolAdvancedConfig,
   ClaudeCodeAdvancedConfig,
-  PoolCodexClientHeadersConfig,
   ProviderWithEndpointsSummary,
 } from '@/api/endpoints/types/provider'
 
@@ -882,22 +883,13 @@ function clearCodexHeaderProfiles(): void {
   codexHeaderForm.value.profiles = []
 }
 
-function buildCodexClientHeadersConfig(): PoolCodexClientHeadersConfig {
-  const profiles = codexHeaderForm.value.profiles
-    .map((profile) => ({
-      user_agent: profile.user_agent.trim(),
-      originator: profile.originator.trim(),
-    }))
-    .filter((profile) => profile.user_agent && profile.originator)
-  return {
-    enabled: codexHeaderForm.value.enabled,
-    profiles: profiles.length > 0 ? profiles : undefined,
-  }
-}
-
 async function handleRefreshCodexHeaders(): Promise<void> {
   refreshingCodexHeaders.value = true
   try {
+    const clientHeaders = buildCodexClientHeadersConfig(
+      codexHeaderForm.value.enabled,
+      codexHeaderForm.value.profiles,
+    )
     const selection = await resolvePoolKeySelection(props.providerId, {})
     if (selection.total === 0) {
       warning('当前号池没有可更新的账号')
@@ -911,17 +903,12 @@ async function handleRefreshCodexHeaders(): Promise<void> {
     })
     if (!confirmed) return
 
-    const poolAdvanced: PoolAdvancedConfig = {
-      ...(props.currentConfig ?? {}),
-      codex_client_headers: buildCodexClientHeadersConfig(),
-    }
-    const updatedProvider = await updateProvider(props.providerId, {
-      pool_advanced: poolAdvanced,
-    })
     const result = await refreshCodexPoolClientProfiles(
       props.providerId,
       selection.items.map((item) => item.key_id),
+      clientHeaders,
     )
+    const updatedProvider = await getProvider(props.providerId)
     success(`已更新 ${result.affected} 个账号的 UA`)
     emit('saved', updatedProvider)
   } catch (err) {
@@ -1111,7 +1098,10 @@ async function handleSave() {
     }
 
     if (isCodex.value) {
-      poolAdvanced.codex_client_headers = buildCodexClientHeadersConfig()
+      poolAdvanced.codex_client_headers = buildCodexClientHeadersConfig(
+        codexHeaderForm.value.enabled,
+        codexHeaderForm.value.profiles,
+      )
     } else {
       delete poolAdvanced.codex_client_headers
     }

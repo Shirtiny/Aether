@@ -816,6 +816,83 @@ impl AppState {
         self.finish_provider_catalog_write(lock, result).await
     }
 
+    pub(crate) async fn update_provider_catalog_codex_client_headers_and_key_fingerprints(
+        &self,
+        provider_id: &str,
+        client_headers: &serde_json::Value,
+        updated_at_unix_secs: u64,
+        keys: &[provider_catalog::StoredProviderCatalogKey],
+    ) -> Result<Option<usize>, GatewayError> {
+        let lock = crate::codex_ws::hot_state::begin_catalog_write_lock(self).await?;
+        let result = self
+            .update_provider_catalog_codex_client_headers_and_key_fingerprints_locked(
+                provider_id,
+                client_headers,
+                updated_at_unix_secs,
+                keys,
+                &lock,
+            )
+            .await;
+        self.finish_provider_catalog_write(lock, result).await
+    }
+
+    async fn update_provider_catalog_codex_client_headers_and_key_fingerprints_locked(
+        &self,
+        provider_id: &str,
+        client_headers: &serde_json::Value,
+        updated_at_unix_secs: u64,
+        keys: &[provider_catalog::StoredProviderCatalogKey],
+        write_lock: &crate::codex_ws::hot_state::CodexWsCatalogWriteLock,
+    ) -> Result<Option<usize>, GatewayError> {
+        let mutation = crate::codex_ws::hot_state::begin_catalog_hot_mutation(self).await?;
+        let write_result =
+            match crate::codex_ws::hot_state::confirm_catalog_write_lock(self, write_lock).await {
+                Ok(()) => self
+                    .data
+                    .update_provider_catalog_codex_client_headers_and_key_fingerprints(
+                        provider_id,
+                        client_headers,
+                        updated_at_unix_secs,
+                        keys,
+                    )
+                    .await
+                    .map_err(|err| GatewayError::Internal(err.to_string())),
+                Err(err) => Err(err),
+            };
+        let confirm_result = if write_result.is_ok() {
+            crate::codex_ws::hot_state::confirm_catalog_write_lock(self, write_lock).await
+        } else {
+            Ok(())
+        };
+        let finish_result =
+            crate::codex_ws::hot_state::finish_catalog_hot_mutation(self, mutation).await;
+
+        let updated = match write_result {
+            Ok(updated) => updated,
+            Err(err) => {
+                return match finish_result {
+                    Ok(()) => Err(err),
+                    Err(finish_err) => Err(GatewayError::Internal(format!(
+                        "{err:?}; failed to restore catalog hot state: {finish_err:?}"
+                    ))),
+                };
+            }
+        };
+        if let Err(err) = confirm_result {
+            return match finish_result {
+                Ok(()) => Err(err),
+                Err(finish_err) => Err(GatewayError::Internal(format!(
+                    "{err:?}; failed to restore catalog hot state: {finish_err:?}"
+                ))),
+            };
+        }
+        finish_result?;
+        if updated.is_some() {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(updated)
+    }
+
     async fn update_provider_catalog_provider_locked(
         &self,
         provider: &provider_catalog::StoredProviderCatalogProvider,

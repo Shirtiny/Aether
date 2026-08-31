@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  buildCodexClientHeadersConfig,
   buildDefaultCodexClientHeaderProfiles,
   buildPoolCooldownFieldLayout,
   buildPoolHealthToggleCards,
@@ -16,6 +17,16 @@ describe('poolAdvancedDialog', () => {
     expect(profiles).toHaveLength(32)
     expect(new Set(profiles.map(profile => profile.user_agent)).size).toBe(32)
     expect(profiles.every(profile => /\/0\.(149|150|151)/.test(profile.user_agent))).toBe(true)
+  })
+
+  it('rejects incomplete or duplicate Codex client header rows', () => {
+    expect(() => buildCodexClientHeadersConfig(true, [
+      { user_agent: 'codex-tui/0.151.0', originator: '' },
+    ])).toThrow('第 1 组')
+    expect(() => buildCodexClientHeadersConfig(true, [
+      { user_agent: 'codex-tui/0.151.0', originator: 'codex-tui' },
+      { user_agent: ' codex-tui/0.151.0 ', originator: 'codex-tui' },
+    ])).toThrow('重复')
   })
 
   it('returns health toggle cards in the desktop display order', () => {

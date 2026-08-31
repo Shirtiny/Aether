@@ -2,10 +2,11 @@ use async_trait::async_trait;
 use sqlx::{mysql::MySqlRow, MySql, QueryBuilder, Row};
 
 use super::{
-    InMemoryProviderCatalogReadRepository, ProviderCatalogKeyListQuery,
-    ProviderCatalogReadRepository, ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint,
-    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
-    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    config_with_codex_client_headers, InMemoryProviderCatalogReadRepository,
+    ProviderCatalogKeyListQuery, ProviderCatalogReadRepository, ProviderCatalogWriteRepository,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
+    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
 use crate::driver::mysql::MysqlPool;
 use crate::error::SqlResultExt;
@@ -301,6 +302,106 @@ WHERE id = ?
             )));
         }
         self.reload_provider(&provider.id, "updated").await
+    }
+
+    pub async fn update_codex_client_headers_and_key_fingerprints(
+        &self,
+        provider_id: &str,
+        client_headers: &serde_json::Value,
+        updated_at_unix_secs: u64,
+        keys: &[StoredProviderCatalogKey],
+    ) -> Result<usize, DataLayerError> {
+        if provider_id.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog provider_id is empty".to_string(),
+            ));
+        }
+        if keys.iter().any(|key| {
+            key.id.trim().is_empty()
+                || key.provider_id.trim().is_empty()
+                || key.provider_id != provider_id
+        }) {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog key fingerprint update has an invalid provider binding"
+                    .to_string(),
+            ));
+        }
+
+        let key_updates = keys
+            .iter()
+            .map(|key| {
+                Ok((
+                    &key.id,
+                    optional_json_to_string(&key.fingerprint, "provider_api_keys.fingerprint")?,
+                    key.updated_at_unix_secs.unwrap_or_else(current_unix_secs) as i64,
+                ))
+            })
+            .collect::<Result<Vec<_>, DataLayerError>>()?;
+
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let current_config = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT config FROM providers WHERE id = ? FOR UPDATE",
+        )
+        .bind(provider_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_sql_err()?
+        .ok_or_else(|| {
+            DataLayerError::UnexpectedValue(format!(
+                "provider catalog provider {provider_id} not found"
+            ))
+        })?;
+        let current_config = optional_json_from_string(current_config, "providers.config")?;
+        let updated_config = config_with_codex_client_headers(current_config, client_headers)?;
+        let provider_config = optional_json_to_string(&Some(updated_config), "providers.config")?;
+        sqlx::query(
+            r#"
+UPDATE providers
+SET config = ?, updated_at = ?
+WHERE id = ?
+"#,
+        )
+        .bind(provider_config)
+        .bind(updated_at_unix_secs as i64)
+        .bind(provider_id)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+
+        for (key_id, fingerprint, updated_at) in key_updates {
+            let key_exists = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM provider_api_keys WHERE id = ? AND provider_id = ? FOR UPDATE",
+            )
+            .bind(key_id)
+            .bind(provider_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?
+            .is_some();
+            if !key_exists {
+                return Err(DataLayerError::UnexpectedValue(format!(
+                    "provider catalog key {key_id} not found for provider {}",
+                    provider_id
+                )));
+            }
+            sqlx::query(
+                r#"
+UPDATE provider_api_keys
+SET fingerprint = ?, updated_at = ?
+WHERE id = ? AND provider_id = ?
+"#,
+            )
+            .bind(fingerprint)
+            .bind(updated_at)
+            .bind(key_id)
+            .bind(provider_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        }
+
+        tx.commit().await.map_sql_err()?;
+        Ok(keys.len())
     }
 
     pub async fn delete_provider(&self, provider_id: &str) -> Result<bool, DataLayerError> {
@@ -1071,6 +1172,23 @@ impl ProviderCatalogWriteRepository for MysqlProviderCatalogReadRepository {
         provider: &StoredProviderCatalogProvider,
     ) -> Result<StoredProviderCatalogProvider, DataLayerError> {
         Self::update_provider(self, provider).await
+    }
+
+    async fn update_codex_client_headers_and_key_fingerprints(
+        &self,
+        provider_id: &str,
+        client_headers: &serde_json::Value,
+        updated_at_unix_secs: u64,
+        keys: &[StoredProviderCatalogKey],
+    ) -> Result<usize, DataLayerError> {
+        Self::update_codex_client_headers_and_key_fingerprints(
+            self,
+            provider_id,
+            client_headers,
+            updated_at_unix_secs,
+            keys,
+        )
+        .await
     }
 
     async fn delete_provider(&self, provider_id: &str) -> Result<bool, DataLayerError> {

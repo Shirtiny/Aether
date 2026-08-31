@@ -44,6 +44,7 @@ pub struct AdminPoolBatchActionPlan {
     pub key_ids: Vec<String>,
     pub action: AdminPoolBatchActionKind,
     pub action_label: &'static str,
+    pub action_payload: Option<Value>,
     pub proxy_payload: Option<Value>,
 }
 
@@ -445,9 +446,10 @@ pub fn build_admin_pool_batch_action_plan(
         return Err("key_ids should not be empty".to_string());
     }
 
+    let action_payload = payload.payload;
     let proxy_payload = if action_kind == AdminPoolBatchActionKind::SetProxy {
-        match payload.payload {
-            Some(Value::Object(map)) if !map.is_empty() => Some(Value::Object(map)),
+        match action_payload.as_ref() {
+            Some(Value::Object(map)) if !map.is_empty() => Some(Value::Object(map.clone())),
             _ => {
                 return Err(
                     "set_proxy action requires a non-empty payload with proxy config".to_string(),
@@ -462,6 +464,7 @@ pub fn build_admin_pool_batch_action_plan(
         key_ids,
         action: action_kind,
         action_label,
+        action_payload,
         proxy_payload,
     })
 }

@@ -63,10 +63,11 @@ pub(crate) use self::planner::{
     record_local_runtime_candidate_skip_reason, refresh_codex_pool_key_fingerprint,
     resolve_codex_pool_concrete_account_profile,
     set_local_openai_chat_execution_exhausted_diagnostic,
-    set_local_openai_image_execution_exhausted_diagnostic, CandidateFailureDiagnostic,
-    CandidateFailureDiagnosticKind, EligibleLocalExecutionCandidate, GatewayAuthApiKeySnapshot,
-    GatewayProviderTransportSnapshot, LocalExecutionAttemptSource, LocalExecutionCandidateKind,
-    LocalResolvedOAuthRequestAuth, PlannerAppState, SkippedLocalExecutionCandidate,
+    set_local_openai_image_execution_exhausted_diagnostic, validate_codex_client_header_config,
+    CandidateFailureDiagnostic, CandidateFailureDiagnosticKind, EligibleLocalExecutionCandidate,
+    GatewayAuthApiKeySnapshot, GatewayProviderTransportSnapshot, LocalExecutionAttemptSource,
+    LocalExecutionCandidateKind, LocalResolvedOAuthRequestAuth, PlannerAppState,
+    SkippedLocalExecutionCandidate,
 };
 pub(crate) use self::planner::{
     openai_compaction_version, COMPACTION_IS_COMPACTION_METADATA_KEY,

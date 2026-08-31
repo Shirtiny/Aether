@@ -3,10 +3,10 @@ use futures_util::TryStreamExt;
 use sqlx::{postgres::PgRow, PgPool, Postgres, QueryBuilder, Row};
 
 use super::{
-    ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery, ProviderCatalogReadRepository,
-    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
-    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
-    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    config_with_codex_client_headers, ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
+    ProviderCatalogReadRepository, ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
 use crate::repository::usage::{
     cap_provider_api_key_total_response_time_ms, clamp_provider_api_key_total_response_time_ms,
@@ -1009,6 +1009,102 @@ WHERE id = $1
                     provider.id
                 ))
             })
+    }
+
+    pub async fn update_codex_client_headers_and_key_fingerprints(
+        &self,
+        provider_id: &str,
+        client_headers: &serde_json::Value,
+        updated_at_unix_secs: u64,
+        keys: &[StoredProviderCatalogKey],
+    ) -> Result<usize, DataLayerError> {
+        if provider_id.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog provider_id is empty".to_string(),
+            ));
+        }
+        if keys.iter().any(|key| {
+            key.id.trim().is_empty()
+                || key.provider_id.trim().is_empty()
+                || key.provider_id != provider_id
+        }) {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog key fingerprint update has an invalid provider binding"
+                    .to_string(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await.map_postgres_err()?;
+        let current_config = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT config FROM providers WHERE id = $1 FOR UPDATE",
+        )
+        .bind(provider_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_postgres_err()?
+        .ok_or_else(|| {
+            DataLayerError::UnexpectedValue(format!(
+                "provider catalog provider {provider_id} not found"
+            ))
+        })?;
+        let updated_config = config_with_codex_client_headers(current_config, client_headers)?;
+        let provider_rows = sqlx::query(
+            r#"
+UPDATE providers
+SET
+  config = $2,
+  updated_at = CASE
+    WHEN $3::double precision IS NULL THEN NOW()
+    ELSE TO_TIMESTAMP($3::double precision)
+  END
+WHERE id = $1
+"#,
+        )
+        .bind(provider_id)
+        .bind(&updated_config)
+        .bind(updated_at_unix_secs as f64)
+        .execute(&mut *tx)
+        .await
+        .map_postgres_err()?
+        .rows_affected();
+        if provider_rows != 1 {
+            return Err(DataLayerError::UnexpectedValue(format!(
+                "provider catalog provider {} not found",
+                provider_id
+            )));
+        }
+
+        for key in keys {
+            let rows = sqlx::query(
+                r#"
+UPDATE provider_api_keys
+SET
+  fingerprint = $3,
+  updated_at = CASE
+    WHEN $4::double precision IS NULL THEN NOW()
+    ELSE TO_TIMESTAMP($4::double precision)
+  END
+WHERE id = $1 AND provider_id = $2
+"#,
+            )
+            .bind(&key.id)
+            .bind(provider_id)
+            .bind(&key.fingerprint)
+            .bind(key.updated_at_unix_secs.map(|value| value as f64))
+            .execute(&mut *tx)
+            .await
+            .map_postgres_err()?
+            .rows_affected();
+            if rows != 1 {
+                return Err(DataLayerError::UnexpectedValue(format!(
+                    "provider catalog key {} not found for provider {}",
+                    key.id, provider_id
+                )));
+            }
+        }
+
+        tx.commit().await.map_err(postgres_error)?;
+        Ok(keys.len())
     }
 
     pub async fn delete_provider(&self, provider_id: &str) -> Result<bool, DataLayerError> {
@@ -2067,6 +2163,23 @@ impl ProviderCatalogWriteRepository for SqlxProviderCatalogReadRepository {
         provider: &StoredProviderCatalogProvider,
     ) -> Result<StoredProviderCatalogProvider, DataLayerError> {
         Self::update_provider(self, provider).await
+    }
+
+    async fn update_codex_client_headers_and_key_fingerprints(
+        &self,
+        provider_id: &str,
+        client_headers: &serde_json::Value,
+        updated_at_unix_secs: u64,
+        keys: &[StoredProviderCatalogKey],
+    ) -> Result<usize, DataLayerError> {
+        Self::update_codex_client_headers_and_key_fingerprints(
+            self,
+            provider_id,
+            client_headers,
+            updated_at_unix_secs,
+            keys,
+        )
+        .await
     }
 
     async fn delete_provider(&self, provider_id: &str) -> Result<bool, DataLayerError> {

@@ -439,6 +439,31 @@ impl GatewayDataState {
         Ok(updated)
     }
 
+    pub(crate) async fn update_provider_catalog_codex_client_headers_and_key_fingerprints(
+        &self,
+        provider_id: &str,
+        client_headers: &serde_json::Value,
+        updated_at_unix_secs: u64,
+        keys: &[StoredProviderCatalogKey],
+    ) -> Result<Option<usize>, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => repository
+                .update_codex_client_headers_and_key_fingerprints(
+                    provider_id,
+                    client_headers,
+                    updated_at_unix_secs,
+                    keys,
+                )
+                .await
+                .map(Some),
+            None => Ok(None),
+        }?;
+        if updated.is_some() {
+            self.clear_provider_catalog_cache();
+        }
+        Ok(updated)
+    }
+
     pub(crate) async fn delete_provider_catalog_provider(
         &self,
         provider_id: &str,

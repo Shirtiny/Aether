@@ -2,7 +2,8 @@
 #[path = "codex/tests.rs"]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -24,136 +25,8 @@ pub(crate) use crate::ai_serving::{
 
 use crate::ai_serving::GatewayProviderTransportSnapshot;
 
-const DEFAULT_CODEX_POOL_CLIENT_HEADER_PROFILES: &[(&str, &str)] = &[
-    (
-        "codex-tui/0.150.1 (Ubuntu 22.4.0; x86_64) gnome-terminal (codex-tui; 0.150.1)",
-        "codex-tui",
-    ),
-    (
-        "Codex Desktop/0.150.0-alpha.12.2 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.825.32147)",
-        "Codex Desktop",
-    ),
-    (
-        "Codex Desktop/0.151.0-alpha.7.2 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.825.51511)",
-        "Codex Desktop",
-    ),
-    (
-        "codex_vscode/0.150.0-alpha.12.2 (Ubuntu 22.4.0; x86_64) xterm-256color (VS Code; 26.825.31414)",
-        "codex_vscode",
-    ),
-    (
-        "codex-tui/0.151.0 (Windows 10.0.26200; x86_64) WindowsTerminal (codex-tui; 0.151.0)",
-        "codex-tui",
-    ),
-    (
-        "codex_cli_rs/0.150.1 (Windows 10.0.26100; x86_64) unknown",
-        "codex_cli_rs",
-    ),
-    (
-        "Codex Desktop/0.149.0-alpha.4.1 (Windows 10.0.26100; x86_64) unknown (Codex Desktop; 26.818.32112)",
-        "Codex Desktop",
-    ),
-    (
-        "codex-tui/0.150.1 (Mac OS 26.2.0; arm64) Orca/1.4.185 (codex-tui; 0.150.1)",
-        "codex-tui",
-    ),
-    (
-        "codex-tui/0.149.1 (Windows 10.0.26200; x86_64) WindowsTerminal (codex-tui; 0.149.1)",
-        "codex-tui",
-    ),
-    (
-        "Codex Desktop/0.150.0-alpha.8 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 26.820.80927)",
-        "Codex Desktop",
-    ),
-    (
-        "codex_vscode/0.151.0-alpha.7.1 (Ubuntu 22.4.0; x86_64) xterm-256color (VS Code; 26.825.41651)",
-        "codex_vscode",
-    ),
-    (
-        "Codex Desktop/0.149.0-alpha.4.3 (Mac OS 14.1.0; arm64) unknown (Codex Desktop; 26.818.61809)",
-        "Codex Desktop",
-    ),
-    (
-        "Codex Desktop/0.150.0-alpha.12.2 (Windows 10.0.26100; x86_64) unknown (Codex Desktop; 26.825.32147)",
-        "Codex Desktop",
-    ),
-    (
-        "Codex Desktop/0.150.0-alpha.12.2 (Windows 10.0.22631; x86_64) unknown (Codex Desktop; 26.825.32147)",
-        "Codex Desktop",
-    ),
-    (
-        "Codex Desktop/0.150.0-alpha.8 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 26.825.51511)",
-        "Codex Desktop",
-    ),
-    (
-        "Codex Desktop/0.149.0-alpha.4.1 (Mac OS 15.7.2; arm64) Apple_Terminal/455.1 (Codex Desktop; 26.818.41509)",
-        "Codex Desktop",
-    ),
-    (
-        "codex-tui/0.151.0 (Ubuntu 25.10.0; aarch64) xterm-256color (codex-tui; 0.151.0)",
-        "codex-tui",
-    ),
-    (
-        "codex_vscode/0.151.0-alpha.7.1 (Windows 10.0.22621; x86_64) unknown (VS Code; 26.825.41651)",
-        "codex_vscode",
-    ),
-    (
-        "Codex Desktop/0.151.0-alpha.7.1 (Windows 10.0.22631; x86_64) unknown (Codex Desktop; 26.825.41651)",
-        "Codex Desktop",
-    ),
-    (
-        "codex-tui/0.149.0 (Ubuntu 22.4.0; x86_64) screen (codex-tui; 0.149.0)",
-        "codex-tui",
-    ),
-    (
-        "codex-tui/0.149.0 (Windows 10.0.19045; x86_64) vscode/1.135.0 (codex-tui; 0.149.0)",
-        "codex-tui",
-    ),
-    (
-        "Codex Desktop/0.149.0-alpha.4.1 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.818.41509)",
-        "Codex Desktop",
-    ),
-    (
-        "Codex Desktop/0.149.0-alpha.4.3 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.818.61809)",
-        "Codex Desktop",
-    ),
-    (
-        "Codex Desktop/0.151.0-alpha.7.1 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.825.41651)",
-        "Codex Desktop",
-    ),
-    (
-        "Codex Desktop/0.151.0-alpha.7.2 (Mac OS 14.1.0; arm64) unknown (Codex Desktop; 26.825.51511)",
-        "Codex Desktop",
-    ),
-    (
-        "Codex Desktop/0.150.0-alpha.8 (Mac OS 15.2.0; arm64) unknown (Codex Desktop; 26.820.60940)",
-        "Codex Desktop",
-    ),
-    (
-        "Codex Desktop/0.150.0-alpha.8 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.820.71523)",
-        "Codex Desktop",
-    ),
-    (
-        "codex-tui/0.151.0 (Mac OS 14.8.5; arm64) Apple_Terminal/453 (codex-tui; 0.151.0)",
-        "codex-tui",
-    ),
-    (
-        "codex-tui/0.150.1 (Windows 10.0.26200; x86_64) WindowsTerminal (codex-tui; 0.150.1)",
-        "codex-tui",
-    ),
-    (
-        "codex_vscode/0.150.0-alpha.12.2 (Ubuntu 22.4.0; x86_64) xterm-256color (VS Code; 26.825.32147)",
-        "codex_vscode",
-    ),
-    (
-        "codex_cli_rs/0.149.0 (Mac OS 26.5.1; arm64) ghostty/1.3.1",
-        "codex_cli_rs",
-    ),
-    (
-        "codex-tui/0.151.0 (Debian 13.0.0; x86_64) xterm-256color (codex-tui; 0.151.0)",
-        "codex-tui",
-    ),
-];
+const DEFAULT_CODEX_POOL_CLIENT_HEADER_PROFILES_JSON: &str =
+    include_str!("../../../../../../resources/codex-client-header-profiles.json");
 
 const CODEX_POOL_UPSTREAM_HEADER_BLOCKLIST: &[&str] = &[
     "anthropic-version",
@@ -166,11 +39,17 @@ const CODEX_POOL_UPSTREAM_HEADER_BLOCKLIST: &[&str] = &[
     "x-oai-attestation",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 struct CodexClientHeaderProfile {
     user_agent: String,
     originator: String,
 }
+
+static DEFAULT_CODEX_POOL_CLIENT_HEADER_PROFILES: LazyLock<Vec<CodexClientHeaderProfile>> =
+    LazyLock::new(|| {
+        serde_json::from_str(DEFAULT_CODEX_POOL_CLIENT_HEADER_PROFILES_JSON)
+            .expect("built-in Codex client header profiles must be valid JSON")
+    });
 
 pub(crate) fn apply_codex_pool_stable_client_headers(
     provider_request_headers: &mut BTreeMap<String, String>,
@@ -362,6 +241,51 @@ pub(crate) fn refresh_codex_pool_key_fingerprint(
     )
 }
 
+pub(crate) fn validate_codex_client_header_config(value: &Value) -> Result<(), String> {
+    let config = value
+        .as_object()
+        .ok_or_else(|| "codex_client_headers 必须是 JSON 对象".to_string())?;
+    if let Some(enabled) = config.get("enabled") {
+        let enabled = enabled
+            .as_bool()
+            .ok_or_else(|| "codex_client_headers.enabled 必须是布尔值".to_string())?;
+        if !enabled {
+            return Err("Codex 稳定客户端请求头已关闭，无法更新账号 UA".to_string());
+        }
+    }
+    let Some(profiles) = config.get("profiles") else {
+        return Ok(());
+    };
+    if profiles.is_null() {
+        return Ok(());
+    }
+    let profiles = profiles
+        .as_array()
+        .ok_or_else(|| "codex_client_headers.profiles 必须是数组".to_string())?;
+    let mut seen = BTreeSet::new();
+    for (index, profile) in profiles.iter().enumerate() {
+        let profile = profile
+            .as_object()
+            .ok_or_else(|| format!("第 {} 组 Codex 请求头必须是对象", index + 1))?;
+        let user_agent = profile
+            .get("user_agent")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("第 {} 组 User-Agent 不能为空", index + 1))?;
+        let originator = profile
+            .get("originator")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("第 {} 组 Originator 不能为空", index + 1))?;
+        if !seen.insert((user_agent, originator)) {
+            return Err(format!("第 {} 组 Codex 请求头与已有配置重复", index + 1));
+        }
+    }
+    Ok(())
+}
+
 fn codex_pool_client_profile_selection_key(transport: &GatewayProviderTransportSnapshot) -> String {
     codex_account_selection_key(
         transport.key.decrypted_auth_config.as_deref(),
@@ -468,13 +392,7 @@ fn parse_codex_client_header_profiles(value: &Value) -> Option<Vec<CodexClientHe
 }
 
 fn default_codex_client_header_profiles() -> Vec<CodexClientHeaderProfile> {
-    DEFAULT_CODEX_POOL_CLIENT_HEADER_PROFILES
-        .iter()
-        .map(|(user_agent, originator)| CodexClientHeaderProfile {
-            user_agent: (*user_agent).to_string(),
-            originator: (*originator).to_string(),
-        })
-        .collect()
+    DEFAULT_CODEX_POOL_CLIENT_HEADER_PROFILES.clone()
 }
 
 fn stable_index_for_key(selection_key: &str, profiles: &[CodexClientHeaderProfile]) -> usize {

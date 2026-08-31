@@ -246,6 +246,23 @@ impl<'a> AdminAppState<'a> {
         self.app.update_provider_catalog_provider(provider).await
     }
 
+    pub(crate) async fn update_provider_catalog_codex_client_headers_and_key_fingerprints(
+        &self,
+        provider_id: &str,
+        client_headers: &serde_json::Value,
+        updated_at_unix_secs: u64,
+        keys: &[aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey],
+    ) -> Result<Option<usize>, GatewayError> {
+        self.app
+            .update_provider_catalog_codex_client_headers_and_key_fingerprints(
+                provider_id,
+                client_headers,
+                updated_at_unix_secs,
+                keys,
+            )
+            .await
+    }
+
     pub(crate) async fn cleanup_deleted_provider_catalog_refs(
         &self,
         provider_id: &str,

@@ -1,138 +1,41 @@
-import type { PoolCodexClientHeaderProfile } from '@/api/endpoints/types/provider'
+import type {
+  PoolCodexClientHeaderProfile,
+  PoolCodexClientHeadersConfig,
+} from '@/api/endpoints/types/provider'
 
-export const DEFAULT_CODEX_CLIENT_HEADER_PROFILES: readonly PoolCodexClientHeaderProfile[] = [
-  {
-    user_agent: 'codex-tui/0.150.1 (Ubuntu 22.4.0; x86_64) gnome-terminal (codex-tui; 0.150.1)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'Codex Desktop/0.150.0-alpha.12.2 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.825.32147)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.151.0-alpha.7.2 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.825.51511)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'codex_vscode/0.150.0-alpha.12.2 (Ubuntu 22.4.0; x86_64) xterm-256color (VS Code; 26.825.31414)',
-    originator: 'codex_vscode',
-  },
-  {
-    user_agent: 'codex-tui/0.151.0 (Windows 10.0.26200; x86_64) WindowsTerminal (codex-tui; 0.151.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex_cli_rs/0.150.1 (Windows 10.0.26100; x86_64) unknown',
-    originator: 'codex_cli_rs',
-  },
-  {
-    user_agent: 'Codex Desktop/0.149.0-alpha.4.1 (Windows 10.0.26100; x86_64) unknown (Codex Desktop; 26.818.32112)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'codex-tui/0.150.1 (Mac OS 26.2.0; arm64) Orca/1.4.185 (codex-tui; 0.150.1)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.149.1 (Windows 10.0.26200; x86_64) WindowsTerminal (codex-tui; 0.149.1)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'Codex Desktop/0.150.0-alpha.8 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 26.820.80927)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'codex_vscode/0.151.0-alpha.7.1 (Ubuntu 22.4.0; x86_64) xterm-256color (VS Code; 26.825.41651)',
-    originator: 'codex_vscode',
-  },
-  {
-    user_agent: 'Codex Desktop/0.149.0-alpha.4.3 (Mac OS 14.1.0; arm64) unknown (Codex Desktop; 26.818.61809)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.150.0-alpha.12.2 (Windows 10.0.26100; x86_64) unknown (Codex Desktop; 26.825.32147)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.150.0-alpha.12.2 (Windows 10.0.22631; x86_64) unknown (Codex Desktop; 26.825.32147)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.150.0-alpha.8 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 26.825.51511)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.149.0-alpha.4.1 (Mac OS 15.7.2; arm64) Apple_Terminal/455.1 (Codex Desktop; 26.818.41509)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'codex-tui/0.151.0 (Ubuntu 25.10.0; aarch64) xterm-256color (codex-tui; 0.151.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex_vscode/0.151.0-alpha.7.1 (Windows 10.0.22621; x86_64) unknown (VS Code; 26.825.41651)',
-    originator: 'codex_vscode',
-  },
-  {
-    user_agent: 'Codex Desktop/0.151.0-alpha.7.1 (Windows 10.0.22631; x86_64) unknown (Codex Desktop; 26.825.41651)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'codex-tui/0.149.0 (Ubuntu 22.4.0; x86_64) screen (codex-tui; 0.149.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.149.0 (Windows 10.0.19045; x86_64) vscode/1.135.0 (codex-tui; 0.149.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'Codex Desktop/0.149.0-alpha.4.1 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.818.41509)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.149.0-alpha.4.3 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.818.61809)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.151.0-alpha.7.1 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.825.41651)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.151.0-alpha.7.2 (Mac OS 14.1.0; arm64) unknown (Codex Desktop; 26.825.51511)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.150.0-alpha.8 (Mac OS 15.2.0; arm64) unknown (Codex Desktop; 26.820.60940)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.150.0-alpha.8 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.820.71523)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'codex-tui/0.151.0 (Mac OS 14.8.5; arm64) Apple_Terminal/453 (codex-tui; 0.151.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.150.1 (Windows 10.0.26200; x86_64) WindowsTerminal (codex-tui; 0.150.1)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex_vscode/0.150.0-alpha.12.2 (Ubuntu 22.4.0; x86_64) xterm-256color (VS Code; 26.825.32147)',
-    originator: 'codex_vscode',
-  },
-  {
-    user_agent: 'codex_cli_rs/0.149.0 (Mac OS 26.5.1; arm64) ghostty/1.3.1',
-    originator: 'codex_cli_rs',
-  },
-  {
-    user_agent: 'codex-tui/0.151.0 (Debian 13.0.0; x86_64) xterm-256color (codex-tui; 0.151.0)',
-    originator: 'codex-tui',
-  },
-]
+import defaultCodexClientHeaderProfiles from '../../../../../resources/codex-client-header-profiles.json'
+
+export const DEFAULT_CODEX_CLIENT_HEADER_PROFILES: readonly PoolCodexClientHeaderProfile[] =
+  defaultCodexClientHeaderProfiles
 
 export function buildDefaultCodexClientHeaderProfiles(): PoolCodexClientHeaderProfile[] {
   return DEFAULT_CODEX_CLIENT_HEADER_PROFILES.map((profile) => ({ ...profile }))
+}
+
+export function buildCodexClientHeadersConfig(
+  enabled: boolean,
+  profiles: readonly PoolCodexClientHeaderProfile[],
+): PoolCodexClientHeadersConfig {
+  const normalized = profiles.map((profile) => ({
+    user_agent: profile.user_agent.trim(),
+    originator: profile.originator.trim(),
+  }))
+  const invalidIndex = normalized.findIndex(profile => !profile.user_agent || !profile.originator)
+  if (invalidIndex >= 0) {
+    throw new Error(`第 ${invalidIndex + 1} 组 User-Agent 和 Originator 必须同时填写`)
+  }
+  const seen = new Set<string>()
+  for (const [index, profile] of normalized.entries()) {
+    const identity = `${profile.user_agent}\u0000${profile.originator}`
+    if (seen.has(identity)) {
+      throw new Error(`第 ${index + 1} 组 Codex 请求头与已有配置重复`)
+    }
+    seen.add(identity)
+  }
+  return {
+    enabled,
+    profiles: normalized.length > 0 ? normalized : undefined,
+  }
 }
 
 export type PoolHealthToggleKey =

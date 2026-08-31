@@ -699,6 +699,33 @@ fn builtin_codex_client_header_profiles_use_current_observed_versions() {
 }
 
 #[test]
+fn codex_client_header_refresh_config_rejects_incomplete_duplicate_or_disabled_profiles() {
+    assert!(super::validate_codex_client_header_config(&json!({
+        "enabled": true,
+        "profiles": [
+            {"user_agent": "codex-tui/0.151.0", "originator": "codex-tui"}
+        ]
+    }))
+    .is_ok());
+    for invalid in [
+        json!({"enabled": false}),
+        json!({
+            "enabled": true,
+            "profiles": [{"user_agent": "codex-tui/0.151.0", "originator": ""}]
+        }),
+        json!({
+            "enabled": true,
+            "profiles": [
+                {"user_agent": "codex-tui/0.151.0", "originator": "codex-tui"},
+                {"user_agent": " codex-tui/0.151.0 ", "originator": "codex-tui"}
+            ]
+        }),
+    ] {
+        assert!(super::validate_codex_client_header_config(&invalid).is_err());
+    }
+}
+
+#[test]
 fn codex_pool_concrete_account_profile_normalizes_installation_id_only() {
     let mut transport = sample_transport(
         "codex",

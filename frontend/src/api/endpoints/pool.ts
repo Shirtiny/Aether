@@ -3,6 +3,7 @@ import { buildCacheKey, cachedRequest } from '@/utils/cache'
 import type {
   AllowedModels,
   OAuthOrganizationInfo,
+  PoolCodexClientHeadersConfig,
   ProxyConfig,
   UpstreamMetadata,
 } from './types/provider'
@@ -448,10 +449,12 @@ export async function batchActionPoolKeys(
 export async function refreshCodexPoolClientProfiles(
   providerId: string,
   keyIds: string[],
+  clientHeaders: PoolCodexClientHeadersConfig,
 ): Promise<{ affected: number; message: string }> {
   return batchActionPoolKeys(providerId, {
     key_ids: keyIds,
     action: 'refresh_codex_client_profiles',
+    payload: { codex_client_headers: clientHeaders },
   })
 }
 

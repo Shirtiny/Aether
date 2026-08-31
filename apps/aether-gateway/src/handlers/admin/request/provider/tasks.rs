@@ -341,6 +341,18 @@ impl<'a> AdminAppState<'a> {
             .filter(|key| key.provider_id == provider.id)
             .collect::<Vec<_>>();
 
+        if plan.action == AdminPoolBatchActionKind::RefreshCodexClientProfiles
+            && keys.len() != plan.key_ids.len()
+        {
+            return Ok((
+                http::StatusCode::CONFLICT,
+                Json(json!({
+                    "detail": "部分 Codex 账号已不存在或不属于当前 Provider，未执行批量更新"
+                })),
+            )
+                .into_response());
+        }
+
         if plan.action == AdminPoolBatchActionKind::Delete {
             let deleted_key_ids = keys.iter().map(|key| key.id.clone()).collect::<Vec<_>>();
             for key in &keys {
@@ -379,10 +391,61 @@ impl<'a> AdminAppState<'a> {
                     .into_response());
             }
 
+            let Some(client_headers) = plan
+                .action_payload
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .and_then(|payload| payload.get("codex_client_headers"))
+                .cloned()
+            else {
+                return Ok((
+                    http::StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "detail": "refresh_codex_client_profiles requires codex_client_headers"
+                    })),
+                )
+                    .into_response());
+            };
+            if let Err(detail) =
+                crate::ai_serving::validate_codex_client_header_config(&client_headers)
+            {
+                return Ok((
+                    http::StatusCode::BAD_REQUEST,
+                    Json(json!({ "detail": detail })),
+                )
+                    .into_response());
+            }
+
             let now_unix_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0);
+            let mut provider_config = match provider.config.as_ref() {
+                Some(serde_json::Value::Object(config)) => config.clone(),
+                Some(_) => {
+                    return Ok((
+                        http::StatusCode::CONFLICT,
+                        Json(json!({ "detail": "Provider config 必须是 JSON 对象" })),
+                    )
+                        .into_response());
+                }
+                None => serde_json::Map::new(),
+            };
+            let pool_advanced = provider_config
+                .entry("pool_advanced".to_string())
+                .or_insert_with(|| json!({}));
+            let Some(pool_advanced) = pool_advanced.as_object_mut() else {
+                return Ok((
+                    http::StatusCode::CONFLICT,
+                    Json(json!({ "detail": "Provider pool_advanced 必须是 JSON 对象" })),
+                )
+                    .into_response());
+            };
+            pool_advanced.insert("codex_client_headers".to_string(), client_headers.clone());
+            let mut updated_provider = provider.clone();
+            updated_provider.config = Some(serde_json::Value::Object(provider_config));
+            updated_provider.updated_at_unix_secs = Some(now_unix_secs);
+
             let mut refreshed_keys = Vec::with_capacity(keys.len());
             for mut key in keys {
                 let auth_config_raw = self
@@ -396,11 +459,17 @@ impl<'a> AdminAppState<'a> {
                     .as_ref()
                     .and_then(serde_json::Value::as_object)
                     .and_then(|root| root.get(crate::codex_profile::CODEX_CLIENT_PROFILE_KEY));
-                if previous_profile
-                    .and_then(|profile| profile.get("selection_key_kind"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("auth_account_id")
-                    && auth_config_raw.is_none()
+                let requires_account_identity =
+                    crate::provider_key_auth::provider_key_is_oauth_managed(
+                        &key,
+                        &provider.provider_type,
+                    ) || previous_profile
+                        .and_then(|profile| profile.get("selection_key_kind"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("auth_account_id");
+                if requires_account_identity
+                    && crate::codex_profile::codex_auth_account_id(auth_config_raw.as_deref())
+                        .is_none()
                 {
                     return Ok((
                         http::StatusCode::UNPROCESSABLE_ENTITY,
@@ -416,7 +485,7 @@ impl<'a> AdminAppState<'a> {
 
                 let Some(outcome) = crate::ai_serving::refresh_codex_pool_key_fingerprint(
                     provider.provider_type.as_str(),
-                    provider.config.as_ref(),
+                    updated_provider.config.as_ref(),
                     key.fingerprint.as_ref(),
                     auth_config_raw.as_deref(),
                     key.id.as_str(),
@@ -474,12 +543,21 @@ impl<'a> AdminAppState<'a> {
                 refreshed_keys.push(key);
             }
 
-            let mut affected = 0usize;
-            for key in refreshed_keys {
-                if self.update_provider_catalog_key(&key).await?.is_some() {
-                    affected = affected.saturating_add(1);
-                }
-            }
+            let Some(affected) = self
+                .update_provider_catalog_codex_client_headers_and_key_fingerprints(
+                    &provider.id,
+                    &client_headers,
+                    now_unix_secs,
+                    &refreshed_keys,
+                )
+                .await?
+            else {
+                return Ok((
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "detail": "Provider catalog writer unavailable" })),
+                )
+                    .into_response());
+            };
             return Ok(Json(
                 admin_provider_pool_pure::build_admin_pool_batch_action_result_payload(
                     affected,

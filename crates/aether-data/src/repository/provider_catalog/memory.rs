@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
 use super::{
-    ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery, ProviderCatalogReadRepository,
-    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
-    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
-    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    config_with_codex_client_headers, ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
+    ProviderCatalogReadRepository, ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
 use crate::repository::usage::{
     apply_provider_api_key_total_response_time_ms_delta,
@@ -640,6 +640,65 @@ impl ProviderCatalogWriteRepository for InMemoryProviderCatalogReadRepository {
         };
         *stored = provider.clone();
         Ok(stored.clone())
+    }
+
+    async fn update_codex_client_headers_and_key_fingerprints(
+        &self,
+        provider_id: &str,
+        client_headers: &Value,
+        updated_at_unix_secs: u64,
+        keys: &[StoredProviderCatalogKey],
+    ) -> Result<usize, DataLayerError> {
+        if provider_id.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog provider_id is empty".to_string(),
+            ));
+        }
+        let mut index = self
+            .index
+            .write()
+            .expect("provider catalog repository lock");
+        let current_config = index
+            .providers
+            .get(provider_id)
+            .ok_or_else(|| {
+                DataLayerError::UnexpectedValue(format!(
+                    "provider catalog provider {provider_id} not found"
+                ))
+            })?
+            .config
+            .clone();
+        let updated_config = config_with_codex_client_headers(current_config, client_headers)?;
+        for key in keys {
+            let Some(stored) = index.keys.get(&key.id) else {
+                return Err(DataLayerError::UnexpectedValue(format!(
+                    "provider catalog key {} not found",
+                    key.id
+                )));
+            };
+            if stored.provider_id != provider_id || key.provider_id != provider_id {
+                return Err(DataLayerError::InvalidInput(format!(
+                    "provider catalog key {} does not belong to provider {}",
+                    key.id, provider_id
+                )));
+            }
+        }
+
+        let stored_provider = index
+            .providers
+            .get_mut(provider_id)
+            .expect("provider existence was validated");
+        stored_provider.config = Some(updated_config);
+        stored_provider.updated_at_unix_secs = Some(updated_at_unix_secs);
+        for key in keys {
+            let stored = index
+                .keys
+                .get_mut(&key.id)
+                .expect("key existence was validated");
+            stored.fingerprint = key.fingerprint.clone();
+            stored.updated_at_unix_secs = key.updated_at_unix_secs;
+        }
+        Ok(keys.len())
     }
 
     async fn delete_provider(&self, provider_id: &str) -> Result<bool, DataLayerError> {
@@ -1370,6 +1429,85 @@ mod tests {
             .expect("keys should read");
         assert_eq!(reloaded[0].name, "updated");
         assert_eq!(reloaded[0].internal_priority, 7);
+    }
+
+    #[tokio::test]
+    async fn atomically_updates_only_codex_headers_and_key_fingerprints() {
+        let mut provider = sample_provider("provider-1");
+        provider.config = Some(json!({"version": "old"}));
+        let mut key = sample_key("key-1", "provider-1");
+        key.fingerprint = Some(json!({"version": "old"}));
+        let repository = InMemoryProviderCatalogReadRepository::seed(
+            vec![provider.clone()],
+            vec![],
+            vec![key.clone()],
+        );
+
+        let mut updated_key = key.clone();
+        updated_key.name = "must-not-replace".to_string();
+        updated_key.fingerprint = Some(json!({"version": "new"}));
+        updated_key.updated_at_unix_secs = Some(20);
+
+        let updated_headers =
+            json!({"profiles": [{"user_agent": "new", "originator": "codex-tui"}]});
+        assert_eq!(
+            repository
+                .update_codex_client_headers_and_key_fingerprints(
+                    "provider-1",
+                    &updated_headers,
+                    20,
+                    std::slice::from_ref(&updated_key),
+                )
+                .await
+                .expect("atomic update should succeed"),
+            1
+        );
+        let stored_provider = repository
+            .list_providers_by_ids(&["provider-1".to_string()])
+            .await
+            .expect("provider should read")
+            .remove(0);
+        let stored_key = repository
+            .list_keys_by_ids(&["key-1".to_string()])
+            .await
+            .expect("key should read")
+            .remove(0);
+        assert_eq!(stored_provider.name, provider.name);
+        assert_eq!(stored_provider.config.as_ref().unwrap()["version"], "old");
+        assert_eq!(
+            stored_provider.config.as_ref().unwrap()["pool_advanced"]["codex_client_headers"],
+            updated_headers
+        );
+        assert_eq!(stored_key.name, key.name);
+        assert_eq!(stored_key.fingerprint, updated_key.fingerprint);
+
+        let mut missing_key = updated_key;
+        missing_key.id = "missing".to_string();
+        let rejected_headers = json!({"profiles": [{"user_agent": "rejected"}]});
+        assert!(repository
+            .update_codex_client_headers_and_key_fingerprints(
+                "provider-1",
+                &rejected_headers,
+                30,
+                &[missing_key],
+            )
+            .await
+            .is_err());
+        let unchanged_provider = repository
+            .list_providers_by_ids(&["provider-1".to_string()])
+            .await
+            .expect("provider should read")
+            .remove(0);
+        let unchanged_key = repository
+            .list_keys_by_ids(&["key-1".to_string()])
+            .await
+            .expect("key should read")
+            .remove(0);
+        assert_eq!(
+            unchanged_provider.config.as_ref().unwrap()["pool_advanced"]["codex_client_headers"],
+            updated_headers
+        );
+        assert_eq!(unchanged_key.fingerprint, Some(json!({"version": "new"})));
     }
 
     #[tokio::test]

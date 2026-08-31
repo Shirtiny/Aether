@@ -3470,7 +3470,9 @@ async fn gateway_refreshes_codex_client_profiles_without_changing_account_identi
     );
 
     let original_config = json!({
+        "unrelated_provider_config": true,
         "pool_advanced": {
+            "health_policy_enabled": true,
             "codex_client_headers": {
                 "enabled": true,
                 "profiles": [
@@ -3479,15 +3481,11 @@ async fn gateway_refreshes_codex_client_profiles_without_changing_account_identi
             }
         }
     });
-    let refreshed_config = json!({
-        "pool_advanced": {
-            "codex_client_headers": {
-                "enabled": true,
-                "profiles": [
-                    {"user_agent": "codex-tui/0.151.0 refreshed", "originator": "codex-tui"}
-                ]
-            }
-        }
+    let refreshed_headers = json!({
+        "enabled": true,
+        "profiles": [
+            {"user_agent": "codex-tui/0.151.0 refreshed", "originator": "codex-tui"}
+        ]
     });
     let mut provider = sample_provider("provider-codex", "Codex", 10).with_transport_fields(
         true,
@@ -3498,7 +3496,7 @@ async fn gateway_refreshes_codex_client_profiles_without_changing_account_identi
         None,
         None,
         None,
-        Some(refreshed_config.clone()),
+        Some(original_config.clone()),
     );
     provider.provider_type = "codex".to_string();
     let mut key = sample_key(
@@ -3552,7 +3550,8 @@ async fn gateway_refreshes_codex_client_profiles_without_changing_account_identi
         .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
         .json(&json!({
             "action": "refresh_codex_client_profiles",
-            "key_ids": ["key-codex-a"]
+            "key_ids": ["key-codex-a"],
+            "payload": { "codex_client_headers": refreshed_headers.clone() }
         }))
         .send()
         .await
@@ -3582,10 +3581,137 @@ async fn gateway_refreshes_codex_client_profiles_without_changing_account_identi
         original_selection_hash
     );
     assert_eq!(fingerprint["transport_profile"], original_transport);
+    let stored_provider = provider_catalog_repository
+        .list_providers_by_ids(&["provider-codex".to_string()])
+        .await
+        .expect("provider should load")
+        .into_iter()
+        .next()
+        .expect("provider should remain stored");
+    let stored_config = stored_provider
+        .config
+        .expect("provider config should remain set");
+    assert_eq!(stored_config["unrelated_provider_config"], json!(true));
+    assert_eq!(
+        stored_config["pool_advanced"]["health_policy_enabled"],
+        json!(true)
+    );
+    assert_eq!(
+        stored_config["pool_advanced"]["codex_client_headers"],
+        refreshed_headers
+    );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rejects_codex_profile_refresh_before_writes_when_oauth_identity_is_missing() {
+    let original_headers = json!({
+        "enabled": true,
+        "profiles": [
+            {"user_agent": "codex-tui/0.142.0 original", "originator": "codex-tui"}
+        ]
+    });
+    let refreshed_headers = json!({
+        "enabled": true,
+        "profiles": [
+            {"user_agent": "codex-tui/0.151.0 refreshed", "originator": "codex-tui"}
+        ]
+    });
+    let original_config = json!({
+        "pool_advanced": { "codex_client_headers": original_headers }
+    });
+    let mut provider = sample_provider("provider-codex", "Codex", 10).with_transport_fields(
+        true,
+        false,
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(original_config.clone()),
+    );
+    provider.provider_type = "codex".to_string();
+
+    let mut existing = sample_key(
+        "key-codex-existing",
+        "provider-codex",
+        "openai:responses",
+        "unused",
+    );
+    let existing_fingerprint = crate::ai_serving::materialize_codex_pool_key_fingerprint(
+        "codex",
+        Some(&original_config),
+        None,
+        None,
+        existing.id.as_str(),
+        existing.name.as_str(),
+        1_760_000_000,
+    )
+    .expect("existing profile should materialize")
+    .fingerprint;
+    existing.fingerprint = Some(existing_fingerprint.clone());
+
+    let mut oauth_without_identity = sample_key(
+        "key-codex-oauth",
+        "provider-codex",
+        "openai:responses",
+        "unused",
+    );
+    oauth_without_identity.auth_type = "oauth".to_string();
+    oauth_without_identity.encrypted_auth_config = None;
+    oauth_without_identity.fingerprint = None;
+
+    let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![existing, oauth_without_identity],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(&repository)),
+        );
+
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/pool/provider-codex/keys/batch-action",
+        Some(json!({
+            "action": "refresh_codex_client_profiles",
+            "key_ids": ["key-codex-existing", "key-codex-oauth"],
+            "payload": { "codex_client_headers": refreshed_headers }
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let stored_provider = repository
+        .list_providers_by_ids(&["provider-codex".to_string()])
+        .await
+        .expect("provider should load")
+        .remove(0);
+    assert_eq!(stored_provider.config, Some(original_config));
+    let stored_keys = repository
+        .list_keys_by_ids(&[
+            "key-codex-existing".to_string(),
+            "key-codex-oauth".to_string(),
+        ])
+        .await
+        .expect("keys should load");
+    let stored_existing = stored_keys
+        .iter()
+        .find(|key| key.id == "key-codex-existing")
+        .expect("existing key should remain stored");
+    let stored_oauth = stored_keys
+        .iter()
+        .find(|key| key.id == "key-codex-oauth")
+        .expect("OAuth key should remain stored");
+    assert_eq!(stored_existing.fingerprint, Some(existing_fingerprint));
+    assert!(stored_oauth.fingerprint.is_none());
 }
 
 #[tokio::test]

@@ -2,10 +2,10 @@ use async_trait::async_trait;
 use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite};
 
 use super::{
-    ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery, ProviderCatalogReadRepository,
-    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
-    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
-    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    config_with_codex_client_headers, ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
+    ProviderCatalogReadRepository, ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
 use crate::driver::sqlite::{sqlite_optional_real, SqlitePool};
 use crate::error::SqlResultExt;
@@ -726,6 +726,103 @@ WHERE id = ?
             )));
         }
         self.reload_provider(&provider.id, "updated").await
+    }
+
+    pub async fn update_codex_client_headers_and_key_fingerprints(
+        &self,
+        provider_id: &str,
+        client_headers: &serde_json::Value,
+        updated_at_unix_secs: u64,
+        keys: &[StoredProviderCatalogKey],
+    ) -> Result<usize, DataLayerError> {
+        if provider_id.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog provider_id is empty".to_string(),
+            ));
+        }
+        if keys.iter().any(|key| {
+            key.id.trim().is_empty()
+                || key.provider_id.trim().is_empty()
+                || key.provider_id != provider_id
+        }) {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog key fingerprint update has an invalid provider binding"
+                    .to_string(),
+            ));
+        }
+
+        let key_updates = keys
+            .iter()
+            .map(|key| {
+                Ok((
+                    &key.id,
+                    optional_json_to_string(&key.fingerprint, "provider_api_keys.fingerprint")?,
+                    key.updated_at_unix_secs.unwrap_or_else(current_unix_secs) as i64,
+                ))
+            })
+            .collect::<Result<Vec<_>, DataLayerError>>()?;
+
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let locked_rows = sqlx::query("UPDATE providers SET id = id WHERE id = ?")
+            .bind(provider_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?
+            .rows_affected();
+        if locked_rows != 1 {
+            return Err(DataLayerError::UnexpectedValue(format!(
+                "provider catalog provider {provider_id} not found"
+            )));
+        }
+        let current_config =
+            sqlx::query_scalar::<_, Option<String>>("SELECT config FROM providers WHERE id = ?")
+                .bind(provider_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_sql_err()?;
+        let current_config = optional_json_from_string(current_config, "providers.config")?;
+        let updated_config = config_with_codex_client_headers(current_config, client_headers)?;
+        let provider_config = optional_json_to_string(&Some(updated_config), "providers.config")?;
+        sqlx::query(
+            r#"
+UPDATE providers
+SET config = ?, updated_at = ?
+WHERE id = ?
+"#,
+        )
+        .bind(provider_config)
+        .bind(updated_at_unix_secs as i64)
+        .bind(provider_id)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+
+        for (key_id, fingerprint, updated_at) in key_updates {
+            let rows = sqlx::query(
+                r#"
+UPDATE provider_api_keys
+SET fingerprint = ?, updated_at = ?
+WHERE id = ? AND provider_id = ?
+"#,
+            )
+            .bind(fingerprint)
+            .bind(updated_at)
+            .bind(key_id)
+            .bind(provider_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?
+            .rows_affected();
+            if rows != 1 {
+                return Err(DataLayerError::UnexpectedValue(format!(
+                    "provider catalog key {key_id} not found for provider {}",
+                    provider_id
+                )));
+            }
+        }
+
+        tx.commit().await.map_sql_err()?;
+        Ok(keys.len())
     }
 
     pub async fn delete_provider(&self, provider_id: &str) -> Result<bool, DataLayerError> {
@@ -1475,6 +1572,23 @@ impl ProviderCatalogWriteRepository for SqliteProviderCatalogReadRepository {
         provider: &StoredProviderCatalogProvider,
     ) -> Result<StoredProviderCatalogProvider, DataLayerError> {
         Self::update_provider(self, provider).await
+    }
+
+    async fn update_codex_client_headers_and_key_fingerprints(
+        &self,
+        provider_id: &str,
+        client_headers: &serde_json::Value,
+        updated_at_unix_secs: u64,
+        keys: &[StoredProviderCatalogKey],
+    ) -> Result<usize, DataLayerError> {
+        Self::update_codex_client_headers_and_key_fingerprints(
+            self,
+            provider_id,
+            client_headers,
+            updated_at_unix_secs,
+            keys,
+        )
+        .await
     }
 
     async fn delete_provider(&self, provider_id: &str) -> Result<bool, DataLayerError> {
@@ -2369,6 +2483,77 @@ mod tests {
             Some("stale models fetch error")
         );
 
+        let client_headers = json!({
+            "enabled": true,
+            "profiles": [{"user_agent":"codex-tui/0.151.0","originator":"codex-tui"}]
+        });
+        let mut fingerprint_update = created_key.clone();
+        let mut refreshed_fingerprint = fingerprint_update
+            .fingerprint
+            .clone()
+            .expect("created key should have a fingerprint");
+        refreshed_fingerprint["fp"] = json!("updated");
+        fingerprint_update.fingerprint = Some(refreshed_fingerprint);
+        fingerprint_update.updated_at_unix_secs = Some(1_730_000_120);
+        assert_eq!(
+            repository
+                .update_codex_client_headers_and_key_fingerprints(
+                    "provider-write-1",
+                    &client_headers,
+                    1_730_000_120,
+                    std::slice::from_ref(&fingerprint_update),
+                )
+                .await
+                .expect("Codex headers and fingerprints should update atomically"),
+            1
+        );
+        let profile_updated_provider = repository
+            .list_providers_by_ids(&["provider-write-1".to_string()])
+            .await
+            .expect("provider should reload")
+            .remove(0);
+        let profile_updated_key = repository
+            .list_keys_by_ids(&["key-write-1".to_string()])
+            .await
+            .expect("key should reload")
+            .remove(0);
+        assert_eq!(
+            profile_updated_provider.config.as_ref().unwrap()["region"],
+            "us"
+        );
+        assert_eq!(
+            profile_updated_provider.config.as_ref().unwrap()["pool_advanced"]
+                ["codex_client_headers"],
+            client_headers
+        );
+        assert_eq!(profile_updated_key.name, created_key.name);
+        assert_eq!(
+            profile_updated_key.fingerprint,
+            fingerprint_update.fingerprint
+        );
+
+        let mut missing_key = fingerprint_update.clone();
+        missing_key.id = "missing-key".to_string();
+        let rejected_headers = json!({"enabled": true, "profiles": []});
+        assert!(repository
+            .update_codex_client_headers_and_key_fingerprints(
+                "provider-write-1",
+                &rejected_headers,
+                1_730_000_121,
+                &[missing_key],
+            )
+            .await
+            .is_err());
+        let rolled_back_provider = repository
+            .list_providers_by_ids(&["provider-write-1".to_string()])
+            .await
+            .expect("provider should reload after rollback")
+            .remove(0);
+        assert_eq!(
+            rolled_back_provider.config.as_ref().unwrap()["pool_advanced"]["codex_client_headers"],
+            client_headers
+        );
+
         let ws_profile = json!({"schema_version":1,"profile_id":"profile-1"});
         assert!(repository
             .update_key_codex_ws_metadata("key-write-1", true, Some(&ws_profile), 1_730_000_150,)
@@ -2391,7 +2576,10 @@ mod tests {
             ws_updated_key.capabilities.as_ref().unwrap()["codex_official_ws"],
             false
         );
-        assert_eq!(ws_updated_key.fingerprint.as_ref().unwrap()["fp"], "abc");
+        assert_eq!(
+            ws_updated_key.fingerprint.as_ref().unwrap()["fp"],
+            "updated"
+        );
         assert_eq!(
             ws_updated_key.fingerprint.as_ref().unwrap()["websocket_transport_profile"]
                 ["retained_nested"],

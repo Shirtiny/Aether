@@ -653,6 +653,16 @@ pub trait ProviderCatalogWriteRepository: Send + Sync {
         provider: &StoredProviderCatalogProvider,
     ) -> Result<StoredProviderCatalogProvider, crate::DataLayerError>;
 
+    /// Atomically updates one provider config and the fingerprints of its selected keys.
+    /// Implementations must not replace unrelated provider or key columns.
+    async fn update_codex_client_headers_and_key_fingerprints(
+        &self,
+        provider_id: &str,
+        client_headers: &serde_json::Value,
+        updated_at_unix_secs: u64,
+        keys: &[StoredProviderCatalogKey],
+    ) -> Result<usize, crate::DataLayerError>;
+
     async fn delete_provider(&self, provider_id: &str) -> Result<bool, crate::DataLayerError>;
 
     async fn cleanup_deleted_provider_refs(

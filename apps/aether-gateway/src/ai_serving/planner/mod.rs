@@ -89,7 +89,7 @@ pub(crate) use self::standard::{
     build_owned_local_openai_responses_request_body as build_codex_ws_local_openai_responses_request_body,
     materialize_codex_pool_key_fingerprint, refresh_codex_pool_key_fingerprint,
     resolve_codex_pool_concrete_account_profile,
-    set_local_openai_chat_execution_exhausted_diagnostic,
+    set_local_openai_chat_execution_exhausted_diagnostic, validate_codex_client_header_config,
 };
 pub(crate) use self::state::{
     GatewayAuthApiKeySnapshot, GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,

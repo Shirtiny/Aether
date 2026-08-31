@@ -21,13 +21,22 @@ describe('Codex pool client profile refresh', () => {
   })
 
   it('uses the pool batch action for the selected keys', async () => {
-    const result = await refreshCodexPoolClientProfiles('provider-codex', ['key-a', 'key-b'])
+    const clientHeaders = {
+      enabled: true,
+      profiles: [{ user_agent: 'codex-tui/0.151.0', originator: 'codex-tui' }],
+    }
+    const result = await refreshCodexPoolClientProfiles(
+      'provider-codex',
+      ['key-a', 'key-b'],
+      clientHeaders,
+    )
 
     expect(postMock).toHaveBeenCalledWith(
       '/api/admin/pool/provider-codex/keys/batch-action',
       {
         key_ids: ['key-a', 'key-b'],
         action: 'refresh_codex_client_profiles',
+        payload: { codex_client_headers: clientHeaders },
       },
       { timeout: 5 * 60 * 1000 },
     )
