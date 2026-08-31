@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use futures_util::FutureExt;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -48,6 +49,12 @@ const MAX_SLOW_SETTLEMENT_TIMEOUT_MS: u64 = 30_000;
 const SLOW_SETTLEMENT_CAPACITY_ENV: &str = "AETHER_CODEX_WS_SLOW_SETTLEMENT_QUEUE_CAPACITY";
 const SLOW_SETTLEMENT_WORKER_CONCURRENCY_ENV: &str = "AETHER_CODEX_WS_SLOW_SETTLEMENT_WORKERS";
 const SLOW_SETTLEMENT_TIMEOUT_ENV: &str = "AETHER_CODEX_WS_SLOW_SETTLEMENT_TIMEOUT_MS";
+// A cancelled provider-reached turn may not have a provider terminal usage
+// event. In that case we derive a bounded input estimate in this cold
+// settlement path. The relay loop deliberately does not tokenize or retain
+// response frames.
+const CANCELLED_INPUT_ESTIMATE_MAX_TOKENS: u64 = 8_000_000;
+const CANCELLED_INPUT_ESTIMATE_SOURCE: &str = "gateway_input_estimate";
 
 type ReporterFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type ReporterHandler<T> = Arc<dyn Fn(T) -> ReporterFuture + Send + Sync + 'static>;
@@ -691,12 +698,139 @@ fn build_usage_outcome(
     cancelled: bool,
 ) -> aether_usage_runtime::TerminalUsageOutcome {
     payload.report_context = compact_usage_report_context(payload.report_context.take());
+    if cancelled {
+        apply_cancelled_input_estimate(plan, payload);
+    }
     let context_seed = aether_usage_runtime::build_terminal_usage_context_seed(
         plan,
         payload.report_context.as_ref(),
     );
     let payload_seed = aether_usage_runtime::build_stream_terminal_usage_payload_seed(payload);
     aether_usage_runtime::build_stream_terminal_usage_seed(context_seed, payload_seed, cancelled)
+}
+
+/// Add an input-token estimate only after a provider write has been
+/// attempted and the turn is being settled as cancelled.  This is intentionally
+/// kept out of the streaming relay hot path: it walks the already materialized
+/// request body once in the settlement worker, and never parses response
+/// chunks.  Provider-reported usage, when present, remains authoritative.
+fn apply_cancelled_input_estimate(
+    plan: &aether_contracts::ExecutionPlan,
+    payload: &mut crate::usage::GatewayStreamReportRequest,
+) {
+    let Some(input_tokens) = cancelled_input_estimate(plan, payload.report_context.as_ref()) else {
+        return;
+    };
+
+    let summary = payload
+        .terminal_summary
+        .get_or_insert_with(Default::default);
+    let mut usage = summary.standardized_usage.take().unwrap_or_default();
+    // Preserve an authoritative provider input count. A provider terminal
+    // event may contain only output usage, in which case the estimate fills
+    // the missing input side without discarding the observed output count.
+    if usage.input_tokens <= 0 {
+        usage.input_tokens = i64::try_from(input_tokens).unwrap_or(i64::MAX);
+    } else {
+        summary.standardized_usage = Some(usage);
+        return;
+    }
+    usage.dimensions.insert(
+        "usage_source".to_string(),
+        json!(CANCELLED_INPUT_ESTIMATE_SOURCE),
+    );
+    usage
+        .dimensions
+        .insert("usage_confidence".to_string(), json!("estimated"));
+    summary.standardized_usage = Some(usage);
+}
+
+fn cancelled_input_estimate(
+    plan: &aether_contracts::ExecutionPlan,
+    report_context: Option<&Value>,
+) -> Option<u64> {
+    let body = plan
+        .body
+        .json_body
+        .as_ref()
+        .or_else(|| report_context.and_then(|value| value.get("original_request_body")))?;
+    estimate_request_input_tokens(body)
+}
+
+fn estimate_request_input_tokens(value: &Value) -> Option<u64> {
+    let is_continuation = value
+        .get("previous_response_id")
+        .is_some_and(|previous| !previous.is_null());
+    // A Responses WebSocket continuation sends only the newly-added input;
+    // the previous response context is provider-side state and is normally
+    // cache-priced. Counting it again here would overcharge a cancelled turn.
+    // For an initial turn, include the complete request-side prompt fields.
+    let fields: &[&str] = if is_continuation {
+        &["input"]
+    } else {
+        &[
+            "instructions",
+            "input",
+            "messages",
+            "prompt",
+            "contents",
+            "system",
+            "tools",
+        ]
+    };
+    let preferred_total = value
+        .as_object()
+        .map(|object| {
+            fields
+                .iter()
+                .copied()
+                .filter_map(|field| object.get(field))
+                .map(estimate_json_tokens)
+                .fold(0_u64, u64::saturating_add)
+        })
+        .unwrap_or_default();
+    let estimate = if preferred_total > 0 {
+        preferred_total
+    } else {
+        estimate_json_tokens(value)
+    };
+    Some(estimate.min(CANCELLED_INPUT_ESTIMATE_MAX_TOKENS)).filter(|value| *value > 0)
+}
+
+fn estimate_json_tokens(value: &Value) -> u64 {
+    match value {
+        Value::String(text) => estimate_text_tokens(text),
+        Value::Array(items) => items
+            .iter()
+            .map(estimate_json_tokens)
+            .fold(0_u64, u64::saturating_add),
+        Value::Object(object) => object
+            .iter()
+            .map(|(key, value)| {
+                estimate_text_tokens(key).saturating_add(estimate_json_tokens(value))
+            })
+            .fold(0_u64, u64::saturating_add),
+        Value::Null => 0,
+        _ => 1,
+    }
+}
+
+fn estimate_text_tokens(text: &str) -> u64 {
+    if text.is_empty() || is_inline_binary_data(text) {
+        0
+    } else {
+        // Byte length is O(1) for a Rust string. It keeps this cancellation-only
+        // fallback from rescanning large prompt strings on a Tokio worker.
+        (text.len() as u64).div_ceil(4).max(1)
+    }
+}
+
+fn is_inline_binary_data(text: &str) -> bool {
+    let prefix = &text.as_bytes()[..text.len().min(128)];
+    prefix.starts_with(b"data:")
+        && prefix
+            .windows(b";base64,".len())
+            .any(|window| window == b";base64,")
 }
 
 async fn run_with_hard_timeout<F>(timeout: Duration, future: F) -> bool
@@ -918,6 +1052,166 @@ mod tests {
                 .and_then(|affinity| affinity.get("session_key")),
             Some(&serde_json::json!("session=session-1"))
         );
+    }
+
+    #[test]
+    fn cancelled_input_estimate_is_confined_to_the_cold_settlement_path() {
+        let request_body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": "A deliberately long enough prompt to produce an estimate",
+            "stream": true
+        });
+        let plan = aether_contracts::ExecutionPlan {
+            request_id: "ws-cancel-estimate-test".into(),
+            candidate_id: Some("candidate-1".into()),
+            provider_name: Some("Codex".into()),
+            provider_id: "provider-1".into(),
+            endpoint_id: "endpoint-1".into(),
+            key_id: "key-1".into(),
+            method: "GET".into(),
+            url: "wss://chatgpt.com/backend-api/codex/responses".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: aether_contracts::RequestBody::from_json(request_body),
+            stream: true,
+            client_api_format: "openai:responses".into(),
+            provider_api_format: "openai:responses".into(),
+            model_name: Some("gpt-5.6-sol".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+
+        let mut cancelled = crate::usage::GatewayStreamReportRequest {
+            trace_id: plan.request_id.clone(),
+            report_kind: "openai_responses_stream_cancelled".into(),
+            report_context: None,
+            status_code: 499,
+            headers: BTreeMap::new(),
+            provider_body_base64: None,
+            provider_body_state: None,
+            client_body_base64: None,
+            client_body_state: None,
+            terminal_summary: None,
+            telemetry: None,
+        };
+        apply_cancelled_input_estimate(&plan, &mut cancelled);
+        let estimated_input = cancelled
+            .terminal_summary
+            .as_ref()
+            .and_then(|summary| summary.standardized_usage.as_ref())
+            .map(|usage| usage.input_tokens)
+            .unwrap_or_default();
+        assert!(estimated_input > 0);
+        assert_eq!(
+            cancelled
+                .terminal_summary
+                .as_ref()
+                .and_then(|summary| summary.standardized_usage.as_ref())
+                .and_then(|usage| usage.dimensions.get("usage_source"))
+                .and_then(Value::as_str),
+            Some(CANCELLED_INPUT_ESTIMATE_SOURCE)
+        );
+        let estimated_outcome = build_usage_outcome(&plan, &mut cancelled, true);
+        assert!(estimated_outcome
+            .standardized_usage
+            .as_ref()
+            .is_some_and(|usage| usage.input_tokens > 0));
+
+        // The helper is called only for cancelled settlement commits. A normal
+        // completed turn never receives this fallback estimate.
+        let mut completed = crate::usage::GatewayStreamReportRequest {
+            trace_id: plan.request_id.clone(),
+            report_kind: "openai_responses_stream_success".into(),
+            report_context: None,
+            status_code: 200,
+            headers: BTreeMap::new(),
+            provider_body_base64: None,
+            provider_body_state: None,
+            client_body_base64: None,
+            client_body_state: None,
+            terminal_summary: None,
+            telemetry: None,
+        };
+        // Do not invoke the fallback for completed requests; this mirrors
+        // build_usage_outcome's `if cancelled` guard.
+        let outcome = build_usage_outcome(&plan, &mut completed, false);
+        assert!(outcome.standardized_usage.is_none());
+    }
+
+    #[test]
+    fn cancelled_input_estimate_fills_only_missing_input_usage() {
+        let plan = aether_contracts::ExecutionPlan {
+            request_id: "ws-cancel-output-only-test".into(),
+            candidate_id: None,
+            provider_name: Some("Codex".into()),
+            provider_id: "provider-1".into(),
+            endpoint_id: "endpoint-1".into(),
+            key_id: "key-1".into(),
+            method: "GET".into(),
+            url: "wss://chatgpt.com/backend-api/codex/responses".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: aether_contracts::RequestBody::from_json(serde_json::json!({
+                "input": "short prompt"
+            })),
+            stream: true,
+            client_api_format: "openai:responses".into(),
+            provider_api_format: "openai:responses".into(),
+            model_name: Some("gpt-5.6-sol".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let mut provider_usage = aether_contracts::StandardizedUsage::new();
+        provider_usage.output_tokens = 7;
+        let mut payload = crate::usage::GatewayStreamReportRequest {
+            trace_id: plan.request_id.clone(),
+            report_kind: "openai_responses_stream_cancelled".into(),
+            report_context: None,
+            status_code: 499,
+            headers: BTreeMap::new(),
+            provider_body_base64: None,
+            provider_body_state: None,
+            client_body_base64: None,
+            client_body_state: None,
+            terminal_summary: Some(aether_contracts::ExecutionStreamTerminalSummary {
+                standardized_usage: Some(provider_usage),
+                ..Default::default()
+            }),
+            telemetry: None,
+        };
+        apply_cancelled_input_estimate(&plan, &mut payload);
+        let usage = payload
+            .terminal_summary
+            .as_ref()
+            .and_then(|summary| summary.standardized_usage.as_ref())
+            .expect("usage should remain present");
+        assert!(usage.input_tokens > 0);
+        assert_eq!(usage.output_tokens, 7);
+    }
+
+    #[test]
+    fn continuation_estimate_counts_only_new_input() {
+        let continued = serde_json::json!({
+            "previous_response_id": "resp-1",
+            "instructions": "This inherited instruction must not be charged again",
+            "tools": [{"type": "function", "name": "large_tool_schema"}],
+            "input": "new"
+        });
+        let initial = serde_json::json!({
+            "instructions": "This initial instruction is part of the first request",
+            "tools": [{"type": "function", "name": "large_tool_schema"}],
+            "input": "new"
+        });
+
+        let continued_tokens = estimate_request_input_tokens(&continued).expect("estimate");
+        let initial_tokens = estimate_request_input_tokens(&initial).expect("estimate");
+
+        assert_eq!(continued_tokens, estimate_json_tokens(&continued["input"]));
+        assert!(initial_tokens > continued_tokens);
     }
 
     #[test]
