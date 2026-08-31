@@ -1,0 +1,28 @@
+[Unit]
+Description=Aether Netcup IPv6 SOCKS5 proxy
+Documentation=file:///opt/stacks/aether/ops/microsocks/README.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/aether-ipv6-proxy
+ExecStart=/opt/stacks/aether/ops/microsocks/bin/linux-amd64/aether-microsocks-1.0.5-aether1 -q -i ${AETHER_MICROSOCKS_LISTEN_IP} -p ${AETHER_MICROSOCKS_LISTEN_PORT} -b ${AETHER_MICROSOCKS_BIND_ADDRESS}
+User=nobody
+Group=nogroup
+Restart=always
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

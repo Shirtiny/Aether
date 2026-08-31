@@ -1,0 +1,6 @@
+# Docker bridge gateway address on which Aether reaches MicroSocks.
+AETHER_MICROSOCKS_LISTEN_IP=172.30.0.1
+AETHER_MICROSOCKS_LISTEN_PORT=1082
+
+# Host IPv6 source address for outbound proxy connections. Replace this value.
+AETHER_MICROSOCKS_BIND_ADDRESS=2001:db8::1

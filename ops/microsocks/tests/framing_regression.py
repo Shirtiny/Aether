@@ -126,9 +126,13 @@ def proxy_echo(proxy_port, target_port, address_type, auth=None, delay=0.0002):
 
 
 def main():
-    if len(sys.argv) != 3:
-        raise SystemExit(f"usage: {sys.argv[0]} ORIGINAL PATCHED")
-    original, patched = sys.argv[1:]
+    if len(sys.argv) == 2:
+        original = None
+        patched = sys.argv[1]
+    elif len(sys.argv) == 3:
+        original, patched = sys.argv[1:]
+    else:
+        raise SystemExit(f"usage: {sys.argv[0]} [ORIGINAL] PATCHED")
 
     echo = ThreadingTCPServer(("127.0.0.1", 0), EchoHandler)
     echo_thread = threading.Thread(target=echo.serve_forever, daemon=True)
@@ -136,14 +140,15 @@ def main():
     target_port = echo.server_address[1]
 
     try:
-        original_port = unused_port()
-        with microsocks(original, original_port):
-            original_split = greeting_result(original_port, 0.02, split=True)
-            original_combined = greeting_result(original_port, 0, split=False)
-        if original_split != b"\x05\xff" or original_combined != b"\x05\x00":
-            raise AssertionError(
-                f"original reproduction changed: split={original_split.hex()} combined={original_combined.hex()}"
-            )
+        if original is not None:
+            original_port = unused_port()
+            with microsocks(original, original_port):
+                original_split = greeting_result(original_port, 0.02, split=True)
+                original_combined = greeting_result(original_port, 0, split=False)
+            if original_split != b"\x05\xff" or original_combined != b"\x05\x00":
+                raise AssertionError(
+                    f"original reproduction changed: split={original_split.hex()} combined={original_combined.hex()}"
+                )
 
         patched_port = unused_port()
         with microsocks(patched, patched_port):
@@ -181,7 +186,8 @@ def main():
                 for _ in range(20):
                     proxy_echo(auth_port, target_port, address_type, auth=auth)
 
-        print(f"original split={original_split.hex()} combined={original_combined.hex()}")
+        if original is not None:
+            print(f"original split={original_split.hex()} combined={original_combined.hex()}")
         print(f"patched greeting matrix={matrix}")
         print("patched fragmented CONNECT: 50 sequential + 500 concurrent passed")
         print("patched fragmented username/password auth: 40 passed")
