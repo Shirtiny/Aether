@@ -734,7 +734,10 @@ fn apply_cancelled_input_estimate(
         // The provider did not disclose whether the prompt cache hit. Price
         // the estimate at the cheaper cache-read rate as a conservative floor
         // instead of treating the entire context as fresh input.
-        if usage.cache_read_tokens <= 0 && usage.cache_creation_tokens <= 0 {
+        if usage.cache_read_tokens <= 0
+            && usage.cache_creation_tokens <= 0
+            && cancelled_usage_uses_cache_floor(plan, payload.report_context.as_ref())
+        {
             usage.cache_read_tokens = usage.input_tokens;
         }
     } else {
@@ -761,6 +764,24 @@ fn cancelled_input_estimate(
         .as_ref()
         .or_else(|| report_context.and_then(|value| value.get("original_request_body")))?;
     estimate_request_input_tokens(body)
+}
+
+fn cancelled_usage_uses_cache_floor(
+    plan: &aether_contracts::ExecutionPlan,
+    report_context: Option<&Value>,
+) -> bool {
+    let format = report_context
+        .and_then(Value::as_object)
+        .and_then(|context| {
+            context
+                .get("provider_api_format")
+                .or_else(|| context.get("client_api_format"))
+        })
+        .and_then(Value::as_str)
+        .unwrap_or(plan.provider_api_format.as_str())
+        .trim()
+        .to_ascii_lowercase();
+    format.starts_with("openai:") || format.starts_with("gemini:")
 }
 
 fn estimate_request_input_tokens(value: &Value) -> Option<u64> {
@@ -1206,6 +1227,31 @@ mod tests {
         assert!(usage.input_tokens > 0);
         assert_eq!(usage.output_tokens, 7);
         assert_eq!(usage.cache_read_tokens, usage.input_tokens);
+
+        let mut claude_plan = plan.clone();
+        claude_plan.client_api_format = "claude:messages".into();
+        claude_plan.provider_api_format = "claude:messages".into();
+        let mut claude_payload = crate::usage::GatewayStreamReportRequest {
+            trace_id: claude_plan.request_id.clone(),
+            report_kind: "claude_messages_stream_cancelled".into(),
+            report_context: None,
+            status_code: 499,
+            headers: BTreeMap::new(),
+            provider_body_base64: None,
+            provider_body_state: None,
+            client_body_base64: None,
+            client_body_state: None,
+            terminal_summary: None,
+            telemetry: None,
+        };
+        apply_cancelled_input_estimate(&claude_plan, &mut claude_payload);
+        let claude_usage = claude_payload
+            .terminal_summary
+            .as_ref()
+            .and_then(|summary| summary.standardized_usage.as_ref())
+            .expect("Claude estimate should exist");
+        assert!(claude_usage.input_tokens > 0);
+        assert_eq!(claude_usage.cache_read_tokens, 0);
     }
 
     #[test]
