@@ -55,6 +55,7 @@ const SLOW_SETTLEMENT_TIMEOUT_ENV: &str = "AETHER_CODEX_WS_SLOW_SETTLEMENT_TIMEO
 // response frames.
 const CANCELLED_INPUT_ESTIMATE_MAX_TOKENS: u64 = 8_000_000;
 const CANCELLED_INPUT_ESTIMATE_SOURCE: &str = "gateway_cached_input_floor";
+const CANCELLED_CONTEXT_FLOOR_SOURCE: &str = "previous_response_context_floor";
 
 type ReporterFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type ReporterHandler<T> = Arc<dyn Fn(T) -> ReporterFuture + Send + Sync + 'static>;
@@ -726,10 +727,22 @@ fn apply_cancelled_input_estimate(
         .terminal_summary
         .get_or_insert_with(Default::default);
     let mut usage = summary.standardized_usage.take().unwrap_or_default();
+    let context_floor = usage
+        .dimensions
+        .get("usage_source")
+        .and_then(Value::as_str)
+        .is_some_and(|source| source == CANCELLED_CONTEXT_FLOOR_SOURCE);
     // Preserve an authoritative provider input count. A provider terminal
     // event may contain only output usage, in which case the estimate fills
     // the missing input side without discarding the observed output count.
-    if usage.input_tokens <= 0 {
+    if context_floor {
+        // The context floor represents the cached previous response. Add the
+        // newly submitted continuation input without replacing that floor.
+        usage.input_tokens = usage
+            .cache_read_tokens
+            .max(0)
+            .saturating_add(i64::try_from(input_tokens).unwrap_or(i64::MAX));
+    } else if usage.input_tokens <= 0 {
         usage.input_tokens = i64::try_from(input_tokens).unwrap_or(i64::MAX);
         // The provider did not disclose whether the prompt cache hit. Price
         // the estimate at the cheaper cache-read rate as a conservative floor
@@ -746,7 +759,11 @@ fn apply_cancelled_input_estimate(
     }
     usage.dimensions.insert(
         "usage_source".to_string(),
-        json!(CANCELLED_INPUT_ESTIMATE_SOURCE),
+        json!(if context_floor {
+            "gateway_cached_context_plus_input_estimate"
+        } else {
+            CANCELLED_INPUT_ESTIMATE_SOURCE
+        }),
     );
     usage
         .dimensions
@@ -1273,6 +1290,64 @@ mod tests {
 
         assert_eq!(continued_tokens, estimate_json_tokens(&continued["input"]));
         assert!(initial_tokens > continued_tokens);
+    }
+
+    #[test]
+    fn cached_context_floor_is_combined_with_new_continuation_input() {
+        let plan = aether_contracts::ExecutionPlan {
+            request_id: "ws-cancel-context-floor-test".into(),
+            candidate_id: None,
+            provider_name: Some("Codex".into()),
+            provider_id: "provider-1".into(),
+            endpoint_id: "endpoint-1".into(),
+            key_id: "key-1".into(),
+            method: "GET".into(),
+            url: "wss://chatgpt.com/backend-api/codex/responses".into(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: aether_contracts::RequestBody::from_json(serde_json::json!({
+                "previous_response_id": "resp-1",
+                "input": "new continuation"
+            })),
+            stream: true,
+            client_api_format: "openai:responses".into(),
+            provider_api_format: "openai:responses".into(),
+            model_name: Some("gpt-5.6-sol".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let mut floor_usage = aether_contracts::StandardizedUsage::new();
+        floor_usage.input_tokens = 100;
+        floor_usage.cache_read_tokens = 100;
+        floor_usage
+            .dimensions
+            .insert("usage_source".into(), json!(CANCELLED_CONTEXT_FLOOR_SOURCE));
+        let mut payload = crate::usage::GatewayStreamReportRequest {
+            trace_id: plan.request_id.clone(),
+            report_kind: "openai_responses_stream_cancelled".into(),
+            report_context: None,
+            status_code: 499,
+            headers: BTreeMap::new(),
+            provider_body_base64: None,
+            provider_body_state: None,
+            client_body_base64: None,
+            client_body_state: None,
+            terminal_summary: Some(aether_contracts::ExecutionStreamTerminalSummary {
+                standardized_usage: Some(floor_usage),
+                ..Default::default()
+            }),
+            telemetry: None,
+        };
+        apply_cancelled_input_estimate(&plan, &mut payload);
+        let usage = payload
+            .terminal_summary
+            .as_ref()
+            .and_then(|summary| summary.standardized_usage.as_ref())
+            .expect("floor usage should remain present");
+        assert!(usage.input_tokens > 100);
+        assert_eq!(usage.cache_read_tokens, 100);
     }
 
     #[test]

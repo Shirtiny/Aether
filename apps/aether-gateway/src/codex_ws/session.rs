@@ -1105,10 +1105,14 @@ pub(crate) async fn run_codex_ws_session(
                     return;
                 }
             }
-            StepOutcome::ClientClosed => {
+            StepOutcome::ClientClosed {
+                cached_input_floor_tokens,
+            } => {
+                let terminal_event = cached_input_floor_tokens
+                    .map(|tokens| cancelled_cached_input_floor_terminal_event(tokens, &step.model));
                 settlement
                     .finish(
-                        None,
+                        terminal_event,
                         None,
                         CodexWsStepDisposition::Cancelled {
                             error_type: "codex_ws_client_disconnected".to_string(),
@@ -1298,6 +1302,7 @@ struct BindingState {
     seen_step_correlations: SettledResponseHistory,
     last_usage_request_id: String,
     last_completed_response_id: Option<String>,
+    last_completed_context_tokens: Option<i64>,
     turn_state: Option<(String, String)>,
     settled_response_ids: SettledResponseHistory,
 }
@@ -1375,6 +1380,7 @@ impl BindingState {
             },
             last_usage_request_id: super::runtime::step_usage_request_id(first_step),
             last_completed_response_id: None,
+            last_completed_context_tokens: None,
             turn_state,
             settled_response_ids: SettledResponseHistory::new(),
         })
@@ -1410,6 +1416,7 @@ impl BindingState {
             .transpose()?;
         self.model = step.model.clone();
         self.last_completed_response_id = None;
+        self.last_completed_context_tokens = None;
         self.turn_state = handshake_turn_state
             .zip(step.logical_turn_id.as_ref())
             .map(|(state, turn_id)| (turn_id.clone(), state));
@@ -1718,13 +1725,49 @@ enum StepOutcome {
         terminal_kind: TerminalKind,
         terminal_frames: Vec<Bytes>,
     },
-    ClientClosed,
+    ClientClosed {
+        cached_input_floor_tokens: Option<i64>,
+    },
     Poisoned {
         terminal_event: Option<TerminalEventSummary>,
         terminal_kind: Option<TerminalKind>,
         disposition: CodexWsStepDisposition,
         terminal_frames: Option<Vec<Bytes>>,
     },
+}
+
+fn cancelled_cached_input_floor_terminal_event(tokens: i64, model: &str) -> TerminalEventSummary {
+    let mut usage = aether_contracts::StandardizedUsage::new();
+    usage.input_tokens = tokens;
+    usage.cache_read_tokens = tokens;
+    usage.dimensions.insert(
+        "usage_source".to_string(),
+        serde_json::json!("previous_response_context_floor"),
+    );
+    usage.dimensions.insert(
+        "usage_confidence".to_string(),
+        serde_json::json!("billing_floor"),
+    );
+    TerminalEventSummary {
+        standardized_usage: Some(usage),
+        model: Some(model.to_string()),
+        ..Default::default()
+    }
+}
+
+fn next_response_context_token_floor(event: &TerminalEventSummary) -> Option<i64> {
+    let usage = event.standardized_usage.as_ref()?;
+    let tokens = usage
+        .input_tokens
+        .max(0)
+        .saturating_add(usage.output_tokens.max(0))
+        .saturating_add(
+            usage
+                .reasoning_output_tokens
+                .max(usage.reasoning_tokens)
+                .max(0),
+        );
+    (tokens > 0).then_some(tokens)
 }
 
 impl StepOutcome {
@@ -1904,12 +1947,16 @@ where
                 match client_frame {
                     Ok(Some(RelayFrame::Ping(bytes))) => {
                         if send_step_frame(client.as_mut(), RelayFrame::Pong(bytes), deadlines).await.is_err() {
-                            return StepOutcome::ClientClosed;
+                            return StepOutcome::ClientClosed {
+                                cached_input_floor_tokens: binding.last_completed_context_tokens,
+                            };
                         }
                     }
                     Ok(Some(RelayFrame::Pong(_))) => {}
                     Ok(Some(RelayFrame::Close)) | Ok(None) | Err(_) => {
-                        return StepOutcome::ClientClosed;
+                        return StepOutcome::ClientClosed {
+                            cached_input_floor_tokens: binding.last_completed_context_tokens,
+                        };
                     }
                     Ok(Some(RelayFrame::Text(_))) | Ok(Some(RelayFrame::Binary(_))) => {
                         close_with_error_step(client, "one response.create is already in flight", deadlines).await;
@@ -2148,6 +2195,9 @@ where
                             if let Some(response_id) = terminal_response_id.clone() {
                                 binding.last_completed_response_id = Some(response_id);
                             }
+                            binding.last_completed_context_tokens = terminal_event
+                                .as_ref()
+                                .and_then(next_response_context_token_floor);
                         }
                         if let Some((kind, event)) = terminal.zip(terminal_event) {
                             return terminal_outcome(kind, event, close_after_terminal, relay_frames);
@@ -2161,7 +2211,9 @@ where
                                 .await
                                 .is_err()
                             {
-                                return StepOutcome::ClientClosed;
+                                return StepOutcome::ClientClosed {
+                                    cached_input_floor_tokens: binding.last_completed_context_tokens,
+                                };
                             }
                         }
                     }
@@ -2795,6 +2847,7 @@ mod tests {
         report_calls: AtomicUsize,
         report_after_release: AtomicUsize,
         report_terminal_kinds: Mutex<Vec<Option<TerminalKind>>>,
+        report_usage_inputs: Mutex<Vec<Option<i64>>>,
         report_dispositions: Mutex<Vec<CodexWsStepDisposition>>,
         report_first_byte_ms: Mutex<Vec<Option<u64>>>,
         started_candidates: Mutex<Vec<String>>,
@@ -2847,6 +2900,7 @@ mod tests {
                 report_calls: AtomicUsize::new(0),
                 report_after_release: AtomicUsize::new(0),
                 report_terminal_kinds: Mutex::new(Vec::new()),
+                report_usage_inputs: Mutex::new(Vec::new()),
                 report_dispositions: Mutex::new(Vec::new()),
                 report_first_byte_ms: Mutex::new(Vec::new()),
                 started_candidates: Mutex::new(Vec::new()),
@@ -3186,7 +3240,7 @@ mod tests {
             &self,
             _candidate: &CodexWsCandidate,
             _step: &ResponseCreateStep,
-            _terminal_event: Option<TerminalEventSummary>,
+            terminal_event: Option<TerminalEventSummary>,
             terminal_kind: Option<TerminalKind>,
             disposition: CodexWsStepDisposition,
             _first_dispatch: bool,
@@ -3199,6 +3253,15 @@ mod tests {
                 .lock()
                 .expect("terminal kinds should lock")
                 .push(terminal_kind);
+            self.report_usage_inputs
+                .lock()
+                .expect("terminal usage inputs should lock")
+                .push(
+                    terminal_event
+                        .as_ref()
+                        .and_then(|event| event.standardized_usage.as_ref())
+                        .map(|usage| usage.input_tokens),
+                );
             self.report_dispositions
                 .lock()
                 .expect("terminal dispositions should lock")
@@ -3462,9 +3525,35 @@ mod tests {
             seen_step_correlations: SettledResponseHistory::new(),
             last_usage_request_id: "ws-idle-test".into(),
             last_completed_response_id: None,
+            last_completed_context_tokens: None,
             turn_state: None,
             settled_response_ids: SettledResponseHistory::new(),
         }
+    }
+
+    #[test]
+    fn completed_usage_becomes_a_constant_size_cached_context_floor() {
+        let mut usage = aether_contracts::StandardizedUsage::new();
+        usage.input_tokens = 120_000;
+        usage.output_tokens = 500;
+        usage.reasoning_output_tokens = 20;
+        let terminal = TerminalEventSummary {
+            standardized_usage: Some(usage),
+            ..Default::default()
+        };
+
+        assert_eq!(next_response_context_token_floor(&terminal), Some(120_520));
+        let floor = cancelled_cached_input_floor_terminal_event(120_520, "gpt-5.6-sol");
+        let usage = floor.standardized_usage.expect("floor usage");
+        assert_eq!(usage.input_tokens, 120_520);
+        assert_eq!(usage.cache_read_tokens, 120_520);
+        assert_eq!(
+            usage
+                .dimensions
+                .get("usage_source")
+                .and_then(serde_json::Value::as_str),
+            Some("previous_response_context_floor")
+        );
     }
 
     #[tokio::test]
@@ -4364,6 +4453,68 @@ mod tests {
         assert!(!client_sent.contains(&relay_text(stale_delta)));
         assert!(!client_sent.contains(&relay_text(stale_boundary)));
         assert_eq!(runtime.gate.snapshot().in_flight, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continued_turn_disconnect_uses_previous_context_as_billing_floor() {
+        let first_created = json!({
+            "type": "response.created",
+            "response": {"id": "resp-1"}
+        })
+        .to_string();
+        let first_terminal = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-1",
+                "usage": {"input_tokens": 100, "output_tokens": 5, "total_tokens": 105}
+            }
+        })
+        .to_string();
+        let second_created = json!({
+            "type": "response.created",
+            "response": {"id": "resp-2"}
+        })
+        .to_string();
+        let second_delta = json!({
+            "type": "response.output_text.delta",
+            "response_id": "resp-2",
+            "delta": "partial"
+        })
+        .to_string();
+        let (official, _) = ScriptedPeer::new([
+            (Duration::ZERO, relay_text(first_created)),
+            (Duration::ZERO, relay_text(first_terminal)),
+            (Duration::from_millis(25), relay_text(second_created)),
+            (Duration::ZERO, relay_text(second_delta)),
+        ]);
+        let runtime = TestRuntime::new(Box::new(official), false);
+        let (client, _) = ScriptedPeer::new([
+            (Duration::ZERO, relay_text(request())),
+            (
+                Duration::from_millis(20),
+                relay_text(request_step("step-2", Some("resp-1"))),
+            ),
+            (Duration::from_millis(20), RelayFrame::Close),
+        ]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            *runtime
+                .report_usage_inputs
+                .lock()
+                .expect("terminal usage inputs should lock"),
+            vec![Some(100), Some(105)]
+        );
+        assert!(matches!(
+            runtime
+                .report_dispositions
+                .lock()
+                .expect("terminal dispositions should lock")
+                .last(),
+            Some(CodexWsStepDisposition::Cancelled { .. })
+        ));
     }
 
     #[tokio::test]
