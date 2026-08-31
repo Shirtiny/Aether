@@ -3,6 +3,11 @@
 This directory is the source of truth for the host-side MicroSocks service
 used by the manual `netcup-ipv6` SOCKS5 proxy.
 
+> **Pinned runtime:** do not replace the repository artifact with the Debian
+> `/usr/bin/microsocks` binary without passing the fragmentation regression
+> test. See [`CHANGELOG.md`](CHANGELOG.md) for the incident signature, exact
+> code changes, checksums, and future replacement criteria.
+
 The checked-in Linux amd64 artifact is only about 26 KB. The systemd unit runs
 that file directly from the fixed Aether checkout path, so replacing a host
 does not require downloading source or compiling C code.
@@ -20,6 +25,8 @@ requests. It also handles partial writes for the small SOCKS5 responses.
 
 ## Repository contents
 
+- `CHANGELOG.md`: why this version is pinned, what changed, and the acceptance
+  criteria for any future replacement.
 - `bin/linux-amd64/aether-microsocks-1.0.5-aether1`: tested runtime artifact.
 - `systemd/aether-ipv6-proxy.service`: service definition that runs the
   repository artifact directly.

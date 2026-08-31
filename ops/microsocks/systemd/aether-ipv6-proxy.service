@@ -1,6 +1,6 @@
 [Unit]
-Description=Aether Netcup IPv6 SOCKS5 proxy
-Documentation=file:///opt/stacks/aether/ops/microsocks/README.md
+Description=Aether Netcup IPv6 SOCKS5 proxy (framing-fixed aether1)
+Documentation=file:///opt/stacks/aether/ops/microsocks/README.md file:///opt/stacks/aether/ops/microsocks/CHANGELOG.md
 After=network-online.target docker.service
 Wants=network-online.target
 
