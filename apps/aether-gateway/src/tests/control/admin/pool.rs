@@ -3431,6 +3431,157 @@ async fn gateway_handles_admin_pool_batch_action_locally_with_trusted_admin_prin
         .expect("keys should load");
     assert_eq!(stored.len(), 2);
     assert!(stored.iter().all(|item| !item.is_active));
+
+    let rejected = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/pool/provider-openai/keys/batch-action"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "action": "refresh_codex_client_profiles",
+            "key_ids": ["key-openai-a", "key-openai-b"]
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_refreshes_codex_client_profiles_without_changing_account_identity() {
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().route(
+        "/api/admin/pool/provider-codex/keys/batch-action",
+        any(move |_request: Request| {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Body::from("unexpected upstream hit"))
+            }
+        }),
+    );
+
+    let original_config = json!({
+        "pool_advanced": {
+            "codex_client_headers": {
+                "enabled": true,
+                "profiles": [
+                    {"user_agent": "codex-tui/0.142.0 original", "originator": "codex-tui"}
+                ]
+            }
+        }
+    });
+    let refreshed_config = json!({
+        "pool_advanced": {
+            "codex_client_headers": {
+                "enabled": true,
+                "profiles": [
+                    {"user_agent": "codex-tui/0.151.0 refreshed", "originator": "codex-tui"}
+                ]
+            }
+        }
+    });
+    let mut provider = sample_provider("provider-codex", "Codex", 10).with_transport_fields(
+        true,
+        false,
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(refreshed_config.clone()),
+    );
+    provider.provider_type = "codex".to_string();
+    let mut key = sample_key(
+        "key-codex-a",
+        "provider-codex",
+        "openai:responses",
+        "unused",
+    );
+    key.name = "codex-a".to_string();
+    let original = crate::ai_serving::materialize_codex_pool_key_fingerprint(
+        "codex",
+        Some(&original_config),
+        None,
+        None,
+        key.id.as_str(),
+        key.name.as_str(),
+        1_760_000_000,
+    )
+    .expect("original profile should materialize");
+    let original_installation =
+        original.fingerprint["codex_client_profile"]["install_identity"]["installation_id"].clone();
+    let original_selection_hash =
+        original.fingerprint["codex_client_profile"]["selection_key_hash"].clone();
+    let original_transport = original.fingerprint["transport_profile"].clone();
+    key.fingerprint = Some(original.fingerprint);
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![key],
+    ));
+
+    let (_upstream_url, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                    &provider_catalog_repository,
+                )),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/pool/provider-codex/keys/batch-action"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "action": "refresh_codex_client_profiles",
+            "key_ids": ["key-codex-a"]
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["affected"], json!(1));
+    let stored = provider_catalog_repository
+        .list_keys_by_ids(&["key-codex-a".to_string()])
+        .await
+        .expect("key should load");
+    let fingerprint = stored[0]
+        .fingerprint
+        .as_ref()
+        .expect("fingerprint should remain materialized");
+    assert_eq!(
+        fingerprint["codex_client_profile"]["client_headers"]["user_agent"],
+        "codex-tui/0.151.0 refreshed"
+    );
+    assert_eq!(
+        fingerprint["codex_client_profile"]["install_identity"]["installation_id"],
+        original_installation
+    );
+    assert_eq!(
+        fingerprint["codex_client_profile"]["selection_key_hash"],
+        original_selection_hash
+    );
+    assert_eq!(fingerprint["transport_profile"], original_transport);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

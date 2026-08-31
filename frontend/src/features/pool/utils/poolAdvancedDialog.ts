@@ -2,132 +2,132 @@ import type { PoolCodexClientHeaderProfile } from '@/api/endpoints/types/provide
 
 export const DEFAULT_CODEX_CLIENT_HEADER_PROFILES: readonly PoolCodexClientHeaderProfile[] = [
   {
-    user_agent: 'codex-tui/0.142.0 (Mac OS 26.4.1; arm64) iTerm.app/3.6.10 (codex-tui; 0.142.0)',
+    user_agent: 'codex-tui/0.150.1 (Ubuntu 22.4.0; x86_64) gnome-terminal (codex-tui; 0.150.1)',
     originator: 'codex-tui',
   },
   {
-    user_agent: 'codex-tui/0.142.0 (Windows 10.0.26200; x86_64) WindowsTerminal (codex-tui; 0.142.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.142.0 (Debian 13.0.0; x86_64) xterm-256color (codex-tui; 0.142.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.142.0 (Ubuntu 22.4.0; x86_64) WindowsTerminal (codex-tui; 0.142.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.142.0 (Ubuntu 24.4.0; x86_64) WindowsTerminal (codex-tui; 0.142.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.142.0 (Ubuntu 24.4.0; x86_64) WezTerm/20240203-110809-5046fc22 (codex-tui; 0.142.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.142.0 (Mac OS 26.2.0; arm64) xterm-256color (codex-tui; 0.142.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.142.0 (Mac OS 15.6.1; arm64) Apple_Terminal (codex-tui; 0.142.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.142.0 (Windows 10.0.26200; x86_64) WarpTerminal (codex-tui; 0.142.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.142.0 (Mac OS 26.5.1; arm64) ghostty/1.3.1 (codex-tui; 0.142.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.141.0 (Debian 13.0.0; x86_64) xterm-256color (codex-tui; 0.141.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.141.0 (Mac OS 15.7.5; arm64) iTerm.app/3.6.6 (codex-tui; 0.141.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.141.0 (Windows 10.0.26200; x86_64) waveterm (codex-tui; 0.141.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.141.0 (Mac OS 26.2.0; arm64) vscode/1.125.0 (codex-tui; 0.141.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'codex-tui/0.134.0 (Mac OS 14.1.0; arm64) iTerm.app/3.6.9 (codex-tui; 0.134.0)',
-    originator: 'codex-tui',
-  },
-  {
-    user_agent: 'Codex Desktop/0.142.0 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.616.71553)',
+    user_agent: 'Codex Desktop/0.150.0-alpha.12.2 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.825.32147)',
     originator: 'Codex Desktop',
   },
   {
-    user_agent: 'Codex Desktop/0.142.0 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 26.616.81150)',
+    user_agent: 'Codex Desktop/0.151.0-alpha.7.2 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.825.51511)',
     originator: 'Codex Desktop',
   },
   {
-    user_agent: 'Codex Desktop/0.142.0 (Mac OS 26.5.1; arm64) unknown (Codex Desktop; 26.616.71553)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.142.0-alpha.6 (Mac OS 26.5.0; arm64) unknown (Codex Desktop; 26.616.51431)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.142.0 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.616.81150)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.142.0 (Mac OS 26.5.0; arm64) unknown (Codex Desktop; 26.616.81150)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.142.0 (Mac OS 14.1.0; arm64) unknown (Codex Desktop; 26.616.81150)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'Codex Desktop/0.142.0 (Mac OS 13.1.0; x86_64) unknown (Codex Desktop; 26.616.81150)',
-    originator: 'Codex Desktop',
-  },
-  {
-    user_agent: 'codex_vscode/0.142.0 (Windows 10.0.19045; x86_64) unknown (VS Code; 26.616.81150)',
+    user_agent: 'codex_vscode/0.150.0-alpha.12.2 (Ubuntu 22.4.0; x86_64) xterm-256color (VS Code; 26.825.31414)',
     originator: 'codex_vscode',
   },
   {
-    user_agent: 'codex_vscode/0.142.0-alpha.1 (Windows 10.0.22631; x86_64) unknown (Windsurf; 26.616.32156)',
+    user_agent: 'codex-tui/0.151.0 (Windows 10.0.26200; x86_64) WindowsTerminal (codex-tui; 0.151.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex_cli_rs/0.150.1 (Windows 10.0.26100; x86_64) unknown',
+    originator: 'codex_cli_rs',
+  },
+  {
+    user_agent: 'Codex Desktop/0.149.0-alpha.4.1 (Windows 10.0.26100; x86_64) unknown (Codex Desktop; 26.818.32112)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'codex-tui/0.150.1 (Mac OS 26.2.0; arm64) Orca/1.4.185 (codex-tui; 0.150.1)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.149.1 (Windows 10.0.26200; x86_64) WindowsTerminal (codex-tui; 0.149.1)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'Codex Desktop/0.150.0-alpha.8 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 26.820.80927)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'codex_vscode/0.151.0-alpha.7.1 (Ubuntu 22.4.0; x86_64) xterm-256color (VS Code; 26.825.41651)',
     originator: 'codex_vscode',
   },
   {
-    user_agent: 'codex_vscode/0.142.0 (Windows 10.0.22631; x86_64) unknown (Antigravity IDE; 26.616.71553)',
+    user_agent: 'Codex Desktop/0.149.0-alpha.4.3 (Mac OS 14.1.0; arm64) unknown (Codex Desktop; 26.818.61809)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.150.0-alpha.12.2 (Windows 10.0.26100; x86_64) unknown (Codex Desktop; 26.825.32147)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.150.0-alpha.12.2 (Windows 10.0.22631; x86_64) unknown (Codex Desktop; 26.825.32147)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.150.0-alpha.8 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 26.825.51511)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.149.0-alpha.4.1 (Mac OS 15.7.2; arm64) Apple_Terminal/455.1 (Codex Desktop; 26.818.41509)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'codex-tui/0.151.0 (Ubuntu 25.10.0; aarch64) xterm-256color (codex-tui; 0.151.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex_vscode/0.151.0-alpha.7.1 (Windows 10.0.22621; x86_64) unknown (VS Code; 26.825.41651)',
     originator: 'codex_vscode',
   },
   {
-    user_agent: 'codex_cli_rs/0.93.0 (Windows 10.0.26200; x86_64) vscode/1.108.1',
-    originator: 'codex_cli',
+    user_agent: 'Codex Desktop/0.151.0-alpha.7.1 (Windows 10.0.22631; x86_64) unknown (Codex Desktop; 26.825.41651)',
+    originator: 'Codex Desktop',
   },
   {
-    user_agent: 'codex_cli_rs/0.133.0 (Windows 10.0.26200; x64)',
+    user_agent: 'codex-tui/0.149.0 (Ubuntu 22.4.0; x86_64) screen (codex-tui; 0.149.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.149.0 (Windows 10.0.19045; x86_64) vscode/1.135.0 (codex-tui; 0.149.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'Codex Desktop/0.149.0-alpha.4.1 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.818.41509)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.149.0-alpha.4.3 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.818.61809)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.151.0-alpha.7.1 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.825.41651)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.151.0-alpha.7.2 (Mac OS 14.1.0; arm64) unknown (Codex Desktop; 26.825.51511)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.150.0-alpha.8 (Mac OS 15.2.0; arm64) unknown (Codex Desktop; 26.820.60940)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'Codex Desktop/0.150.0-alpha.8 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.820.71523)',
+    originator: 'Codex Desktop',
+  },
+  {
+    user_agent: 'codex-tui/0.151.0 (Mac OS 14.8.5; arm64) Apple_Terminal/453 (codex-tui; 0.151.0)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex-tui/0.150.1 (Windows 10.0.26200; x86_64) WindowsTerminal (codex-tui; 0.150.1)',
+    originator: 'codex-tui',
+  },
+  {
+    user_agent: 'codex_vscode/0.150.0-alpha.12.2 (Ubuntu 22.4.0; x86_64) xterm-256color (VS Code; 26.825.32147)',
+    originator: 'codex_vscode',
+  },
+  {
+    user_agent: 'codex_cli_rs/0.149.0 (Mac OS 26.5.1; arm64) ghostty/1.3.1',
     originator: 'codex_cli_rs',
   },
   {
-    user_agent: 'codex_cli_rs/0.125.0 (Mac OS 24.6.0; arm64)',
-    originator: 'codex_cli_rs',
-  },
-  {
-    user_agent: 'codex_cli_rs/0.77.0 (Windows 10.0.26100; x86_64) WindowsTerminal',
-    originator: 'codex_cli_rs',
-  },
-  {
-    user_agent: 'codex_exec/0.142.0 (Mac OS 15.7.5; arm64) iTerm.app/3.6.6 (codex_exec; 0.142.0)',
-    originator: 'codex_exec',
-  },
-  {
-    user_agent: 'codex_sdk_ts/0.136.0 (Windows 10.0.19045; x86_64) unknown (codex_exec; 0.136.0)',
-    originator: 'codex_sdk_ts',
+    user_agent: 'codex-tui/0.151.0 (Debian 13.0.0; x86_64) xterm-256color (codex-tui; 0.151.0)',
+    originator: 'codex-tui',
   },
 ]
 

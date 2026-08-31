@@ -87,7 +87,8 @@ pub(crate) use self::standard::{
     build_local_sync_attempt_source as build_standard_family_sync_attempt_source,
     build_local_sync_plan_and_reports as build_standard_family_sync_plan_and_reports,
     build_owned_local_openai_responses_request_body as build_codex_ws_local_openai_responses_request_body,
-    materialize_codex_pool_key_fingerprint, resolve_codex_pool_concrete_account_profile,
+    materialize_codex_pool_key_fingerprint, refresh_codex_pool_key_fingerprint,
+    resolve_codex_pool_concrete_account_profile,
     set_local_openai_chat_execution_exhausted_diagnostic,
 };
 pub(crate) use self::state::{

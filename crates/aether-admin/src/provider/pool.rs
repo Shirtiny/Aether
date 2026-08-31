@@ -33,6 +33,7 @@ pub enum AdminPoolBatchActionKind {
     ClearProxy,
     SetProxy,
     RegenerateFingerprint,
+    RefreshCodexClientProfiles,
     EnableCodexWs,
     DisableCodexWs,
     Delete,
@@ -409,6 +410,10 @@ pub fn build_admin_pool_batch_action_plan(
             AdminPoolBatchActionKind::RegenerateFingerprint,
             "fingerprint regenerated",
         ),
+        "refresh_codex_client_profiles" => (
+            AdminPoolBatchActionKind::RefreshCodexClientProfiles,
+            "Codex client profiles refreshed",
+        ),
         "enable_codex_ws" => (AdminPoolBatchActionKind::EnableCodexWs, "Codex WS enabled"),
         "disable_codex_ws" => (
             AdminPoolBatchActionKind::DisableCodexWs,
@@ -423,7 +428,7 @@ pub fn build_admin_pool_batch_action_plan(
         "delete" => (AdminPoolBatchActionKind::Delete, "deleted"),
         _ => {
             return Err(format!(
-                "Invalid action: {action}. Supported locally: enable, disable, clear_proxy, set_proxy, regenerate_fingerprint, enable_codex_ws, disable_codex_ws, delete"
+                "Invalid action: {action}. Supported locally: enable, disable, clear_proxy, set_proxy, regenerate_fingerprint, refresh_codex_client_profiles, enable_codex_ws, disable_codex_ws, delete"
             ));
         }
     };
@@ -564,8 +569,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_dedicated_codex_ws_batch_actions() {
+    fn parses_dedicated_codex_batch_actions() {
         for (action, expected) in [
+            (
+                "refresh_codex_client_profiles",
+                AdminPoolBatchActionKind::RefreshCodexClientProfiles,
+            ),
             ("enable_codex_ws", AdminPoolBatchActionKind::EnableCodexWs),
             ("disable_codex_ws", AdminPoolBatchActionKind::DisableCodexWs),
         ] {

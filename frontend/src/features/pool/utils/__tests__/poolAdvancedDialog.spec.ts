@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  buildDefaultCodexClientHeaderProfiles,
   buildPoolCooldownFieldLayout,
   buildPoolHealthToggleCards,
   buildPoolCostFieldLayout,
@@ -9,6 +10,14 @@ import {
 } from '@/features/pool/utils/poolAdvancedDialog'
 
 describe('poolAdvancedDialog', () => {
+  it('ships the current observed Codex client header profiles', () => {
+    const profiles = buildDefaultCodexClientHeaderProfiles()
+
+    expect(profiles).toHaveLength(32)
+    expect(new Set(profiles.map(profile => profile.user_agent)).size).toBe(32)
+    expect(profiles.every(profile => /\/0\.(149|150|151)/.test(profile.user_agent))).toBe(true)
+  })
+
   it('returns health toggle cards in the desktop display order', () => {
     expect(buildPoolHealthToggleCards().map(item => item.key)).toEqual([
       'health_policy_enabled',

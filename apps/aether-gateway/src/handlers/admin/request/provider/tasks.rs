@@ -368,6 +368,127 @@ impl<'a> AdminAppState<'a> {
             .into_response());
         }
 
+        if plan.action == AdminPoolBatchActionKind::RefreshCodexClientProfiles {
+            if !provider.provider_type.trim().eq_ignore_ascii_case("codex") {
+                return Ok((
+                    http::StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "detail": "Codex client profile refresh requires a Codex provider"
+                    })),
+                )
+                    .into_response());
+            }
+
+            let now_unix_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            let mut refreshed_keys = Vec::with_capacity(keys.len());
+            for mut key in keys {
+                let auth_config_raw = self
+                    .parse_catalog_auth_config_json(&key)
+                    .map(serde_json::Value::Object)
+                    .map(|value| serde_json::to_string(&value))
+                    .transpose()
+                    .map_err(|err| GatewayError::Internal(err.to_string()))?;
+                let previous_profile = key
+                    .fingerprint
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|root| root.get(crate::codex_profile::CODEX_CLIENT_PROFILE_KEY));
+                if previous_profile
+                    .and_then(|profile| profile.get("selection_key_kind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("auth_account_id")
+                    && auth_config_raw.is_none()
+                {
+                    return Ok((
+                        http::StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(json!({
+                            "detail": format!(
+                                "Key {} 缺少可解密的 Codex account identity，未执行批量更新",
+                                key.id
+                            )
+                        })),
+                    )
+                        .into_response());
+                }
+
+                let Some(outcome) = crate::ai_serving::refresh_codex_pool_key_fingerprint(
+                    provider.provider_type.as_str(),
+                    provider.config.as_ref(),
+                    key.fingerprint.as_ref(),
+                    auth_config_raw.as_deref(),
+                    key.id.as_str(),
+                    key.name.as_str(),
+                    now_unix_secs,
+                ) else {
+                    return Ok((
+                        http::StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(json!({
+                            "detail": "Codex 稳定客户端请求头已关闭或没有可用模板"
+                        })),
+                    )
+                        .into_response());
+                };
+
+                let refreshed_profile = outcome
+                    .fingerprint
+                    .as_object()
+                    .and_then(|root| root.get(crate::codex_profile::CODEX_CLIENT_PROFILE_KEY));
+                let identity_changed = previous_profile.is_some_and(|previous| {
+                    ["selection_key_kind", "selection_key_hash"]
+                        .into_iter()
+                        .any(|field| {
+                            previous.get(field) != refreshed_profile.and_then(|p| p.get(field))
+                        })
+                        || previous
+                            .get("install_identity")
+                            .and_then(|value| value.get("installation_id"))
+                            != refreshed_profile
+                                .and_then(|profile| profile.get("install_identity"))
+                                .and_then(|value| value.get("installation_id"))
+                });
+                let transport_changed = key
+                    .fingerprint
+                    .as_ref()
+                    .and_then(|fingerprint| fingerprint.get("transport_profile"))
+                    .is_some_and(|previous| {
+                        outcome.fingerprint.get("transport_profile") != Some(previous)
+                    });
+                if identity_changed || transport_changed {
+                    return Ok((
+                        http::StatusCode::CONFLICT,
+                        Json(json!({
+                            "detail": format!(
+                                "Key {} 的账号身份或传输配置会发生变化，已中止批量更新",
+                                key.id
+                            )
+                        })),
+                    )
+                        .into_response());
+                }
+
+                key.fingerprint = Some(outcome.fingerprint);
+                key.updated_at_unix_secs = Some(now_unix_secs);
+                refreshed_keys.push(key);
+            }
+
+            let mut affected = 0usize;
+            for key in refreshed_keys {
+                if self.update_provider_catalog_key(&key).await?.is_some() {
+                    affected = affected.saturating_add(1);
+                }
+            }
+            return Ok(Json(
+                admin_provider_pool_pure::build_admin_pool_batch_action_result_payload(
+                    affected,
+                    plan.action_label,
+                ),
+            )
+            .into_response());
+        }
+
         if matches!(
             plan.action,
             AdminPoolBatchActionKind::EnableCodexWs | AdminPoolBatchActionKind::DisableCodexWs
@@ -435,6 +556,7 @@ impl<'a> AdminAppState<'a> {
                     key.fingerprint =
                         Some(aether_provider_transport::claude_code::generate_random_fingerprint())
                 }
+                AdminPoolBatchActionKind::RefreshCodexClientProfiles => unreachable!(),
                 AdminPoolBatchActionKind::EnableCodexWs
                 | AdminPoolBatchActionKind::DisableCodexWs => unreachable!(),
                 AdminPoolBatchActionKind::Delete => unreachable!(),

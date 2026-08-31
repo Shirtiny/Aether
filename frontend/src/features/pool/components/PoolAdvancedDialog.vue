@@ -504,7 +504,7 @@
                 <Label>User-Agent</Label>
                 <Input
                   v-model="profile.user_agent"
-                  placeholder="codex-tui/0.139.0 ..."
+                  placeholder="codex-tui/0.151.0 ..."
                 />
               </div>
               <div class="space-y-1.5">
@@ -547,6 +547,18 @@
                 @click="clearCodexHeaderProfiles"
               >
                 清空自定义
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                :disabled="loading || refreshingCodexHeaders || !codexHeaderForm.enabled"
+                @click="handleRefreshCodexHeaders"
+              >
+                <RefreshCw
+                  class="mr-2 h-4 w-4"
+                  :class="{ 'animate-spin': refreshingCodexHeaders }"
+                />
+                {{ refreshingCodexHeaders ? '更新中...' : '一键更新 UA' }}
               </Button>
             </div>
           </div>
@@ -695,14 +707,14 @@
       <Button
         variant="outline"
         class="min-w-[96px] flex-1 sm:flex-none"
-        :disabled="loading"
+        :disabled="loading || refreshingCodexHeaders"
         @click="emit('update:modelValue', false)"
       >
         取消
       </Button>
       <Button
         class="min-w-[96px] flex-1 sm:flex-none"
-        :disabled="loading"
+        :disabled="loading || refreshingCodexHeaders"
         @click="handleSave"
       >
         {{ loading ? '保存中...' : '保存' }}
@@ -713,11 +725,16 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { CircleHelp } from 'lucide-vue-next'
+import { CircleHelp, RefreshCw } from 'lucide-vue-next'
 import { Dialog, Button, Input, Label, Switch, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui'
 import { useToast } from '@/composables/useToast'
+import { useConfirm } from '@/composables/useConfirm'
 import { parseApiError } from '@/utils/errorParser'
-import { updateProvider } from '@/api/endpoints'
+import {
+  refreshCodexPoolClientProfiles,
+  resolvePoolKeySelection,
+  updateProvider,
+} from '@/api/endpoints'
 import {
   buildDefaultCodexClientHeaderProfiles,
   buildPoolCooldownFieldLayout,
@@ -730,6 +747,7 @@ import {
 import type {
   PoolAdvancedConfig,
   ClaudeCodeAdvancedConfig,
+  PoolCodexClientHeadersConfig,
   ProviderWithEndpointsSummary,
 } from '@/api/endpoints/types/provider'
 
@@ -746,8 +764,10 @@ const emit = defineEmits<{
   saved: [provider: ProviderWithEndpointsSummary]
 }>()
 
-const { success, error: showError } = useToast()
+const { success, warning, error: showError } = useToast()
+const { confirm } = useConfirm()
 const loading = ref(false)
+const refreshingCodexHeaders = ref(false)
 
 const isClaudeCode = computed(() => {
   return (props.providerType || '').trim().toLowerCase() === 'claude_code'
@@ -860,6 +880,55 @@ function loadDefaultCodexHeaderProfiles(): void {
 
 function clearCodexHeaderProfiles(): void {
   codexHeaderForm.value.profiles = []
+}
+
+function buildCodexClientHeadersConfig(): PoolCodexClientHeadersConfig {
+  const profiles = codexHeaderForm.value.profiles
+    .map((profile) => ({
+      user_agent: profile.user_agent.trim(),
+      originator: profile.originator.trim(),
+    }))
+    .filter((profile) => profile.user_agent && profile.originator)
+  return {
+    enabled: codexHeaderForm.value.enabled,
+    profiles: profiles.length > 0 ? profiles : undefined,
+  }
+}
+
+async function handleRefreshCodexHeaders(): Promise<void> {
+  refreshingCodexHeaders.value = true
+  try {
+    const selection = await resolvePoolKeySelection(props.providerId, {})
+    if (selection.total === 0) {
+      warning('当前号池没有可更新的账号')
+      return
+    }
+    const confirmed = await confirm({
+      title: '一键更新 UA',
+      message: `将保存当前 Codex 请求头配置，并刷新全部 ${selection.total} 个账号的 UA 与 Originator。账号安装 ID 和传输配置保持不变。`,
+      confirmText: '确认更新',
+      variant: 'warning',
+    })
+    if (!confirmed) return
+
+    const poolAdvanced: PoolAdvancedConfig = {
+      ...(props.currentConfig ?? {}),
+      codex_client_headers: buildCodexClientHeadersConfig(),
+    }
+    const updatedProvider = await updateProvider(props.providerId, {
+      pool_advanced: poolAdvanced,
+    })
+    const result = await refreshCodexPoolClientProfiles(
+      props.providerId,
+      selection.items.map((item) => item.key_id),
+    )
+    success(`已更新 ${result.affected} 个账号的 UA`)
+    emit('saved', updatedProvider)
+  } catch (err) {
+    showError(parseApiError(err))
+  } finally {
+    refreshingCodexHeaders.value = false
+  }
 }
 
 function parseNum(v: string | number): number | undefined {
@@ -1042,16 +1111,7 @@ async function handleSave() {
     }
 
     if (isCodex.value) {
-      const profiles = codexHeaderForm.value.profiles
-        .map((profile) => ({
-          user_agent: profile.user_agent.trim(),
-          originator: profile.originator.trim(),
-        }))
-        .filter((profile) => profile.user_agent && profile.originator)
-      poolAdvanced.codex_client_headers = {
-        enabled: codexHeaderForm.value.enabled,
-        profiles: profiles.length > 0 ? profiles : undefined,
-      }
+      poolAdvanced.codex_client_headers = buildCodexClientHeadersConfig()
     } else {
       delete poolAdvanced.codex_client_headers
     }

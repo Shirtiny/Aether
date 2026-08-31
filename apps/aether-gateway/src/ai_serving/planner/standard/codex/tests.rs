@@ -682,6 +682,23 @@ fn codex_pool_stable_client_headers_use_builtin_profiles_without_pool_config() {
 }
 
 #[test]
+fn builtin_codex_client_header_profiles_use_current_observed_versions() {
+    let profiles = super::default_codex_client_header_profiles();
+    let unique_user_agents = profiles
+        .iter()
+        .map(|profile| profile.user_agent.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(profiles.len(), 32);
+    assert_eq!(unique_user_agents.len(), profiles.len());
+    assert!(profiles.iter().all(|profile| {
+        ["/0.149", "/0.150", "/0.151"]
+            .iter()
+            .any(|version| profile.user_agent.contains(version))
+    }));
+}
+
+#[test]
 fn codex_pool_concrete_account_profile_normalizes_installation_id_only() {
     let mut transport = sample_transport(
         "codex",
@@ -1201,6 +1218,80 @@ fn materialized_codex_profiles_are_stable_per_account_and_unique_across_accounts
     assert_eq!(
         first.fingerprint["transport_profile"]["backend"],
         "reqwest_default_tls"
+    );
+}
+
+#[test]
+fn refreshed_codex_profile_reselects_headers_without_changing_account_identity_or_transport() {
+    let original_config = json!({
+        "pool_advanced": {
+            "codex_client_headers": {
+                "profiles": [
+                    {"user_agent": "codex-tui/0.142.0 original", "originator": "codex-tui"}
+                ]
+            }
+        }
+    });
+    let refreshed_config = json!({
+        "pool_advanced": {
+            "codex_client_headers": {
+                "profiles": [
+                    {"user_agent": "codex-tui/0.151.0 refreshed", "originator": "codex-tui"}
+                ]
+            }
+        }
+    });
+    let original = super::materialize_codex_pool_key_fingerprint(
+        "codex",
+        Some(&original_config),
+        None,
+        Some(r#"{"account_id":"acc-refresh"}"#),
+        "key-refresh",
+        "name-refresh",
+        1_760_000_000,
+    )
+    .expect("original profile");
+    let refreshed = super::refresh_codex_pool_key_fingerprint(
+        "codex",
+        Some(&refreshed_config),
+        Some(&original.fingerprint),
+        Some(r#"{"account_id":"acc-refresh"}"#),
+        "key-refresh",
+        "name-refresh",
+        1_760_000_100,
+    )
+    .expect("refreshed profile");
+
+    let original_profile = &original.fingerprint["codex_client_profile"];
+    let refreshed_profile = &refreshed.fingerprint["codex_client_profile"];
+    assert_eq!(
+        refreshed_profile["client_headers"]["user_agent"],
+        "codex-tui/0.151.0 refreshed"
+    );
+    assert_eq!(
+        original_profile["selection_key_kind"],
+        refreshed_profile["selection_key_kind"]
+    );
+    assert_eq!(
+        original_profile["selection_key_hash"],
+        refreshed_profile["selection_key_hash"]
+    );
+    assert_eq!(
+        original_profile["install_identity"],
+        refreshed_profile["install_identity"]
+    );
+    assert_eq!(
+        original.fingerprint["transport_profile"],
+        refreshed.fingerprint["transport_profile"]
+    );
+    assert_eq!(
+        original_profile["created_at_unix_secs"],
+        refreshed_profile["created_at_unix_secs"]
+    );
+    assert_eq!(refreshed_profile["frozen_at_unix_secs"], 1_760_000_100);
+    assert_ne!(
+        original_profile["fingerprint_hash"],
+        refreshed_profile["fingerprint_hash"]
     );
 }
 

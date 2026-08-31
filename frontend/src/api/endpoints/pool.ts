@@ -336,6 +336,7 @@ export interface PoolBatchAction {
     | 'disable'
     | 'enable_codex_ws'
     | 'disable_codex_ws'
+    | 'refresh_codex_client_profiles'
     | 'delete'
     | 'clear_proxy'
     | 'set_proxy'
@@ -442,6 +443,16 @@ export async function batchActionPoolKeys(
     { timeout: POOL_BATCH_ACTION_TIMEOUT_MS },
   )
   return response.data
+}
+
+export async function refreshCodexPoolClientProfiles(
+  providerId: string,
+  keyIds: string[],
+): Promise<{ affected: number; message: string }> {
+  return batchActionPoolKeys(providerId, {
+    key_ids: keyIds,
+    action: 'refresh_codex_client_profiles',
+  })
 }
 
 export interface BatchDeleteTaskStatus {
