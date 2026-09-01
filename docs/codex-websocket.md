@@ -392,8 +392,9 @@ candidate。继承结果只附加到详情响应，并标记 `scope=ws_session`�
 | `AETHER_CODEX_WS_LARGE_FRAME_CPU_ADMISSION_CAPACITY` | workers*4 | workers..256 | 大帧执行加等待总上限 |
 
 大帧普通工作在 admission 满时立即拒绝；已 admission 的工作最多等待 250 ms 获取 CPU
-worker。Provider write 在最后一个异步 fence 后同步取得两个 permit，避免等待期间账号
-状态变化。不要仅通过扩大队列掩盖存储、CPU 或结算延迟。
+worker。Provider write 同样受 admission 硬上限约束；取得 worker 后持有 permit 完成最终异步
+fence 校验并立即写入，校验同时监听 write deadline 和 execution lease。CPU 等待预算耗尽返回
+503，write deadline 耗尽返回 504。不要仅通过扩大队列掩盖存储、CPU 或结算延迟。
 
 ### 8.1 默认超时
 

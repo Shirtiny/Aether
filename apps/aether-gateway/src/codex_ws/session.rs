@@ -58,6 +58,89 @@ impl OwnedResponseCreateContext {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderWritePreflightError {
+    CandidateChanged(StepPreparationError),
+    CpuUnavailable,
+    LeaseLost,
+    WriteDeadlineExceeded,
+}
+
+fn classify_provider_write_cpu_acquire_failure(
+    error: super::cpu_budget::ProviderWriteCpuAcquireError,
+    write_deadline_expired: bool,
+    lease_valid: bool,
+) -> ProviderWritePreflightError {
+    if write_deadline_expired
+        || error == super::cpu_budget::ProviderWriteCpuAcquireError::WriteDeadlineExceeded
+    {
+        ProviderWritePreflightError::WriteDeadlineExceeded
+    } else if !lease_valid {
+        ProviderWritePreflightError::LeaseLost
+    } else {
+        ProviderWritePreflightError::CpuUnavailable
+    }
+}
+
+async fn prepare_provider_write_preflight(
+    runtime: &dyn CodexWsRuntimePort,
+    candidate: &CodexWsCandidate,
+    step_execution_guard: &StepExecutionGuard,
+    encoded_len: usize,
+    provider_write_deadline: tokio::time::Instant,
+) -> Result<
+    (
+        Option<super::cpu_budget::LargeFrameCpuPermit>,
+        StepExecutionLeaseStatus,
+        super::hot_state::CodexWsFenceDecision,
+    ),
+    ProviderWritePreflightError,
+> {
+    let cpu = match super::cpu_budget::acquire_large_frame_cpu_budget_for_provider_write(
+        encoded_len,
+        provider_write_deadline,
+    )
+    .await
+    {
+        Ok(cpu) => cpu,
+        Err(error) => {
+            let lease_status = step_execution_guard.lease_status();
+            return Err(classify_provider_write_cpu_acquire_failure(
+                error,
+                tokio::time::Instant::now() >= provider_write_deadline,
+                lease_status.is_valid(),
+            ));
+        }
+    };
+
+    let lease_status = step_execution_guard.lease_status();
+    if tokio::time::Instant::now() >= provider_write_deadline {
+        return Err(ProviderWritePreflightError::WriteDeadlineExceeded);
+    }
+    if !lease_status.is_valid() {
+        return Err(ProviderWritePreflightError::LeaseLost);
+    }
+
+    let validation = tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(provider_write_deadline) => {
+            return Err(ProviderWritePreflightError::WriteDeadlineExceeded);
+        }
+        _ = lease_status.lost() => {
+            return Err(ProviderWritePreflightError::LeaseLost);
+        }
+        result = runtime.validate_candidate_current_state(candidate) => result,
+    };
+    if tokio::time::Instant::now() >= provider_write_deadline {
+        return Err(ProviderWritePreflightError::WriteDeadlineExceeded);
+    }
+    if !lease_status.is_valid() {
+        return Err(ProviderWritePreflightError::LeaseLost);
+    }
+    let decision = validation.map_err(ProviderWritePreflightError::CandidateChanged)?;
+    Ok((cpu, lease_status, decision))
+}
+
 async fn parse_response_create_with_cpu_budget(
     text: Bytes,
     context: OwnedResponseCreateContext,
@@ -884,77 +967,60 @@ pub(crate) async fn run_codex_ws_session(
             best_effort_step_send(peer.as_mut(), RelayFrame::Close, &deadlines).await;
             return;
         }
-        match runtime.validate_candidate_current_state(&candidate).await {
-            Ok(decision) => drain_after_terminal |= decision.should_drain(),
-            Err(error) => {
-                step_usage.reject(
-                    http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                    error.reason,
-                    "Codex WebSocket candidate changed before provider execution",
-                    false,
-                );
-                step_execution_guard.release().await;
-                drop(usage_report);
-                candidate_attempt.abort().await;
-                send_not_executed_control(
-                    &mut client,
-                    &step,
-                    error.reason,
-                    error.middle_route_disposition,
-                )
-                .await;
-                best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
-                return;
-            }
-        }
-        if tokio::time::Instant::now() >= provider_write_deadline {
-            step_usage.reject(
-                http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
-                "official_provider_write_budget_exhausted",
-                "official Codex WebSocket write budget was exhausted",
-                false,
-            );
-            step_execution_guard.release().await;
-            drop(usage_report);
-            candidate_attempt.abort().await;
-            send_not_executed_control(
-                &mut client,
-                &step,
-                "official_provider_write_budget_exhausted",
-                MiddleRouteDisposition::Retain,
+        // The bounded CPU reservation remains held through the authoritative
+        // fence, so a successful preflight can start_send without another wait.
+        let (provider_write_cpu, execution_lease_status, fence_decision) =
+            match prepare_provider_write_preflight(
+                runtime,
+                &candidate,
+                &step_execution_guard,
+                materialized_step.len(),
+                provider_write_deadline,
             )
-            .await;
-            best_effort_step_send(peer.as_mut(), RelayFrame::Close, &deadlines).await;
-            return;
-        }
-        let execution_lease_status = step_execution_guard.lease_status();
-        if !execution_lease_status.is_valid() {
-            step_usage.reject(
-                http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                "runtime_permit_lease_lost",
-                "runtime concurrency permit was lost before provider execution",
-                false,
-            );
-            step_execution_guard.release().await;
-            drop(usage_report);
-            candidate_attempt.abort().await;
-            send_not_executed_control(
-                &mut client,
-                &step,
-                "runtime_permit_lease_lost",
-                MiddleRouteDisposition::Retain,
-            )
-            .await;
-            best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
-            return;
-        }
-        // This acquisition is synchronous so the authoritative shared-state
-        // validation above remains adjacent to start_send without holding a
-        // CPU worker over Redis I/O.
-        let provider_write_cpu =
-            match super::cpu_budget::try_acquire_large_frame_cpu_budget(materialized_step.len()) {
-                Ok(permit) => permit,
-                Err(()) => {
+            .await
+            {
+                Ok(preflight) => preflight,
+                Err(ProviderWritePreflightError::WriteDeadlineExceeded) => {
+                    step_usage.reject(
+                        http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                        "official_provider_write_budget_exhausted",
+                        "official Codex WebSocket write budget was exhausted",
+                        false,
+                    );
+                    step_execution_guard.release().await;
+                    drop(usage_report);
+                    candidate_attempt.abort().await;
+                    send_not_executed_control(
+                        &mut client,
+                        &step,
+                        "official_provider_write_budget_exhausted",
+                        MiddleRouteDisposition::Retain,
+                    )
+                    .await;
+                    best_effort_step_send(peer.as_mut(), RelayFrame::Close, &deadlines).await;
+                    return;
+                }
+                Err(ProviderWritePreflightError::LeaseLost) => {
+                    step_usage.reject(
+                        http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                        "runtime_permit_lease_lost",
+                        "runtime concurrency permit was lost before provider execution",
+                        false,
+                    );
+                    step_execution_guard.release().await;
+                    drop(usage_report);
+                    candidate_attempt.abort().await;
+                    send_not_executed_control(
+                        &mut client,
+                        &step,
+                        "runtime_permit_lease_lost",
+                        MiddleRouteDisposition::Retain,
+                    )
+                    .await;
+                    best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                    return;
+                }
+                Err(ProviderWritePreflightError::CpuUnavailable) => {
                     step_usage.reject(
                         http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
                         "large_frame_cpu_unavailable",
@@ -974,28 +1040,28 @@ pub(crate) async fn run_codex_ws_session(
                     best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
                     return;
                 }
+                Err(ProviderWritePreflightError::CandidateChanged(error)) => {
+                    step_usage.reject(
+                        http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                        error.reason,
+                        "Codex WebSocket candidate changed before provider execution",
+                        false,
+                    );
+                    step_execution_guard.release().await;
+                    drop(usage_report);
+                    candidate_attempt.abort().await;
+                    send_not_executed_control(
+                        &mut client,
+                        &step,
+                        error.reason,
+                        error.middle_route_disposition,
+                    )
+                    .await;
+                    best_effort_control_send(peer.as_mut(), RelayFrame::Close).await;
+                    return;
+                }
             };
-        if tokio::time::Instant::now() >= provider_write_deadline {
-            step_usage.reject(
-                http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
-                "official_provider_write_budget_exhausted",
-                "official Codex WebSocket write budget was exhausted",
-                false,
-            );
-            drop(provider_write_cpu);
-            step_execution_guard.release().await;
-            drop(usage_report);
-            candidate_attempt.abort().await;
-            send_not_executed_control(
-                &mut client,
-                &step,
-                "official_provider_write_budget_exhausted",
-                MiddleRouteDisposition::Retain,
-            )
-            .await;
-            best_effort_step_send(peer.as_mut(), RelayFrame::Close, &deadlines).await;
-            return;
-        }
+        drain_after_terminal |= fence_decision.should_drain();
         let first_dispatch = candidate_attempt.mark_provider_write_attempted();
         let mut settlement = StepSettlementGuard::new(
             runtime,
@@ -2600,6 +2666,45 @@ mod tests {
 
         assert_eq!(started_at.elapsed(), Duration::from_millis(100));
     }
+
+    #[test]
+    fn provider_write_cpu_failure_prefers_deadline_then_lease() {
+        use crate::codex_ws::cpu_budget::ProviderWriteCpuAcquireError;
+
+        assert_eq!(
+            classify_provider_write_cpu_acquire_failure(
+                ProviderWriteCpuAcquireError::CapacityUnavailable,
+                true,
+                false,
+            ),
+            ProviderWritePreflightError::WriteDeadlineExceeded
+        );
+        assert_eq!(
+            classify_provider_write_cpu_acquire_failure(
+                ProviderWriteCpuAcquireError::WriteDeadlineExceeded,
+                false,
+                true,
+            ),
+            ProviderWritePreflightError::WriteDeadlineExceeded
+        );
+        assert_eq!(
+            classify_provider_write_cpu_acquire_failure(
+                ProviderWriteCpuAcquireError::CapacityUnavailable,
+                false,
+                false,
+            ),
+            ProviderWritePreflightError::LeaseLost
+        );
+        assert_eq!(
+            classify_provider_write_cpu_acquire_failure(
+                ProviderWriteCpuAcquireError::CapacityUnavailable,
+                false,
+                true,
+            ),
+            ProviderWritePreflightError::CpuUnavailable
+        );
+    }
+
     use crate::codex_ws::runtime::{
         CodexWsCandidate, PeerError, PreparedStep, StepPreparationError, UsageReportReservation,
     };
@@ -2855,6 +2960,7 @@ mod tests {
         connect_delays: Mutex<VecDeque<Duration>>,
         handshake_turn_state: Mutex<Option<String>>,
         prepare_delay: Mutex<Option<Duration>>,
+        prepared_body: Mutex<Option<String>>,
         timeouts: Mutex<Option<aether_contracts::ExecutionTimeouts>>,
         gate: ConcurrencyGate,
         select_calls: AtomicUsize,
@@ -2908,6 +3014,7 @@ mod tests {
                 connect_delays: Mutex::new(VecDeque::new()),
                 handshake_turn_state: Mutex::new(None),
                 prepare_delay: Mutex::new(None),
+                prepared_body: Mutex::new(None),
                 timeouts: Mutex::new(None),
                 gate: ConcurrencyGate::new("codex-ws-test", 1),
                 select_calls: AtomicUsize::new(0),
@@ -2976,6 +3083,13 @@ mod tests {
                 .prepare_delay
                 .lock()
                 .expect("prepare delay should lock") = Some(delay);
+        }
+
+        fn set_prepared_body(&self, body: String) {
+            *self
+                .prepared_body
+                .lock()
+                .expect("prepared body should lock") = Some(body);
         }
 
         fn configured_candidate(
@@ -3195,10 +3309,13 @@ mod tests {
             {
                 self.runtime_fences_valid.store(false, Ordering::Release);
             }
-            Ok(PreparedStep::for_test(
-                "materialized-step".to_string(),
-                Some(permit.into()),
-            ))
+            let body = self
+                .prepared_body
+                .lock()
+                .expect("prepared body should lock")
+                .take()
+                .unwrap_or_else(|| "materialized-step".to_string());
+            Ok(PreparedStep::for_test(body, Some(permit.into())))
         }
 
         async fn validate_candidate_current_state(
@@ -3306,6 +3423,21 @@ mod tests {
 
     fn request() -> String {
         request_step("step-1", None)
+    }
+
+    fn saturate_large_frame_cpu_workers() -> Vec<crate::codex_ws::cpu_budget::LargeFrameCpuPermit> {
+        let mut permits = Vec::new();
+        loop {
+            match crate::codex_ws::cpu_budget::try_acquire_large_frame_cpu_budget(
+                crate::codex_ws::cpu_budget::LARGE_FRAME_CPU_THRESHOLD_BYTES + 1,
+            ) {
+                Ok(Some(permit)) => permits.push(permit),
+                Ok(None) => panic!("large test frame should require a CPU permit"),
+                Err(()) => break,
+            }
+        }
+        assert!(!permits.is_empty(), "at least one CPU worker should exist");
+        permits
     }
 
     fn relay_text(value: impl Into<Bytes>) -> RelayFrame {
@@ -4236,6 +4368,66 @@ mod tests {
             }
             _ => false,
         }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn large_provider_write_revalidates_candidate_after_cpu_wait() {
+        let cpu_blockers = saturate_large_frame_cpu_workers();
+        let (official, official_sent) = ScriptedPeer::new([]);
+        let runtime = Arc::new(TestRuntime::new(Box::new(official), false));
+        runtime.set_prepared_body(
+            "x".repeat(crate::codex_ws::cpu_budget::LARGE_FRAME_CPU_THRESHOLD_BYTES + 1),
+        );
+        let (client, client_sent) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
+        let task_runtime = Arc::clone(&runtime);
+        let session = tokio::spawn(async move {
+            run_codex_ws_session(Box::new(client), task_runtime.as_ref()).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.prepare_calls.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session should reach provider write preparation");
+        tokio::task::yield_now().await;
+        assert!(
+            !session.is_finished(),
+            "provider write should wait while every CPU worker is occupied"
+        );
+
+        runtime
+            .candidate_state_valid
+            .store(false, Ordering::Release);
+        drop(cpu_blockers);
+        tokio::time::timeout(Duration::from_secs(1), session)
+            .await
+            .expect("session should continue after CPU capacity is released")
+            .expect("session task should complete");
+
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *runtime
+                .rejected_reasons
+                .lock()
+                .expect("rejected reasons should lock"),
+            vec!["account_catalog_changed"]
+        );
+        assert_eq!(
+            official_sent
+                .lock()
+                .expect("official frames should lock")
+                .iter()
+                .filter(|frame| matches!(frame, RelayFrame::Text(_)))
+                .count(),
+            0
+        );
+        assert!(client_sent
+            .lock()
+            .expect("client frames should lock")
+            .iter()
+            .any(|frame| matches!(frame, RelayFrame::Text(text) if text_bytes_contains(text, "account_catalog_changed") && text_bytes_contains(text, "codex_official_ws.not_executed"))));
     }
 
     #[tokio::test]

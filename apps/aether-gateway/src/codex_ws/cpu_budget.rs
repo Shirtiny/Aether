@@ -22,6 +22,12 @@ pub(crate) struct LargeFrameCpuPermit {
     _admission: OwnedSemaphorePermit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderWriteCpuAcquireError {
+    CapacityUnavailable,
+    WriteDeadlineExceeded,
+}
+
 static LARGE_FRAME_CPU_GATE: OnceLock<LargeFrameCpuGate> = OnceLock::new();
 
 pub(crate) fn requires_large_frame_cpu_budget(encoded_len: usize) -> bool {
@@ -54,6 +60,43 @@ pub(crate) async fn acquire_large_frame_cpu_budget(
     }))
 }
 
+pub(crate) async fn acquire_large_frame_cpu_budget_for_provider_write(
+    encoded_len: usize,
+    provider_write_deadline: tokio::time::Instant,
+) -> Result<Option<LargeFrameCpuPermit>, ProviderWriteCpuAcquireError> {
+    if !requires_large_frame_cpu_budget(encoded_len) {
+        return Ok(None);
+    }
+
+    let now = tokio::time::Instant::now();
+    if now >= provider_write_deadline {
+        return Err(ProviderWriteCpuAcquireError::WriteDeadlineExceeded);
+    }
+
+    let gate = large_frame_cpu_gate();
+    let admission = Arc::clone(&gate.admission)
+        .try_acquire_owned()
+        .map_err(|_| ProviderWriteCpuAcquireError::CapacityUnavailable)?;
+    let capacity_deadline = now + LARGE_FRAME_CPU_WAIT_TIMEOUT;
+    let wait_deadline = std::cmp::min(provider_write_deadline, capacity_deadline);
+    let worker =
+        match tokio::time::timeout_at(wait_deadline, Arc::clone(&gate.workers).acquire_owned())
+            .await
+        {
+            Ok(Ok(worker)) => worker,
+            Ok(Err(_)) => return Err(ProviderWriteCpuAcquireError::CapacityUnavailable),
+            Err(_) if provider_write_deadline <= capacity_deadline => {
+                return Err(ProviderWriteCpuAcquireError::WriteDeadlineExceeded)
+            }
+            Err(_) => return Err(ProviderWriteCpuAcquireError::CapacityUnavailable),
+        };
+    Ok(Some(LargeFrameCpuPermit {
+        _worker: worker,
+        _admission: admission,
+    }))
+}
+
+#[cfg(test)]
 pub(crate) fn try_acquire_large_frame_cpu_budget(
     encoded_len: usize,
 ) -> Result<Option<LargeFrameCpuPermit>, ()> {
@@ -62,8 +105,6 @@ pub(crate) fn try_acquire_large_frame_cpu_budget(
     }
 
     let gate = large_frame_cpu_gate();
-    // Provider writes use this after their final async fence check. Both
-    // permits must therefore be obtained without yielding.
     let admission = Arc::clone(&gate.admission)
         .try_acquire_owned()
         .map_err(|_| ())?;
