@@ -462,6 +462,14 @@ impl UsageReportReservation {
         self.lifecycle_seed.as_ref()
     }
 
+    pub(crate) fn cancelled_usage_floor(
+        &self,
+        existing_usage: Option<aether_contracts::StandardizedUsage>,
+    ) -> Option<aether_contracts::StandardizedUsage> {
+        let plan = self.plan.as_ref()?;
+        aether_usage_runtime::cancelled_usage_billing_floor(plan, None, existing_usage)
+    }
+
     fn into_parts(
         mut self,
     ) -> (
@@ -3875,6 +3883,36 @@ mod tests {
             transport_profile: None,
             timeouts: None,
         }
+    }
+
+    #[test]
+    fn reserved_ws_plan_builds_cancelled_usage_for_relay() {
+        let mut plan = usage_plan_with_body();
+        plan.body.json_body = Some(json!({
+            "model": "gpt-test",
+            "input": "cancelled request input"
+        }));
+        let reservation = UsageReportReservation {
+            permit: None,
+            settlement_permit: None,
+            plan: Some(plan),
+            original_request_body: None,
+            lifecycle_seed: None,
+        };
+
+        let usage = reservation
+            .cancelled_usage_floor(None)
+            .expect("provider-reached cancellation should have a billing floor");
+
+        assert!(usage.input_tokens > 0);
+        assert_eq!(usage.cache_read_tokens, usage.input_tokens);
+        assert_eq!(
+            usage
+                .dimensions
+                .get("usage_confidence")
+                .and_then(serde_json::Value::as_str),
+            Some("billing_floor")
+        );
     }
 
     #[test]

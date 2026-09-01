@@ -10,10 +10,11 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 
 use super::protocol::{
-    classify_server_event, classify_standard_server_event, parse_response_create,
-    route_control_event, validate_official_turn_state, CodexRelayDirective, MiddleRouteDisposition,
-    ProtocolError, ResponseCreateContext, ResponseCreateStep, RouteControlAction,
-    TerminalEventSummary, TerminalKind, FIRST_FRAME_TIMEOUT, MAX_PUBLIC_CLIENT_PAYLOAD_BYTES,
+    classify_server_event, classify_standard_server_event, inject_cancelled_terminal_usage,
+    parse_response_create, route_control_event, validate_official_turn_state, CodexRelayDirective,
+    MiddleRouteDisposition, ProtocolError, ResponseCreateContext, ResponseCreateStep,
+    RouteControlAction, TerminalEventSummary, TerminalKind, FIRST_FRAME_TIMEOUT,
+    MAX_PUBLIC_CLIENT_PAYLOAD_BYTES,
 };
 use super::runtime::{
     CodexWsCandidate, CodexWsRuntimePort, CodexWsStepUsageContext, CodexWsTimeouts,
@@ -396,6 +397,15 @@ impl<'a> StepSettlementGuard<'a> {
             first_byte_elapsed,
             usage_report,
         );
+    }
+
+    fn cancelled_relay_usage(
+        &self,
+        terminal_event: Option<&TerminalEventSummary>,
+    ) -> Option<aether_contracts::StandardizedUsage> {
+        self.usage_report.as_ref()?.cancelled_usage_floor(
+            terminal_event.and_then(|event| event.standardized_usage.clone()),
+        )
     }
 
     async fn finish(
@@ -1205,6 +1215,15 @@ pub(crate) async fn run_codex_ws_session(
                 disposition,
                 terminal_frames,
             } => {
+                let terminal_frames =
+                    if matches!(&disposition, CodexWsStepDisposition::Cancelled { .. }) {
+                        terminal_frames.map(|frames| {
+                            let usage = settlement.cancelled_relay_usage(terminal_event.as_ref());
+                            inject_cancelled_terminal_usage(frames, usage.as_ref())
+                        })
+                    } else {
+                        terminal_frames
+                    };
                 settlement
                     .finish(terminal_event, terminal_kind, disposition)
                     .await;

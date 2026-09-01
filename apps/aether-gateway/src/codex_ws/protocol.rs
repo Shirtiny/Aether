@@ -794,6 +794,7 @@ impl<'a> JsonScanner<'a> {
                     | b"response.failed"
                     | b"response.incomplete"
                     | b"response.cancelled"
+                    | b"response.canceled"
                     | b"error"
                     | b"codex.rate_limits"
                     | b"codex.response.metadata"
@@ -1254,6 +1255,7 @@ fn classify_direct_server_event(bytes: &[u8]) -> Result<ServerEventClassificatio
         "response.failed" => Some(TerminalKind::Failed),
         "response.incomplete" => Some(TerminalKind::Incomplete),
         "response.cancelled" => Some(TerminalKind::Cancelled),
+        "response.canceled" => Some(TerminalKind::Cancelled),
         "error" => Some(TerminalKind::Error),
         _ => None,
     };
@@ -1661,6 +1663,107 @@ fn is_recognized_business_kind(kind: &[u8]) -> bool {
             kind,
             b"error" | b"codex.response.metadata" | b"codex.rate_limits"
         )
+}
+
+/// Makes Aether's cancelled-turn settlement usage visible to a billing middle
+/// hop. Provider-reported usage remains authoritative and is never replaced.
+pub(crate) fn inject_cancelled_terminal_usage(
+    terminal_frames: Vec<Bytes>,
+    usage: Option<&aether_contracts::StandardizedUsage>,
+) -> Vec<Bytes> {
+    let Some(usage) = usage.filter(|usage| usage.has_token_signal()) else {
+        return terminal_frames;
+    };
+    let usage_value = standardized_usage_to_responses_usage(usage);
+    terminal_frames
+        .into_iter()
+        .map(|frame| inject_cancelled_frame_usage(frame, &usage_value))
+        .collect()
+}
+
+fn inject_cancelled_frame_usage(frame: Bytes, usage: &Value) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<Value>(&frame) else {
+        return frame;
+    };
+    if !inject_cancelled_event_usage(&mut value, usage) {
+        return frame;
+    }
+    serde_json::to_vec(&value).map_or(frame, Bytes::from)
+}
+
+fn inject_cancelled_event_usage(value: &mut Value, usage: &Value) -> bool {
+    if let Some(chunks) = value.get_mut("chunks").and_then(Value::as_array_mut) {
+        return chunks
+            .iter_mut()
+            .any(|chunk| inject_cancelled_event_usage(chunk, usage));
+    }
+    let cancelled = value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "response.cancelled" | "response.canceled"));
+    if !cancelled {
+        return false;
+    }
+    let Some(response) = value.get_mut("response").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    if response
+        .get("usage")
+        .is_some_and(openai_usage_has_token_signal)
+    {
+        return false;
+    }
+    response.insert("usage".to_string(), usage.clone());
+    true
+}
+
+fn openai_usage_has_token_signal(value: &Value) -> bool {
+    serde_json::from_value::<CompactOpenAiUsage>(value.clone())
+        .ok()
+        .map(|usage| usage.standardize().has_token_signal())
+        .unwrap_or(false)
+}
+
+fn standardized_usage_to_responses_usage(usage: &aether_contracts::StandardizedUsage) -> Value {
+    let input_tokens = usage.input_tokens.max(0);
+    let output_tokens = usage.output_tokens.max(0);
+    let total_tokens = usage
+        .dimensions
+        .get("total_tokens")
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        })
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+    let mut value = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    });
+    let cache_read_tokens = usage.cache_read_tokens.max(0);
+    let cache_creation_tokens = usage.cache_creation_tokens.max(0);
+    if cache_read_tokens > 0 || cache_creation_tokens > 0 {
+        value["input_tokens_details"] = json!({});
+        if cache_read_tokens > 0 {
+            value["input_tokens_details"]["cached_tokens"] = Value::from(cache_read_tokens);
+        }
+        if cache_creation_tokens > 0 {
+            value["input_tokens_details"]["cache_write_tokens"] =
+                Value::from(cache_creation_tokens);
+        }
+    }
+    let reasoning_tokens = usage
+        .reasoning_output_tokens
+        .max(usage.reasoning_tokens)
+        .max(0);
+    if reasoning_tokens > 0 {
+        value["output_tokens_details"] = json!({
+            "reasoning_tokens": reasoning_tokens,
+        });
+    }
+    value
 }
 
 impl CompactOpenAiUsage {
@@ -2464,18 +2567,20 @@ mod tests {
 
     #[test]
     fn cancelled_and_future_incomplete_reasons_are_terminal_without_synthetic_502() {
-        let cancelled = classify_server_event(
-            r#"{"type":"response.cancelled","response":{"id":"resp-cancelled"}}"#,
-        )
-        .expect("cancelled should classify");
-        assert_eq!(cancelled.terminal, Some(TerminalKind::Cancelled));
-        assert_eq!(
-            cancelled
-                .terminal_event
-                .as_ref()
-                .and_then(|event| event.provider_status_code),
-            Some(499)
-        );
+        for event_type in ["response.cancelled", "response.canceled"] {
+            let cancelled = classify_server_event(format!(
+                r#"{{"type":"{event_type}","response":{{"id":"resp-cancelled"}}}}"#
+            ))
+            .expect("cancelled should classify");
+            assert_eq!(cancelled.terminal, Some(TerminalKind::Cancelled));
+            assert_eq!(
+                cancelled
+                    .terminal_event
+                    .as_ref()
+                    .and_then(|event| event.provider_status_code),
+                Some(499)
+            );
+        }
 
         let incomplete = classify_server_event(
             r#"{"type":"response.incomplete","response":{"id":"resp-future","incomplete_details":{"reason":"future_context_boundary"}}}"#,
@@ -2489,6 +2594,53 @@ mod tests {
                 .and_then(|event| event.provider_status_code),
             Some(200)
         );
+    }
+
+    #[test]
+    fn cancelled_terminal_injects_estimated_usage_for_middle_hop_billing() {
+        let mut usage = aether_contracts::StandardizedUsage::new();
+        usage.input_tokens = 119_404;
+        usage.output_tokens = 301;
+        usage.cache_read_tokens = 119_040;
+        usage.cache_creation_tokens = 17;
+        usage.reasoning_output_tokens = 123;
+
+        let frames = inject_cancelled_terminal_usage(
+            vec![Bytes::from_static(
+                br#"{"type":"response.cancelled","response":{"id":"resp-cancelled","usage":{}}}"#,
+            )],
+            Some(&usage),
+        );
+        let value: Value =
+            serde_json::from_slice(&frames[0]).expect("patched event should be JSON");
+        assert_eq!(value["response"]["usage"]["input_tokens"], json!(119_404));
+        assert_eq!(value["response"]["usage"]["output_tokens"], json!(301));
+        assert_eq!(value["response"]["usage"]["total_tokens"], json!(119_705));
+        assert_eq!(
+            value["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            json!(119_040)
+        );
+        assert_eq!(
+            value["response"]["usage"]["input_tokens_details"]["cache_write_tokens"],
+            json!(17)
+        );
+        assert_eq!(
+            value["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
+            json!(123)
+        );
+    }
+
+    #[test]
+    fn cancelled_terminal_preserves_authoritative_provider_usage() {
+        let frame = Bytes::from_static(
+            br#"{"type":"response.cancelled","response":{"id":"resp-cancelled","usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}"#,
+        );
+        let mut estimate = aether_contracts::StandardizedUsage::new();
+        estimate.input_tokens = 100;
+
+        let frames = inject_cancelled_terminal_usage(vec![frame.clone()], Some(&estimate));
+
+        assert_eq!(frames, vec![frame]);
     }
 
     #[test]
