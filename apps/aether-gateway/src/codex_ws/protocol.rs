@@ -1704,24 +1704,60 @@ fn inject_cancelled_event_usage(value: &mut Value, usage: &Value) -> bool {
     if !cancelled {
         return false;
     }
-    let Some(response) = value.get_mut("response").and_then(Value::as_object_mut) else {
+    let Some(event) = value.as_object_mut() else {
         return false;
     };
-    if response
-        .get("usage")
-        .is_some_and(openai_usage_has_token_signal)
+    let response = event.entry("response").or_insert_with(|| json!({}));
+    if response.is_null() {
+        *response = json!({});
+    }
+    let Some(response) = response.as_object_mut() else {
+        return false;
+    };
+    let target = response.entry("usage").or_insert_with(|| json!({}));
+    let preserve_positive_numbers = openai_usage_has_authoritative_input(target);
+    merge_json_value(target, usage, preserve_positive_numbers)
+}
+
+fn openai_usage_has_authoritative_input(usage: &Value) -> bool {
+    ["input_tokens", "prompt_tokens"].into_iter().any(|key| {
+        usage.get(key).is_some_and(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+                .is_some_and(|value| value > 0)
+        })
+    })
+}
+
+fn merge_json_value(target: &mut Value, source: &Value, preserve_positive_numbers: bool) -> bool {
+    if let Some(source) = source.as_object() {
+        if let Some(target) = target.as_object_mut() {
+            let mut changed = false;
+            for (key, value) in source {
+                changed |= merge_json_value(
+                    target.entry(key.clone()).or_insert(Value::Null),
+                    value,
+                    preserve_positive_numbers,
+                );
+            }
+            return changed;
+        }
+    }
+    if preserve_positive_numbers
+        && source.is_number()
+        && target
+            .as_i64()
+            .or_else(|| target.as_u64().and_then(|value| i64::try_from(value).ok()))
+            .is_some_and(|value| value > 0)
     {
         return false;
     }
-    response.insert("usage".to_string(), usage.clone());
+    if target == source {
+        return false;
+    }
+    *target = source.clone();
     true
-}
-
-fn openai_usage_has_token_signal(value: &Value) -> bool {
-    serde_json::from_value::<CompactOpenAiUsage>(value.clone())
-        .ok()
-        .map(|usage| usage.standardize().has_token_signal())
-        .unwrap_or(false)
 }
 
 fn standardized_usage_to_responses_usage(usage: &aether_contracts::StandardizedUsage) -> Value {
@@ -2641,6 +2677,66 @@ mod tests {
         let frames = inject_cancelled_terminal_usage(vec![frame.clone()], Some(&estimate));
 
         assert_eq!(frames, vec![frame]);
+    }
+
+    #[test]
+    fn cancelled_terminal_completes_partial_usage_without_dropping_provider_fields() {
+        let mut merged = aether_contracts::StandardizedUsage::new();
+        merged.input_tokens = 119_404;
+        merged.output_tokens = 301;
+        merged.cache_read_tokens = 119_040;
+        let frame = Bytes::from_static(
+            br#"{"type":"response.cancelled","response":{"id":"resp-cancelled","usage":{"output_tokens":301,"provider_detail":{"kept":true}}}}"#,
+        );
+
+        let frames = inject_cancelled_terminal_usage(vec![frame], Some(&merged));
+
+        let value: Value =
+            serde_json::from_slice(&frames[0]).expect("patched event should be JSON");
+        assert_eq!(value["response"]["usage"]["input_tokens"], json!(119_404));
+        assert_eq!(value["response"]["usage"]["output_tokens"], json!(301));
+        assert_eq!(
+            value["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            json!(119_040)
+        );
+        assert_eq!(
+            value["response"]["usage"]["provider_detail"]["kept"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn cancelled_terminal_completes_authoritative_input_for_strict_middle_hop_parser() {
+        let mut authoritative = aether_contracts::StandardizedUsage::new();
+        authoritative.input_tokens = 7;
+        let frame = Bytes::from_static(
+            br#"{"type":"response.cancelled","response":{"id":"resp-cancelled","usage":{"input_tokens":7}}}"#,
+        );
+
+        let frames = inject_cancelled_terminal_usage(vec![frame], Some(&authoritative));
+
+        let value: Value =
+            serde_json::from_slice(&frames[0]).expect("patched event should be JSON");
+        assert_eq!(value["response"]["usage"]["input_tokens"], json!(7));
+        assert_eq!(value["response"]["usage"]["output_tokens"], json!(0));
+        assert_eq!(value["response"]["usage"]["total_tokens"], json!(7));
+    }
+
+    #[test]
+    fn cancelled_terminal_with_top_level_response_id_gets_billable_usage() {
+        let mut estimate = aether_contracts::StandardizedUsage::new();
+        estimate.input_tokens = 11;
+        estimate.cache_read_tokens = 11;
+        let frame =
+            Bytes::from_static(br#"{"type":"response.cancelled","response_id":"resp-cancelled"}"#);
+
+        let frames = inject_cancelled_terminal_usage(vec![frame], Some(&estimate));
+
+        let value: Value =
+            serde_json::from_slice(&frames[0]).expect("patched event should be JSON");
+        assert_eq!(value["response_id"], json!("resp-cancelled"));
+        assert_eq!(value["response"]["usage"]["input_tokens"], json!(11));
+        assert_eq!(value["response"]["usage"]["output_tokens"], json!(0));
     }
 
     #[test]
