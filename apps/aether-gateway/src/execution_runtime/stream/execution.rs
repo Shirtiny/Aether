@@ -17,7 +17,8 @@ use aether_scheduler_core::{
 };
 use aether_usage_runtime::{
     build_lifecycle_usage_seed, build_stream_terminal_usage_payload_seed,
-    build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed, LifecycleUsageSeed,
+    build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed,
+    cancelled_usage_billing_floor, terminal_usage_is_cancelled, LifecycleUsageSeed,
     UsageBodyCapturePolicy, UsageRequestRecordLevel, UsageRuntimeAccess,
     DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
 };
@@ -149,7 +150,16 @@ async fn record_sync_terminal_usage(
     payload: &GatewaySyncReportRequest,
 ) {
     let context_seed = build_terminal_usage_context_seed(plan, report_context);
-    let payload_seed = build_sync_terminal_usage_payload_seed(payload);
+    let mut payload_seed = build_sync_terminal_usage_payload_seed(payload);
+    if terminal_usage_is_cancelled(payload.status_code, &payload.report_kind) {
+        let mut billing_report_context = report_context.cloned();
+        seed_kiro_report_context_input_tokens(plan, &mut billing_report_context);
+        let billing_report_context = billing_report_context.as_ref().or(report_context);
+        let existing_usage = payload_seed.standardized_usage.take();
+        payload_seed.standardized_usage =
+            cancelled_usage_billing_floor(plan, billing_report_context, existing_usage.clone())
+                .or(existing_usage);
+    }
     if let Err(err) = state
         .usage_runtime
         .persist_sync_terminal(state.data.as_ref(), context_seed, payload_seed)
@@ -241,8 +251,21 @@ async fn record_stream_terminal_usage(
     payload: &GatewayStreamReportRequest,
     cancelled: bool,
 ) {
+    let mut payload_seed = build_stream_terminal_usage_payload_seed(payload);
+    if cancelled {
+        // This function is reached after the execution-runtime headers frame,
+        // so a downstream disconnect means the provider stream was reached.
+        // Estimate only in this terminal cold path; never inspect chunks on the
+        // relay path.
+        let mut billing_report_context = report_context.cloned();
+        seed_kiro_report_context_input_tokens(plan, &mut billing_report_context);
+        let billing_report_context = billing_report_context.as_ref().or(report_context);
+        let existing_usage = payload_seed.standardized_usage.take();
+        payload_seed.standardized_usage =
+            cancelled_usage_billing_floor(plan, billing_report_context, existing_usage.clone())
+                .or(existing_usage);
+    }
     let context_seed = build_terminal_usage_context_seed(plan, report_context);
-    let payload_seed = build_stream_terminal_usage_payload_seed(payload);
     if let Err(err) = state
         .usage_runtime
         .persist_stream_terminal(state.data.as_ref(), context_seed, payload_seed, cancelled)
@@ -8488,6 +8511,9 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         .await
         .expect("downstream write timeout should cancel the stream");
         assert_eq!(usage.status_code, Some(499));
+        assert!(usage.input_tokens > 0);
+        assert_eq!(usage.cache_read_input_tokens, usage.input_tokens);
+        assert!(usage.total_tokens >= usage.input_tokens);
 
         let candidates = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -8606,6 +8632,9 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         .await
         .expect("stalled upstream should be cancelled after bounded drain");
         assert_eq!(usage.status_code, Some(499));
+        assert!(usage.input_tokens > 0);
+        assert_eq!(usage.cache_read_input_tokens, usage.input_tokens);
+        assert!(usage.total_tokens >= usage.input_tokens);
 
         let candidates = tokio::time::timeout(Duration::from_secs(1), async {
             loop {

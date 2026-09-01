@@ -268,6 +268,7 @@ struct StepSettlementGuard<'a> {
     execution_guard: Option<StepExecutionGuard>,
     usage_report: Option<UsageReportReservation>,
     first_dispatch: bool,
+    provider_write_attempted: bool,
     first_byte_elapsed: Option<Duration>,
 }
 
@@ -289,8 +290,13 @@ impl<'a> StepSettlementGuard<'a> {
             execution_guard: Some(execution_guard),
             usage_report: Some(usage_report),
             first_dispatch,
+            provider_write_attempted: false,
             first_byte_elapsed: None,
         }
+    }
+
+    fn mark_provider_write_attempted(&mut self) {
+        self.provider_write_attempted = true;
     }
 
     fn record_stream_started(&mut self, first_byte_elapsed: Duration) {
@@ -345,6 +351,7 @@ impl<'a> StepSettlementGuard<'a> {
             terminal_kind,
             disposition,
             self.first_dispatch,
+            self.provider_write_attempted,
             self.first_byte_elapsed,
             self.started_at.elapsed(),
             usage_report,
@@ -1000,6 +1007,7 @@ pub(crate) async fn run_codex_ws_session(
             first_dispatch,
         );
         step_usage.disarm();
+        settlement.mark_provider_write_attempted();
         let provider_write = send_ready_until_with_optional_cpu_budget(
             peer.as_mut(),
             RelayFrame::Text(materialized_step.into()),
@@ -3259,6 +3267,7 @@ mod tests {
             terminal_kind: Option<TerminalKind>,
             disposition: CodexWsStepDisposition,
             _first_dispatch: bool,
+            _provider_write_attempted: bool,
             first_byte_elapsed: Option<Duration>,
             _elapsed: Duration,
             _usage_report: UsageReportReservation,

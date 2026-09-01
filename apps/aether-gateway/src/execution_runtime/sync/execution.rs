@@ -14,8 +14,10 @@ use aether_scheduler_core::{
     SchedulerRequestCandidateStatusUpdate,
 };
 use aether_usage_runtime::{
-    build_lifecycle_usage_seed, build_sync_terminal_usage_payload_seed,
-    build_terminal_usage_context_seed, build_usage_event_data_seed, UsageEvent, UsageEventType,
+    apply_standardized_usage_to_event_data, build_lifecycle_usage_seed,
+    build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed,
+    build_usage_event_data_seed, cancelled_usage_billing_floor, terminal_usage_is_cancelled,
+    UsageEvent, UsageEventType,
 };
 use async_stream::stream;
 use axum::body::{to_bytes, Body, Bytes};
@@ -116,6 +118,7 @@ struct SyncAttemptTerminalGuard {
     plan: ExecutionPlan,
     report_context: Option<Value>,
     candidate_started_unix_ms: u64,
+    provider_dispatch_started: bool,
     armed: bool,
 }
 
@@ -131,8 +134,13 @@ impl SyncAttemptTerminalGuard {
             plan: plan.clone(),
             report_context,
             candidate_started_unix_ms,
+            provider_dispatch_started: false,
             armed: true,
         }
+    }
+
+    fn mark_provider_dispatch_started(&mut self) {
+        self.provider_dispatch_started = true;
     }
 
     fn disarm(&mut self) {
@@ -154,6 +162,7 @@ impl SyncAttemptTerminalGuard {
             StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
             "local_sync_attempt_aborted",
             format!("Local sync attempt failed before terminal finalization: {error:?}"),
+            false,
         )
         .await;
     }
@@ -169,6 +178,7 @@ impl Drop for SyncAttemptTerminalGuard {
         let plan = self.plan.clone();
         let report_context = self.report_context.clone();
         let candidate_started_unix_ms = self.candidate_started_unix_ms;
+        let bill_cancelled_usage = self.provider_dispatch_started;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 record_sync_attempt_forced_terminal_state(
@@ -181,6 +191,7 @@ impl Drop for SyncAttemptTerminalGuard {
                     499,
                     "local_sync_attempt_cancelled",
                     "Local sync attempt was dropped before terminal finalization, usually because the client disconnected or the request task was cancelled.",
+                    bill_cancelled_usage,
                 )
                 .await;
             });
@@ -200,13 +211,14 @@ impl Drop for SyncAttemptTerminalGuard {
 async fn record_sync_attempt_forced_terminal_state(
     state: AppState,
     plan: ExecutionPlan,
-    report_context: Option<Value>,
+    mut report_context: Option<Value>,
     candidate_started_unix_ms: u64,
     usage_event_type: UsageEventType,
     candidate_status: RequestCandidateStatus,
     status_code: u16,
     error_type: &'static str,
     error_message: impl Into<String>,
+    bill_cancelled_usage: bool,
 ) {
     let error_message = error_message.into();
     let terminal_unix_ms = current_request_candidate_unix_ms();
@@ -231,7 +243,15 @@ async fn record_sync_attempt_forced_terminal_state(
         return;
     }
 
+    if matches!(usage_event_type, UsageEventType::Cancelled) && bill_cancelled_usage {
+        seed_kiro_sync_report_context_input_tokens(&plan, &mut report_context);
+    }
     let mut usage_data = build_usage_event_data_seed(&plan, report_context.as_ref());
+    if matches!(usage_event_type, UsageEventType::Cancelled) && bill_cancelled_usage {
+        if let Some(usage) = cancelled_usage_billing_floor(&plan, report_context.as_ref(), None) {
+            apply_standardized_usage_to_event_data(&usage, &mut usage_data);
+        }
+    }
     usage_data.status_code = Some(status_code);
     usage_data.error_message = Some(error_message.clone());
     usage_data.error_category = Some(
@@ -296,8 +316,18 @@ async fn record_sync_terminal_usage(
     report_context: Option<&serde_json::Value>,
     payload: &GatewaySyncReportRequest,
 ) {
+    let mut payload_seed = build_sync_terminal_usage_payload_seed(payload);
+    let cancelled = terminal_usage_is_cancelled(payload.status_code, &payload.report_kind);
+    if cancelled {
+        let mut billing_report_context = report_context.cloned();
+        seed_kiro_sync_report_context_input_tokens(plan, &mut billing_report_context);
+        let billing_report_context = billing_report_context.as_ref().or(report_context);
+        let existing_usage = payload_seed.standardized_usage.take();
+        payload_seed.standardized_usage =
+            cancelled_usage_billing_floor(plan, billing_report_context, existing_usage.clone())
+                .or(existing_usage);
+    }
     let context_seed = build_terminal_usage_context_seed(plan, report_context);
-    let payload_seed = build_sync_terminal_usage_payload_seed(payload);
     if let Err(err) = state
         .usage_runtime
         .persist_sync_terminal(state.data.as_ref(), context_seed, payload_seed)
@@ -1557,6 +1587,7 @@ async fn execute_execution_runtime_sync_impl(
         key_id.as_str(),
     )
     .await;
+    terminal_guard.mark_provider_dispatch_started();
     #[cfg(not(test))]
     let mut result = {
         match maybe_execute_chatgpt_web_image_sync(state, &plan, report_context.as_ref())
@@ -2795,8 +2826,10 @@ mod tests {
         assert!(message.is_none());
     }
 
-    #[tokio::test]
-    async fn sync_attempt_terminal_guard_marks_dropped_pending_attempt_cancelled() {
+    async fn assert_dropped_sync_attempt_cancelled(
+        request_id: &str,
+        provider_dispatch_started: bool,
+    ) {
         let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
         let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
         let state = AppState::new()
@@ -2812,19 +2845,27 @@ mod tests {
                 ..UsageRuntimeConfig::default()
             });
         let mut plan = test_openai_image_plan(false);
-        plan.request_id = "sync-cancel-guard-request".to_string();
+        plan.request_id = request_id.to_string();
         plan.candidate_id = None;
+        plan.url = "https://example.test/v1/chat/completions".to_string();
+        plan.body = aether_contracts::RequestBody::from_json(json!({
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "bill this dispatched request"}]
+        }));
+        plan.client_api_format = "openai:chat".to_string();
+        plan.provider_api_format = "openai:chat".to_string();
+        plan.model_name = Some("gpt-5.4".to_string());
         let mut report_context = Some(json!({
             "candidate_index": 0,
             "retry_index": 0,
             "user_id": "user-cancel",
             "api_key_id": "api-key-cancel",
-            "client_api_format": "openai:image",
-            "provider_api_format": "openai:image",
-            "request_path": "/v1/images/generations",
-            "request_path_and_query": "/v1/images/generations",
-            "upstream_url": "https://example.test/v1/images/generations",
-            "mapped_model": "gpt-image-2",
+            "client_api_format": "openai:chat",
+            "provider_api_format": "openai:chat",
+            "request_path": "/v1/chat/completions",
+            "request_path_and_query": "/v1/chat/completions",
+            "upstream_url": "https://example.test/v1/chat/completions",
+            "mapped_model": "gpt-5.4",
         }));
 
         ensure_execution_request_candidate_slot(&state, &mut plan, &mut report_context).await;
@@ -2850,14 +2891,17 @@ mod tests {
         .await;
 
         {
-            let _guard =
+            let mut guard =
                 SyncAttemptTerminalGuard::new(&state, &plan, report_context.clone(), started_at);
+            if provider_dispatch_started {
+                guard.mark_provider_dispatch_started();
+            }
         }
 
         let mut stored_usage = None;
         for _ in 0..50 {
             if let Some(usage) = usage_repository
-                .find_by_request_id("sync-cancel-guard-request")
+                .find_by_request_id(request_id)
                 .await
                 .expect("usage should read")
             {
@@ -2873,9 +2917,21 @@ mod tests {
         assert_eq!(stored_usage.billing_status, "pending");
         assert_eq!(stored_usage.status_code, Some(499));
         assert_eq!(stored_usage.error_category.as_deref(), Some("cancelled"));
+        if provider_dispatch_started {
+            assert!(stored_usage.input_tokens > 0);
+            assert_eq!(
+                stored_usage.cache_read_input_tokens,
+                stored_usage.input_tokens
+            );
+            assert!(stored_usage.total_tokens >= stored_usage.input_tokens);
+        } else {
+            assert_eq!(stored_usage.input_tokens, 0);
+            assert_eq!(stored_usage.output_tokens, 0);
+            assert_eq!(stored_usage.total_tokens, 0);
+        }
 
         let stored_candidates = request_candidate_repository
-            .list_by_request_id("sync-cancel-guard-request")
+            .list_by_request_id(request_id)
             .await
             .expect("request candidates should read");
         assert_eq!(stored_candidates.len(), 1);
@@ -2888,6 +2944,73 @@ mod tests {
             stored_candidates[0].error_type.as_deref(),
             Some("local_sync_attempt_cancelled")
         );
+    }
+
+    #[tokio::test]
+    async fn sync_attempt_terminal_guard_keeps_pre_dispatch_cancellation_unbilled() {
+        assert_dropped_sync_attempt_cancelled("sync-cancel-before-dispatch", false).await;
+    }
+
+    #[tokio::test]
+    async fn sync_attempt_terminal_guard_bills_provider_dispatched_cancellation() {
+        assert_dropped_sync_attempt_cancelled("sync-cancel-after-dispatch", true).await;
+    }
+
+    #[tokio::test]
+    async fn sync_terminal_usage_bills_provider_cancel_without_usage() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    request_candidate_repository,
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let mut plan = test_openai_image_plan(false);
+        plan.request_id = "sync-provider-cancel-no-usage".into();
+        plan.url = "https://example.test/v1/chat/completions".into();
+        plan.body = aether_contracts::RequestBody::from_json(json!({
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "cancelled upstream request"}]
+        }));
+        plan.client_api_format = "openai:chat".into();
+        plan.provider_api_format = "openai:chat".into();
+        plan.model_name = Some("gpt-5.4".into());
+        let report_context = json!({
+            "user_id": "user-cancel",
+            "api_key_id": "api-key-cancel",
+            "client_api_format": "openai:chat",
+            "provider_api_format": "openai:chat"
+        });
+        let payload = GatewaySyncReportRequest {
+            trace_id: plan.request_id.clone(),
+            report_kind: "openai_chat_sync_cancelled".into(),
+            report_context: Some(report_context.clone()),
+            status_code: 499,
+            headers: BTreeMap::new(),
+            body_json: None,
+            client_body_json: None,
+            body_base64: None,
+            telemetry: None,
+        };
+
+        record_sync_terminal_usage(&state, &plan, Some(&report_context), &payload).await;
+
+        let stored = usage_repository
+            .find_by_request_id(&plan.request_id)
+            .await
+            .expect("usage should read")
+            .expect("cancelled usage should exist");
+        assert_eq!(stored.status, "cancelled");
+        assert_eq!(stored.billing_status, "pending");
+        assert!(stored.input_tokens > 0);
+        assert_eq!(stored.cache_read_input_tokens, stored.input_tokens);
     }
 
     #[test]

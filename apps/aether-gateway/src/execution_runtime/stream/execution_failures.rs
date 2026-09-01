@@ -3,7 +3,7 @@ use aether_data_contracts::repository::candidates::RequestCandidateStatus;
 use aether_scheduler_core::SchedulerRequestCandidateStatusUpdate;
 use aether_usage_runtime::{
     build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed,
-    usage_text_matches_risk_control,
+    cancelled_usage_billing_floor, terminal_usage_is_cancelled, usage_text_matches_risk_control,
 };
 use axum::body::Body;
 use axum::http::Response;
@@ -372,8 +372,14 @@ async fn record_stream_sync_failure(
         error_body.as_deref(),
     )
     .await;
+    let mut payload_seed = build_sync_terminal_usage_payload_seed(payload);
+    if terminal_usage_is_cancelled(payload.status_code, &payload.report_kind) {
+        let existing_usage = payload_seed.standardized_usage.take();
+        payload_seed.standardized_usage =
+            cancelled_usage_billing_floor(plan, report_context, existing_usage.clone())
+                .or(existing_usage);
+    }
     let context_seed = build_terminal_usage_context_seed(plan, report_context);
-    let payload_seed = build_sync_terminal_usage_payload_seed(payload);
     if let Err(err) = state
         .usage_runtime
         .persist_sync_terminal(state.data.as_ref(), context_seed, payload_seed)

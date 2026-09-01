@@ -613,6 +613,7 @@ pub(crate) trait CodexWsRuntimePort: Send + Sync {
         terminal_kind: Option<TerminalKind>,
         disposition: CodexWsStepDisposition,
         first_dispatch: bool,
+        provider_write_attempted: bool,
         first_byte_elapsed: Option<std::time::Duration>,
         elapsed: std::time::Duration,
         usage_report: UsageReportReservation,
@@ -2128,6 +2129,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         terminal_kind: Option<TerminalKind>,
         disposition: CodexWsStepDisposition,
         first_dispatch: bool,
+        provider_write_attempted: bool,
         first_byte_elapsed: Option<std::time::Duration>,
         elapsed: std::time::Duration,
         usage_report: UsageReportReservation,
@@ -2187,6 +2189,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             first_byte_ms,
             elapsed_ms,
             cancelled,
+            provider_write_attempted,
             step_settlement,
             usage_permit,
         });

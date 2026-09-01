@@ -1,4 +1,5 @@
 mod body_capture;
+mod cancelled;
 pub mod config;
 pub mod event;
 mod executor;
@@ -17,6 +18,10 @@ pub mod write;
 pub use body_capture::{
     apply_usage_body_capture_policy_to_event, apply_usage_body_capture_policy_to_record,
     UsageBodyCaptureEngine,
+};
+pub use cancelled::{
+    cancelled_usage_billing_floor, terminal_usage_is_cancelled, CANCELLED_CONTEXT_FLOOR_SOURCE,
+    CANCELLED_INPUT_ESTIMATE_SOURCE,
 };
 pub use config::UsageRuntimeConfig;
 pub use event::{now_ms, UsageEvent, UsageEventData, UsageEventType, USAGE_EVENT_VERSION};
@@ -57,14 +62,15 @@ pub use worker::{
     UsageEventRecorder, UsageQueueWorker, UsageRecordWriter,
 };
 pub use write::{
-    build_lifecycle_usage_seed, build_pending_usage_record, build_pending_usage_record_from_seed,
-    build_stream_terminal_usage_event, build_stream_terminal_usage_outcome,
-    build_stream_terminal_usage_payload_seed, build_stream_terminal_usage_seed,
-    build_streaming_usage_record, build_streaming_usage_record_from_seed,
-    build_sync_terminal_usage_event, build_sync_terminal_usage_outcome,
-    build_sync_terminal_usage_payload_seed, build_sync_terminal_usage_seed,
-    build_terminal_usage_context_seed, build_terminal_usage_event_from_outcome,
-    build_terminal_usage_event_from_seed, build_usage_event_data_seed, LifecycleUsageSeed,
-    StreamTerminalUsagePayloadSeed, SyncTerminalUsagePayloadSeed, TerminalUsageContextSeed,
-    TerminalUsageOutcome, TerminalUsageSeed, UsageTerminalState,
+    apply_standardized_usage_to_event_data, build_lifecycle_usage_seed, build_pending_usage_record,
+    build_pending_usage_record_from_seed, build_stream_terminal_usage_event,
+    build_stream_terminal_usage_outcome, build_stream_terminal_usage_payload_seed,
+    build_stream_terminal_usage_seed, build_streaming_usage_record,
+    build_streaming_usage_record_from_seed, build_sync_terminal_usage_event,
+    build_sync_terminal_usage_outcome, build_sync_terminal_usage_payload_seed,
+    build_sync_terminal_usage_seed, build_terminal_usage_context_seed,
+    build_terminal_usage_event_from_outcome, build_terminal_usage_event_from_seed,
+    build_usage_event_data_seed, LifecycleUsageSeed, StreamTerminalUsagePayloadSeed,
+    SyncTerminalUsagePayloadSeed, TerminalUsageContextSeed, TerminalUsageOutcome,
+    TerminalUsageSeed, UsageTerminalState,
 };

@@ -626,7 +626,7 @@ fn build_terminal_usage_event_from_seed_impl(
     };
 
     if let Some(usage) = standardized_usage.as_ref() {
-        apply_standardized_usage_seed(usage, &mut data);
+        apply_standardized_usage_to_event_data(usage, &mut data);
     }
 
     if data.total_tokens.is_none() {
@@ -963,11 +963,22 @@ pub fn build_stream_terminal_usage_seed(
         terminal_error_message,
         capture_metadata,
     } = payload_seed;
-    let standardized_usage = standardized_usage.or_else(|| {
-        provider_response_full.as_ref().map(|response| {
+    let standardized_usage = if cancelled {
+        let derived_standardized_usage = provider_response_full.as_ref().map(|response| {
             map_usage_from_response(response, context_seed.provider_contract.as_str())
+        });
+        merge_cancelled_usage_with_provider_usage(
+            standardized_usage,
+            derived_standardized_usage,
+            true,
+        )
+    } else {
+        standardized_usage.or_else(|| {
+            provider_response_full.as_ref().map(|response| {
+                map_usage_from_response(response, context_seed.provider_contract.as_str())
+            })
         })
-    });
+    };
     let captured_terminal_state = captured_stream_terminal_state(
         report_kind.as_str(),
         context_seed.client_contract.as_str(),
@@ -1093,6 +1104,127 @@ pub fn build_stream_terminal_usage_seed(
         request_metadata: context_seed.request_metadata,
         audit_payload: capture_metadata,
         standardized_usage,
+    }
+}
+
+fn merge_cancelled_usage_with_provider_usage(
+    estimated_usage: Option<StandardizedUsage>,
+    provider_usage: Option<StandardizedUsage>,
+    cancelled: bool,
+) -> Option<StandardizedUsage> {
+    if !cancelled {
+        return estimated_usage.or(provider_usage);
+    }
+
+    let Some(estimated_usage) = estimated_usage else {
+        return provider_usage;
+    };
+    let Some(provider_usage) = provider_usage else {
+        return Some(estimated_usage);
+    };
+    let is_billing_floor = estimated_usage
+        .dimensions
+        .get("usage_confidence")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "billing_floor");
+    if !is_billing_floor {
+        return Some(estimated_usage);
+    }
+
+    // A captured provider terminal event is authoritative per component. Keep
+    // the gateway floor only for components the provider omitted (for example,
+    // a provider may return input but omit output after a cut stream).
+    let mut merged = provider_usage;
+    let provider_input_missing = merged.input_tokens <= 0;
+    let mut used_floor = false;
+    if merged.input_tokens <= 0 && estimated_usage.input_tokens > 0 {
+        merged.input_tokens = estimated_usage.input_tokens;
+        used_floor = true;
+    }
+    if merged.output_tokens <= 0 && estimated_usage.output_tokens > 0 {
+        merged.output_tokens = estimated_usage.output_tokens;
+        used_floor = true;
+    }
+    if merged.reasoning_tokens <= 0 && estimated_usage.reasoning_tokens > 0 {
+        merged.reasoning_tokens = estimated_usage.reasoning_tokens;
+        used_floor = true;
+    }
+    if merged.reasoning_output_tokens <= 0 && estimated_usage.reasoning_output_tokens > 0 {
+        merged.reasoning_output_tokens = estimated_usage.reasoning_output_tokens;
+        used_floor = true;
+    }
+    if provider_input_missing
+        && merged.cache_creation_tokens <= 0
+        && estimated_usage.cache_creation_tokens > 0
+    {
+        merged.cache_creation_tokens = estimated_usage.cache_creation_tokens;
+        used_floor = true;
+    }
+    if provider_input_missing
+        && merged.cache_creation_ephemeral_5m_tokens <= 0
+        && estimated_usage.cache_creation_ephemeral_5m_tokens > 0
+    {
+        merged.cache_creation_ephemeral_5m_tokens =
+            estimated_usage.cache_creation_ephemeral_5m_tokens;
+        used_floor = true;
+    }
+    if provider_input_missing
+        && merged.cache_creation_ephemeral_1h_tokens <= 0
+        && estimated_usage.cache_creation_ephemeral_1h_tokens > 0
+    {
+        merged.cache_creation_ephemeral_1h_tokens =
+            estimated_usage.cache_creation_ephemeral_1h_tokens;
+        used_floor = true;
+    }
+    if provider_input_missing
+        && merged.cache_read_tokens <= 0
+        && estimated_usage.cache_read_tokens > 0
+    {
+        merged.cache_read_tokens = estimated_usage.cache_read_tokens;
+        used_floor = true;
+    }
+    if !used_floor {
+        return Some(merged);
+    }
+    merged.dimensions.insert(
+        "usage_source".to_string(),
+        estimated_usage
+            .dimensions
+            .get("usage_source")
+            .cloned()
+            .unwrap_or_else(|| json!("gateway_cached_input_floor")),
+    );
+    merged
+        .dimensions
+        .insert("usage_confidence".to_string(), json!("billing_floor"));
+    normalize_cancelled_usage_total(&mut merged);
+    Some(merged)
+}
+
+fn normalize_cancelled_usage_total(usage: &mut StandardizedUsage) {
+    let total = usage
+        .input_tokens
+        .max(0)
+        .saturating_add(usage.output_tokens.max(0))
+        .saturating_add(
+            usage
+                .reasoning_output_tokens
+                .max(usage.reasoning_tokens)
+                .max(0),
+        );
+    let explicit_total = usage
+        .dimensions
+        .get("total_tokens")
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|tokens| i64::try_from(tokens).ok()))
+        })
+        .unwrap_or_default();
+    if total > explicit_total {
+        usage
+            .dimensions
+            .insert("total_tokens".to_string(), json!(total));
     }
 }
 
@@ -2235,7 +2367,10 @@ fn infer_endpoint_kind(api_format: &str) -> Option<&str> {
     api_format.split_once(':').map(|(_, kind)| kind)
 }
 
-fn apply_standardized_usage_seed(usage: &StandardizedUsage, data: &mut UsageEventData) {
+pub fn apply_standardized_usage_to_event_data(
+    usage: &StandardizedUsage,
+    data: &mut UsageEventData,
+) {
     if usage.input_tokens > 0 {
         data.input_tokens = Some(usage.input_tokens as u64);
     }
@@ -3148,9 +3283,10 @@ mod tests {
         build_terminal_usage_event_from_seed, build_usage_event_data_seed, decode_body_for_storage,
         extract_token_counts_from_json, extract_token_counts_from_value, headers_to_json,
         mask_header_value, mask_sensitive_body_fields, mask_sensitive_headers_in_json_value,
-        parse_sse_body_for_storage, resolve_error_message, trim_owned_non_empty_string,
-        LifecycleUsageSeed, TerminalUsageSeed, UsageBodyRefsSeed, UsageBodyStatesSeed,
-        UsageRoutingSeed, UsageTerminalState, MAX_USAGE_CAPTURE_BYTES, MAX_USAGE_CAPTURE_DEPTH,
+        merge_cancelled_usage_with_provider_usage, parse_sse_body_for_storage,
+        resolve_error_message, trim_owned_non_empty_string, LifecycleUsageSeed, TerminalUsageSeed,
+        UsageBodyRefsSeed, UsageBodyStatesSeed, UsageRoutingSeed, UsageTerminalState,
+        MAX_USAGE_CAPTURE_BYTES, MAX_USAGE_CAPTURE_DEPTH,
     };
     use crate::{
         build_upsert_usage_record_from_event, GatewayStreamReportRequest, GatewaySyncReportRequest,
@@ -4027,6 +4163,53 @@ mod tests {
         assert_eq!(event.data.total_tokens, Some(34));
         assert_eq!(event.data.cache_creation_input_tokens, Some(2));
         assert_eq!(event.data.cache_read_input_tokens, Some(3));
+    }
+
+    #[test]
+    fn cancelled_usage_floor_yields_to_captured_provider_input_usage() {
+        let mut floor = StandardizedUsage::new();
+        floor.input_tokens = 100;
+        floor.cache_read_tokens = 100;
+        floor
+            .dimensions
+            .insert("usage_confidence".into(), json!("billing_floor"));
+        let mut provider = StandardizedUsage::new();
+        provider.input_tokens = 7;
+        provider.output_tokens = 3;
+        provider.dimensions.insert("total_tokens".into(), json!(10));
+
+        let merged =
+            merge_cancelled_usage_with_provider_usage(Some(floor), Some(provider.clone()), true)
+                .expect("provider usage should remain");
+        assert_eq!(merged, provider);
+    }
+
+    #[test]
+    fn cancelled_usage_floor_fills_provider_output_only_usage() {
+        let mut floor = StandardizedUsage::new();
+        floor.input_tokens = 100;
+        floor.cache_read_tokens = 100;
+        floor
+            .dimensions
+            .insert("usage_source".into(), json!("gateway_cached_input_floor"));
+        floor
+            .dimensions
+            .insert("usage_confidence".into(), json!("billing_floor"));
+        let mut provider = StandardizedUsage::new();
+        provider.output_tokens = 3;
+
+        let merged = merge_cancelled_usage_with_provider_usage(Some(floor), Some(provider), true)
+            .expect("merged usage should remain");
+        assert_eq!(merged.input_tokens, 100);
+        assert_eq!(merged.cache_read_tokens, 100);
+        assert_eq!(merged.output_tokens, 3);
+        assert_eq!(
+            merged
+                .dimensions
+                .get("total_tokens")
+                .and_then(Value::as_i64),
+            Some(103)
+        );
     }
 
     #[test]
