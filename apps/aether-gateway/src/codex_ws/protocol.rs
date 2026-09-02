@@ -10,8 +10,10 @@ pub(crate) const ROUTE_CONTROL_ACCEPT_HEADER: &str = "x-aether-ws-control-accept
 pub(crate) const ROUTE_CONTROL_SELECTED_HEADER: &str = "x-aether-ws-control";
 pub(crate) const ROUTE_CONTROL_CAPABILITIES_HEADER: &str = "x-aether-ws-capabilities";
 pub(crate) const ROUTE_CONTROL_VERSION: &str = "route-v1";
-pub(crate) const ROUTE_CONTROL_CAPABILITIES: &str = "close-after-terminal,client-reconnect";
+pub(crate) const ROUTE_CONTROL_CAPABILITIES: &str =
+    "close-after-terminal,client-reconnect,turn-cancel";
 pub(crate) const ROUTE_CONTROL_EVENT_TYPE: &str = "aether.route_control";
+pub(crate) const TURN_CANCEL_EVENT_TYPE: &str = "aether.turn.cancel";
 pub(crate) const NOT_EXECUTED_PROOF_CLASS: &str = "codex_official_ws.not_executed";
 pub(crate) const NOT_EXECUTED_PROOF_VERSION: u32 = 1;
 pub(crate) const FIRST_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -781,9 +783,10 @@ impl<'a> JsonScanner<'a> {
         if requires_fallback {
             return Ok(None);
         }
-        if kind == ROUTE_CONTROL_EVENT_TYPE.as_bytes() {
+        if kind == ROUTE_CONTROL_EVENT_TYPE.as_bytes() || kind == TURN_CANCEL_EVENT_TYPE.as_bytes()
+        {
             return Err(ProtocolError::Upstream(
-                "official server emitted a reserved route-control event",
+                "official server emitted a reserved control event",
             ));
         }
         if is_recognized_business_kind(kind)
@@ -1245,9 +1248,9 @@ fn classify_direct_server_event(bytes: &[u8]) -> Result<ServerEventClassificatio
     let value: BorrowedServerEvent<'_> = serde_json::from_slice(bytes)
         .map_err(|_| ProtocolError::Upstream("official server emitted invalid event schema"))?;
     let kind = value.kind.as_deref().unwrap_or_default();
-    if kind == ROUTE_CONTROL_EVENT_TYPE {
+    if kind == ROUTE_CONTROL_EVENT_TYPE || kind == TURN_CANCEL_EVENT_TYPE {
         return Err(ProtocolError::Upstream(
-            "official server emitted a reserved route-control event",
+            "official server emitted a reserved control event",
         ));
     }
     let terminal = match kind {
@@ -2209,6 +2212,7 @@ mod tests {
             Some(TerminalKind::Completed)
         );
         assert!(classify_server_event(r#"{"type":"aether.route_control"}"#).is_err());
+        assert!(classify_server_event(r#"{"type":"aether.turn.cancel"}"#).is_err());
     }
 
     #[test]

@@ -14,7 +14,7 @@ use super::protocol::{
     parse_response_create, route_control_event, validate_official_turn_state, CodexRelayDirective,
     MiddleRouteDisposition, ProtocolError, ResponseCreateContext, ResponseCreateStep,
     RouteControlAction, TerminalEventSummary, TerminalKind, FIRST_FRAME_TIMEOUT,
-    MAX_PUBLIC_CLIENT_PAYLOAD_BYTES,
+    MAX_PUBLIC_CLIENT_PAYLOAD_BYTES, TURN_CANCEL_EVENT_TYPE,
 };
 use super::runtime::{
     CodexWsCandidate, CodexWsRuntimePort, CodexWsStepUsageContext, CodexWsTimeouts,
@@ -1829,6 +1829,57 @@ enum StepOutcome {
     },
 }
 
+fn is_turn_cancel_frame(frame: &Bytes) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(frame) else {
+        return false;
+    };
+    let event_type = value.get("type").and_then(serde_json::Value::as_str);
+    event_type == Some(TURN_CANCEL_EVENT_TYPE) || event_type == Some("response.cancel")
+}
+
+fn turn_cancel_outcome(
+    binding: &BindingState,
+    step: &ResponseCreateStep,
+    active_response_id: Option<&str>,
+) -> StepOutcome {
+    let mut terminal_event = binding
+        .last_completed_context_tokens
+        .map(|tokens| cancelled_cached_input_floor_terminal_event(tokens, &step.model))
+        .unwrap_or_else(|| TerminalEventSummary {
+            model: Some(step.model.clone()),
+            ..Default::default()
+        });
+    terminal_event.response_id = active_response_id.map(str::to_string);
+    terminal_event.provider_status_code = Some(499);
+
+    let mut response = serde_json::Map::new();
+    if let Some(response_id) = active_response_id {
+        response.insert(
+            "id".to_string(),
+            serde_json::Value::String(response_id.to_string()),
+        );
+    }
+    response.insert(
+        "status".to_string(),
+        serde_json::Value::String("cancelled".to_string()),
+    );
+    let terminal_frame = serde_json::json!({
+        "type": "response.cancelled",
+        "response": response,
+    })
+    .to_string();
+
+    StepOutcome::Poisoned {
+        terminal_event: Some(terminal_event),
+        terminal_kind: Some(TerminalKind::Cancelled),
+        disposition: CodexWsStepDisposition::Cancelled {
+            error_type: "codex_ws_client_cancelled".to_string(),
+            error_message: "client cancelled while the provider response was in flight".to_string(),
+        },
+        terminal_frames: Some(vec![Bytes::from(terminal_frame)]),
+    }
+}
+
 fn cancelled_cached_input_floor_terminal_event(tokens: i64, model: &str) -> TerminalEventSummary {
     let mut usage = aether_contracts::StandardizedUsage::new();
     usage.input_tokens = tokens;
@@ -2063,7 +2114,21 @@ where
                             cached_input_floor_tokens: binding.last_completed_context_tokens,
                         };
                     }
-                    Ok(Some(RelayFrame::Text(_))) | Ok(Some(RelayFrame::Binary(_))) => {
+                    Ok(Some(RelayFrame::Text(text))) => {
+                        if is_turn_cancel_frame(&text) {
+                            return turn_cancel_outcome(
+                                binding,
+                                step,
+                                active_response_id.as_deref(),
+                            );
+                        }
+                        close_with_error_step(client, "one response.create is already in flight", deadlines).await;
+                        return StepOutcome::cancelled(
+                            "codex_ws_client_inflight_violation",
+                            "client sent another request while a response was in flight",
+                        );
+                    }
+                    Ok(Some(RelayFrame::Binary(_))) => {
                         close_with_error_step(client, "one response.create is already in flight", deadlines).await;
                         return StepOutcome::cancelled(
                             "codex_ws_client_inflight_violation",
@@ -4753,6 +4818,89 @@ mod tests {
                 .last(),
             Some(CodexWsStepDisposition::Cancelled { .. })
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aether_turn_cancel_returns_billable_cancelled_terminal() {
+        let first_created = json!({
+            "type": "response.created",
+            "response": {"id": "resp-1"}
+        })
+        .to_string();
+        let first_terminal = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-1",
+                "usage": {"input_tokens": 100, "output_tokens": 5, "total_tokens": 105}
+            }
+        })
+        .to_string();
+        let second_created = json!({
+            "type": "response.created",
+            "response": {"id": "resp-2"}
+        })
+        .to_string();
+        let (official, official_sent) = ScriptedPeer::new([
+            (Duration::ZERO, relay_text(first_created)),
+            (Duration::ZERO, relay_text(first_terminal)),
+            (Duration::from_millis(25), relay_text(second_created)),
+        ]);
+        let runtime = TestRuntime::new(Box::new(official), false);
+        let cancel = json!({"type": TURN_CANCEL_EVENT_TYPE}).to_string();
+        let (client, client_sent) = ScriptedPeer::new([
+            (Duration::ZERO, relay_text(request())),
+            (
+                Duration::from_millis(20),
+                relay_text(request_step("step-2", Some("resp-1"))),
+            ),
+            (Duration::from_millis(20), relay_text(cancel)),
+        ]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            *runtime
+                .report_usage_inputs
+                .lock()
+                .expect("terminal usage inputs should lock"),
+            vec![Some(100), Some(105)]
+        );
+        assert!(matches!(
+            runtime
+                .report_dispositions
+                .lock()
+                .expect("terminal dispositions should lock")
+                .last(),
+            Some(CodexWsStepDisposition::Cancelled { .. })
+        ));
+        assert!(client_sent
+            .lock()
+            .expect("client frames should lock")
+            .iter()
+            .any(|frame| matches!(frame, RelayFrame::Text(text)
+                if text_bytes_contains(text, "response.cancelled")
+                    && text_bytes_contains(text, "cached_tokens")
+                    && text_bytes_contains(text, "105"))));
+        assert!(!official_sent
+            .lock()
+            .expect("official frames should lock")
+            .iter()
+            .any(|frame| matches!(frame, RelayFrame::Text(text)
+                if text_bytes_contains(text, TURN_CANCEL_EVENT_TYPE))));
+    }
+
+    #[test]
+    fn turn_cancel_frame_accepts_public_and_negotiated_control_events() {
+        assert!(is_turn_cancel_frame(&Bytes::from_static(
+            br#"{"type":"response.cancel"}"#,
+        )));
+        assert!(is_turn_cancel_frame(&Bytes::from_static(
+            br#"{"type":"aether.turn.cancel"}"#,
+        )));
+        assert!(!is_turn_cancel_frame(&Bytes::from_static(
+            br#"{"type":"response.create"}"#,
+        )));
     }
 
     #[tokio::test]
