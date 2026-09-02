@@ -3,6 +3,9 @@ use serde_json::Value;
 
 use super::{LocalFailoverPolicy, LocalFailoverRegexRule};
 
+const SESSION_PRESERVING_OVERLOAD_MESSAGE: &str =
+    "Our servers are currently overloaded. Please try again later.";
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ParsedLocalErrorResponse {
     message: Option<String>,
@@ -56,6 +59,13 @@ pub(crate) fn classify_local_failover(
     policy: &LocalFailoverPolicy,
     input: LocalFailoverInput<'_>,
 ) -> LocalFailoverClassification {
+    // This capacity error is transient and account-independent. Retrying another
+    // candidate would move a sticky session to a different account, so it must
+    // take precedence over provider-configured retryable status codes.
+    if is_session_preserving_overload(input) {
+        return LocalFailoverClassification::StopErrorPattern;
+    }
+
     if policy.stop_status_codes.contains(&input.status_code) {
         return LocalFailoverClassification::StopStatusCode;
     }
@@ -105,6 +115,21 @@ pub(crate) fn local_failover_error_message(response_text: Option<&str>) -> Optio
 
 fn should_failover_local_upstream_status(status_code: u16) -> bool {
     status_code >= 400
+}
+
+fn is_session_preserving_overload(input: LocalFailoverInput<'_>) -> bool {
+    if input.status_code != 503 {
+        return false;
+    }
+
+    let parsed = parse_local_error_response(input.response_text);
+    parsed.message.as_deref().is_some_and(|message| {
+        message
+            .trim()
+            .eq_ignore_ascii_case(SESSION_PRESERVING_OVERLOAD_MESSAGE)
+    }) || input
+        .response_text
+        .is_some_and(|text| text.contains(SESSION_PRESERVING_OVERLOAD_MESSAGE))
 }
 
 fn parse_local_error_response(response_text: Option<&str>) -> ParsedLocalErrorResponse {
@@ -206,7 +231,10 @@ fn local_failover_regex_rule_matches(
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{classify_local_failover, LocalFailoverClassification, LocalFailoverInput};
+    use super::{
+        classify_local_failover, LocalFailoverClassification, LocalFailoverInput,
+        SESSION_PRESERVING_OVERLOAD_MESSAGE,
+    };
     use crate::orchestration::{LocalFailoverPolicy, LocalFailoverRegexRule};
 
     #[test]
@@ -219,6 +247,43 @@ mod tests {
         assert_eq!(
             classify_local_failover(&policy, LocalFailoverInput::new(503, None)),
             LocalFailoverClassification::StopStatusCode
+        );
+    }
+
+    #[test]
+    fn classifier_never_fails_over_session_preserving_overload() {
+        let policy = LocalFailoverPolicy {
+            continue_status_codes: [503].into_iter().collect(),
+            ..LocalFailoverPolicy::default()
+        };
+
+        for response_text in [
+            SESSION_PRESERVING_OVERLOAD_MESSAGE,
+            r#"{"error":{"message":"Our servers are currently overloaded. Please try again later."}}"#,
+            r#"{"message":"Our servers are currently overloaded. Please try again later."}"#,
+            "event: error\ndata: {\"error\":{\"message\":\"Our servers are currently overloaded. Please try again later.\"}}",
+        ] {
+            assert_eq!(
+                classify_local_failover(
+                    &policy,
+                    LocalFailoverInput::new(503, Some(response_text))
+                ),
+                LocalFailoverClassification::StopErrorPattern
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_still_retries_other_service_unavailable_errors() {
+        assert_eq!(
+            classify_local_failover(
+                &LocalFailoverPolicy::default(),
+                LocalFailoverInput::new(
+                    503,
+                    Some(r#"{"error":{"message":"upstream service unavailable"}}"#)
+                )
+            ),
+            LocalFailoverClassification::RetryUpstreamFailure
         );
     }
 

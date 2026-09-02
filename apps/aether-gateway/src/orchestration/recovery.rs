@@ -90,6 +90,27 @@ mod tests {
     }
 
     #[test]
+    fn recovery_stops_failover_for_session_preserving_overload() {
+        let policy = LocalFailoverPolicy {
+            continue_status_codes: [503].into_iter().collect(),
+            ..LocalFailoverPolicy::default()
+        };
+
+        assert_eq!(
+            recover_local_failover_decision(
+                &policy,
+                LocalFailoverInput::new(
+                    503,
+                    Some(
+                        r#"{"error":{"message":"Our servers are currently overloaded. Please try again later."}}"#
+                    )
+                )
+            ),
+            LocalFailoverDecision::StopLocalFailover
+        );
+    }
+
+    #[test]
     fn recovery_maps_neutral_status_to_use_default() {
         assert_eq!(
             recover_local_failover_decision(

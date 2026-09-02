@@ -1936,7 +1936,7 @@ mod tests {
 
     use super::{
         admin_provider_pool_key_error_is_account_invalid, apply_local_execution_effect,
-        local_candidate_failure_should_record_pool_error,
+        local_candidate_failure_should_record_pool_error, local_pool_failure_should_clear_sticky,
         pool_error_should_record_or_refresh_quota, pool_error_should_trigger_codex_quota_refresh,
         pool_score_hard_state_for_status, prepare_pool_after_handshake_failure,
         prepare_pool_attempt_started_effect, LocalAdaptiveRateLimitEffect,
@@ -4656,6 +4656,17 @@ mod tests {
         assert!(local_candidate_failure_should_record_pool_error(
             LocalFailoverClassification::RetryUpstreamFailure,
             429,
+        ));
+    }
+
+    #[test]
+    fn session_preserving_overload_does_not_clear_pool_sticky() {
+        let error_body = r#"{"error":{"message":"Our servers are currently overloaded. Please try again later."}}"#;
+
+        assert!(!local_pool_failure_should_clear_sticky(
+            503,
+            Some(error_body),
+            LocalFailoverClassification::StopErrorPattern,
         ));
     }
 
