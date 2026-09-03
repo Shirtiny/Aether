@@ -1,6 +1,6 @@
 # Codex 号池出站 Session / Thread / Turn 合成与复用计划
 
-> Status: **Final（第四稿）— 已批准在 `custom` 分支实现；生产号池打开开关仍受 §17 门禁**
+> Status: **Implemented（第四稿）— 已在 `custom` 分支落地，随 `backend-v0.7.101` 交付；线上未更新，生产号池打开开关仍受 §17 门禁**
 > Date: 2026-09-03
 > Scope: Codex OAuth 号池在选号之后，按账号、按日合成并复用上游可见的 `session_id` / `thread_id` / `turn_id` / `window_id`
 > Production changes: **本轮不更新线上。** 只提交代码并推送 `backend-v0.7.101` tag 触发 CI 构建镜像；**不执行 `update.sh`**，运行中的容器不变，功能缺省关闭
@@ -447,7 +447,7 @@ HTTP planner 今天对 dash `session-id` / `thread-id` / `x-codex-window-id` 没
 
 - 同一账号、同一天，入站 session A/B 映射出的 distinct 出站 thread ≤ N；A 重复请求稳定
 - 入站 turn 映射出的 distinct 出站 turn：同一合成 thread 内 ≤ M；同一入站 `turn_id` 稳定
-- **不同入站 root 不得共用出站 `turn_id`**（即使账号全局 turn 计数因此可能到 N×M）
+- **不同出站 thread 不得共用出站 `turn_id`**；同一出站 thread 内的不同入站 root 可以碰撞到同一 turn 槽（这是「每条 thread 每日 ≤ M 个 turn」的必然结果），账号全局 turn 计数上限仍是 N×M
 - turn 槽按出站 thread 分区：root freeze 跨日命中的 thread 与当天同槽位新 mint 的 thread 不共用 turn UUID
 - 出站 `session_id == thread_id`；`window_id == "{thread}:0"`；WS `x-client-request-id == thread_id`
 - 出站剥离 parent/fork/subagent/`thread_source`/`subagent_kind`；WS 绑定仍用入站 ID
@@ -525,7 +525,7 @@ cargo test -p aether-ai-formats --lib codex
 
 **不接受**（实现前必须避免）：
 
-- 不同入站 root 共用出站 `turn_id`
+- 不同出站 thread 共用出站 `turn_id`（turn 槽必须按出站 thread UUID 分区；同一出站 thread 内的槽碰撞是设计内的）
 - 同一入站 root 在 HTTP compact / WS / 重连 / 跨日之间换 thread（freeze 未过期时）
 - freeze miss 时透传入站身份
 - memory 请求透传入站 UUID，或把 memory 剥成没有任何 thread 的请求
@@ -648,10 +648,11 @@ Search（`:1118` 之后、`normalize_openai_search_headers` 之前）、chat / f
 
 ### 18.6 WS
 
-- `CodexWsCandidate` 新增 `outbound_identity: Option<Arc<OutboundCodexRuntimeIdentity>>` 与 `runtime_identity_scope: Option<Arc<CodexRuntimeIdentityScope>>`；在 `select_candidates`（async）里、`account_profile` 解析之后按首步入站身份解析一次；`candidate.headers`、`binding_identity`、`upstream_binding_identity` 不变。
-- `official_request`：有快照时 `session-id` / `thread-id` / `x-client-request-id` / `x-codex-window-id` 写出站，跳过 `x-codex-parent-thread-id` / `x-openai-subagent`，turn-metadata 头按 blob 规则改写。
-- `prepare_step`（async）：按本步入站 turn key 决定出站 turn：与快照同一入站 turn → `Snapshot`；否则查 / 写 per-turn freeze 或按快照 thread 取槽（`Frozen` / `Minted`）；memory → `None`。结果作为新参数传入 `materialize_codex_ws_step_body`，在 profile body apply 与稳定 `prompt_cache_key` 之后做 body 改写；`x-codex-turn-state` 按 `turn_source` 转发 / 剥离。
-- 物理连接复用（`activate_reused_candidate`）沿用被绑定候选对象上的快照。
+- `CodexWsCandidate` 新增 `runtime_identity: Option<Arc<CodexWsRuntimeIdentitySnapshot>>`（`{ scope, outbound }`）。`select_candidates` 在 `account_profile` 解析之后、仅当 adapter 为 Codex 时，用首步 `value` + 入站请求头解析一次（`resolve_candidate_runtime_identity`，`ws_snapshot = None`）；`candidate.headers`、`binding_identity`、`upstream_binding_identity`、握手指纹不变。
+- `official_request`：有快照时 `session-id` / `thread-id` / `x-client-request-id` 写出站 session/thread；`x-codex-window-id` 在入站带该头时写出站 window；跳过 `x-codex-parent-thread-id` / `x-openai-subagent`；`x-codex-turn-metadata` 头先按 profile 归一化，再按 blob 规则改写（`rewrite_codex_turn_metadata_string`）。入站 `x-codex-turn-state` 本来就不进入握手头，无需剥离。
+- `prepare_step`：在取走 `step.value` 之前用本步入站身份 + 候选快照调用 `resolve_step_runtime_identity`（`ws_snapshot = Some(&snapshot.outbound)`）：与快照同一入站 turn → `Snapshot`；否则查 / 写 per-turn freeze 或按快照 thread 取槽（`Frozen` / `Minted`）；memory → 无 turn。结果 `CodexWsStepRuntimeIdentity { inbound, outbound }` 作为最后一个参数传入 `materialize_codex_ws_step_body`，在 profile body apply 与稳定 `prompt_cache_key` 之后、序列化之前以 `WsStepBody` surface 只改写 body（不碰头）。
+- 存储不可用：候选已有同一入站 root 的快照时，本步沿用快照的 session/thread/window 与快照 turn（来源 `Snapshot`），不透传入站；首步（尚无快照）存储不可用 → 该候选整段透传，与 HTTP 相同，打点 `codex_rid_store_unavailable`。
+- 物理连接复用（`activate_reused_candidate`）沿用被绑定候选对象上的快照；`rebind` 换候选时随新候选重新解析（同一入站 root、同一 `selection_fp` 因 root freeze 得到同一出站 thread）。
 
 ### 18.7 配置校验挂点
 

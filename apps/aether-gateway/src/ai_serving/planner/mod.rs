@@ -70,7 +70,7 @@ pub(crate) use self::specialized::{
 };
 pub(crate) use self::standard::{
     apply_codex_official_ws_handshake_headers, apply_codex_pool_concrete_account_profile,
-    apply_codex_pool_concrete_account_profile_for_api_format,
+    apply_codex_pool_concrete_account_profile_for_api_format, apply_codex_pool_runtime_identity,
     apply_codex_pool_stable_client_headers,
     build_compact_local_openai_responses_stream_plan_and_reports_for_kind_with_required_capabilities,
     build_local_openai_chat_stream_attempt_source_for_kind,
@@ -88,7 +88,7 @@ pub(crate) use self::standard::{
     build_local_sync_plan_and_reports as build_standard_family_sync_plan_and_reports,
     build_owned_local_openai_responses_request_body as build_codex_ws_local_openai_responses_request_body,
     materialize_codex_pool_key_fingerprint, refresh_codex_pool_key_fingerprint,
-    resolve_codex_pool_concrete_account_profile,
+    resolve_codex_pool_concrete_account_profile, resolve_codex_pool_runtime_identity_scope,
     set_local_openai_chat_execution_exhausted_diagnostic, validate_codex_client_header_config,
 };
 pub(crate) use self::state::{

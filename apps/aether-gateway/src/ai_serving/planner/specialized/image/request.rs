@@ -236,6 +236,16 @@ pub(super) async fn resolve_local_openai_image_candidate_payload_parts(
             transport,
             spec_metadata.api_format,
         );
+        crate::ai_serving::apply_codex_pool_runtime_identity(
+            &state.runtime_state,
+            transport,
+            &mut provider_request_headers,
+            None,
+            effective_headers,
+            Some(body_json),
+            crate::codex_runtime_identity::CodexRuntimeIdentitySurface::Headers,
+        )
+        .await;
     }
     let requested_model = normalized_request
         .requested_model

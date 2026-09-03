@@ -168,7 +168,21 @@ pub(crate) fn normalize_pool_advanced_config(
     match value {
         serde_json::Value::Null => Ok(None),
         // `pool_advanced: {}` still means "enable pool mode with defaults".
-        serde_json::Value::Object(map) => Ok(Some(serde_json::Value::Object(map))),
+        serde_json::Value::Object(map) => {
+            // Other pool_advanced keys stay opaque here; the runtime identity
+            // switch is validated on write so an invalid shape never reaches
+            // the request path (which would silently keep synthesis off).
+            if let Some(runtime_identity) =
+                map.get(crate::codex_runtime_identity::CODEX_RUNTIME_IDENTITY_KEY)
+            {
+                if !runtime_identity.is_null() {
+                    crate::codex_runtime_identity::validate_codex_runtime_identity_config(
+                        runtime_identity,
+                    )?;
+                }
+            }
+            Ok(Some(serde_json::Value::Object(map)))
+        }
         _ => Err("pool_advanced 必须是 JSON 对象".to_string()),
     }
 }
@@ -345,6 +359,57 @@ mod tests {
         assert_eq!(
             normalize_pool_advanced_config(Some(json!(false))).unwrap_err(),
             "pool_advanced 必须是 JSON 对象"
+        );
+    }
+
+    #[test]
+    fn normalize_pool_advanced_validates_codex_runtime_identity() {
+        let valid = json!({
+            "codex_client_headers": { "enabled": true },
+            "codex_runtime_identity": {
+                "enabled": true,
+                "expected_threads_per_day": 6,
+                "expected_turns_per_day": 48
+            }
+        });
+        assert_eq!(
+            normalize_pool_advanced_config(Some(valid.clone())).expect("valid config"),
+            Some(valid)
+        );
+        // Disabled or null keeps the object untouched.
+        let disabled = json!({ "codex_runtime_identity": { "enabled": false } });
+        assert_eq!(
+            normalize_pool_advanced_config(Some(disabled.clone())).expect("disabled config"),
+            Some(disabled)
+        );
+        let null = json!({ "codex_runtime_identity": null });
+        assert_eq!(
+            normalize_pool_advanced_config(Some(null.clone())).expect("null config"),
+            Some(null)
+        );
+        // Invalid shapes are rejected on write.
+        assert_eq!(
+            normalize_pool_advanced_config(Some(json!({ "codex_runtime_identity": true })))
+                .unwrap_err(),
+            "pool_advanced.codex_runtime_identity 必须是 JSON 对象"
+        );
+        assert_eq!(
+            normalize_pool_advanced_config(Some(json!({
+                "codex_runtime_identity": { "enabled": true, "expected_turns_per_day": 48 }
+            })))
+            .unwrap_err(),
+            "codex_runtime_identity.expected_threads_per_day 必须是 1 到 64 之间的整数"
+        );
+        assert_eq!(
+            normalize_pool_advanced_config(Some(json!({
+                "codex_runtime_identity": {
+                    "enabled": true,
+                    "expected_threads_per_day": 6,
+                    "expected_turns_per_day": 4096
+                }
+            })))
+            .unwrap_err(),
+            "codex_runtime_identity.expected_turns_per_day 必须是 1 到 512 之间的整数"
         );
     }
 

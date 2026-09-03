@@ -38,6 +38,12 @@ use crate::codex_profile::{
     normalize_codex_turn_metadata_for_profile, CodexConcreteAccountProfile,
     CodexProfileRequestBodyPolicy,
 };
+use crate::codex_runtime_identity::{
+    apply_outbound_codex_runtime_identity, resolve_outbound_codex_runtime_identity,
+    rewrite_codex_turn_metadata_string, CodexRuntimeIdentityResolution, CodexRuntimeIdentityScope,
+    CodexRuntimeIdentityStore, CodexRuntimeIdentitySurface, InboundCodexRuntimeIdentity,
+    OutboundCodexRuntimeIdentity,
+};
 use crate::handlers::shared::provider_pool::admin_provider_pool_key_error_is_account_invalid;
 use crate::orchestration::{
     apply_local_execution_effect, is_session_preserving_rate_limit,
@@ -169,6 +175,11 @@ pub(crate) struct CodexWsCandidate {
     pub(crate) headers: BTreeMap<String, String>,
     pub(crate) response_headers: BTreeMap<String, String>,
     pub(crate) account_profile: Option<Arc<CodexConcreteAccountProfile>>,
+    /// Outbound runtime identity snapshot negotiated at selection when the
+    /// pool's `codex_runtime_identity` switch is on. `None` keeps the inbound
+    /// official identity on the wire unchanged. Never part of the binding
+    /// identity or handshake fingerprint.
+    pub(crate) runtime_identity: Option<Arc<CodexWsRuntimeIdentitySnapshot>>,
     pub(crate) report_kind: String,
     pub(crate) binding_identity: UpstreamBindingIdentity,
     pub(crate) adapter: crate::orchestration::ResponsesWebSocketAdapter,
@@ -195,6 +206,22 @@ pub(crate) struct CodexWsCandidate {
     pub(crate) shared_catalog_binding: super::hot_state::CodexWsCatalogBindingLease,
     pub(crate) prewrite_cleanup_permit:
         Option<tokio::sync::mpsc::OwnedPermit<CodexWsSettlementCommit>>,
+}
+
+/// Candidate-scoped outbound identity: the session/thread/window presented at
+/// the physical handshake plus the first step's outbound turn. Later steps
+/// resolve their own turn against this snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexWsRuntimeIdentitySnapshot {
+    pub(crate) scope: CodexRuntimeIdentityScope,
+    pub(crate) outbound: OutboundCodexRuntimeIdentity,
+}
+
+/// Step-scoped outbound identity resolved from the candidate snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexWsStepRuntimeIdentity {
+    pub(crate) inbound: InboundCodexRuntimeIdentity,
+    pub(crate) outbound: OutboundCodexRuntimeIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -878,6 +905,65 @@ impl GatewayCodexWsRuntime {
         Ok(parts)
     }
 
+    /// Negotiates the candidate-scoped outbound runtime identity for a Codex
+    /// pool account with synthesis enabled. `None` means passthrough: the
+    /// switch is off, the first step carries no official root, or the shared
+    /// store was unavailable (logged by the resolver).
+    async fn resolve_candidate_runtime_identity(
+        &self,
+        transport: &crate::ai_serving::GatewayProviderTransportSnapshot,
+        first_step: &ResponseCreateStep,
+    ) -> Option<Arc<CodexWsRuntimeIdentitySnapshot>> {
+        let scope = crate::ai_serving::resolve_codex_pool_runtime_identity_scope(transport)?;
+        let inbound = InboundCodexRuntimeIdentity::from_request(
+            Some(&first_step.value),
+            Some(&self.request_headers),
+        );
+        let store = CodexRuntimeIdentityStore::new(&self.state.runtime_state);
+        match resolve_outbound_codex_runtime_identity(
+            &store,
+            &scope,
+            &inbound,
+            None,
+            std::time::SystemTime::now(),
+        )
+        .await
+        {
+            CodexRuntimeIdentityResolution::Rewrite(outbound) => {
+                Some(Arc::new(CodexWsRuntimeIdentitySnapshot { scope, outbound }))
+            }
+            CodexRuntimeIdentityResolution::Passthrough => None,
+        }
+    }
+
+    /// Resolves one step's outbound turn against the candidate snapshot. The
+    /// snapshot's session/thread/window are authoritative for the bound
+    /// connection; only a new inbound turn touches the shared store.
+    async fn resolve_step_runtime_identity(
+        &self,
+        candidate: &CodexWsCandidate,
+        body: &serde_json::Value,
+    ) -> Option<CodexWsStepRuntimeIdentity> {
+        let snapshot = candidate.runtime_identity.as_deref()?;
+        let inbound =
+            InboundCodexRuntimeIdentity::from_request(Some(body), Some(&self.request_headers));
+        let store = CodexRuntimeIdentityStore::new(&self.state.runtime_state);
+        match resolve_outbound_codex_runtime_identity(
+            &store,
+            &snapshot.scope,
+            &inbound,
+            Some(&snapshot.outbound),
+            std::time::SystemTime::now(),
+        )
+        .await
+        {
+            CodexRuntimeIdentityResolution::Rewrite(outbound) => {
+                Some(CodexWsStepRuntimeIdentity { inbound, outbound })
+            }
+            CodexRuntimeIdentityResolution::Passthrough => None,
+        }
+    }
+
     fn official_request(
         &self,
         candidate: &CodexWsCandidate,
@@ -919,25 +1005,39 @@ impl GatewayCodexWsRuntime {
                 insert_header(request.headers_mut(), name, value)?;
             }
         }
-        insert_header(request.headers_mut(), "session-id", &identity.session_id)?;
-        insert_header(request.headers_mut(), "thread-id", &identity.thread_id)?;
-        insert_header(
-            request.headers_mut(),
-            "x-client-request-id",
-            &identity.thread_id,
-        )?;
+        // With pool runtime identity synthesis the handshake presents the
+        // candidate's outbound session tree; the inbound official identity
+        // keeps owning binding, fencing and settlement.
+        let outbound_identity = candidate
+            .runtime_identity
+            .as_deref()
+            .map(|snapshot| &snapshot.outbound);
+        let session_id = outbound_identity
+            .map(|outbound| outbound.session_id.as_str())
+            .unwrap_or(identity.session_id.as_str());
+        let thread_id = outbound_identity
+            .map(|outbound| outbound.thread_id.as_str())
+            .unwrap_or(identity.thread_id.as_str());
+        insert_header(request.headers_mut(), "session-id", session_id)?;
+        insert_header(request.headers_mut(), "thread-id", thread_id)?;
+        insert_header(request.headers_mut(), "x-client-request-id", thread_id)?;
         if let Some(window_id) = identity.window_id.as_deref() {
+            let window_id = outbound_identity
+                .map(|outbound| outbound.window_id.as_str())
+                .unwrap_or(window_id);
             insert_header(request.headers_mut(), "x-codex-window-id", window_id)?;
         }
-        if let Some(parent_thread_id) = identity.parent_thread_id.as_deref() {
-            insert_header(
-                request.headers_mut(),
-                "x-codex-parent-thread-id",
-                parent_thread_id,
-            )?;
-        }
-        if let Some(subagent) = identity.subagent.as_deref() {
-            insert_header(request.headers_mut(), "x-openai-subagent", subagent)?;
+        if outbound_identity.is_none() {
+            if let Some(parent_thread_id) = identity.parent_thread_id.as_deref() {
+                insert_header(
+                    request.headers_mut(),
+                    "x-codex-parent-thread-id",
+                    parent_thread_id,
+                )?;
+            }
+            if let Some(subagent) = identity.subagent.as_deref() {
+                insert_header(request.headers_mut(), "x-openai-subagent", subagent)?;
+            }
         }
         if identity.responses_lite {
             insert_header(
@@ -954,6 +1054,16 @@ impl GatewayCodexWsRuntime {
                         || PeerError("x-codex-turn-metadata is not a valid JSON object".into()),
                     )?;
                 normalized_turn_metadata.as_str()
+            } else {
+                turn_metadata
+            };
+            let synthesized_turn_metadata;
+            let turn_metadata = if let Some(outbound) = outbound_identity {
+                synthesized_turn_metadata =
+                    rewrite_codex_turn_metadata_string(turn_metadata, outbound).ok_or_else(
+                        || PeerError("x-codex-turn-metadata is not a valid JSON object".into()),
+                    )?;
+                synthesized_turn_metadata.as_str()
             } else {
                 turn_metadata
             };
@@ -1449,6 +1559,13 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                     .map(Arc::new)
                 })
                 .flatten();
+            let runtime_identity =
+                if adapter == crate::orchestration::ResponsesWebSocketAdapter::Codex {
+                    self.resolve_candidate_runtime_identity(transport.as_ref(), first_step)
+                        .await
+                } else {
+                    None
+                };
             let body_rules = transport.endpoint.body_rules.clone().map(Arc::new);
             let force_body_stream_field =
                 crate::ai_serving::endpoint_config_forces_upstream_stream_policy(
@@ -1482,6 +1599,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 headers,
                 response_headers: BTreeMap::new(),
                 account_profile,
+                runtime_identity,
                 report_kind,
                 binding_identity,
                 adapter,
@@ -1939,6 +2057,12 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         // settlement even though the body is moved for materialization below.
         let lifecycle_report_context =
             step_report_context(candidate.lifecycle.report_context().cloned(), step, None);
+        // Per-step outbound runtime identity (pool synthesis). Resolved from
+        // the client body before it is taken, so `prompt_cache_key` presence
+        // reflects what the client actually sent rather than a later filler.
+        let runtime_identity = self
+            .resolve_step_runtime_identity(candidate, &step.value)
+            .await;
         let body = std::mem::take(&mut step.value);
         // The long-lived candidate template intentionally carries no payload,
         // but each settled WS step still needs its own accepted client body for
@@ -1977,6 +2101,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                         account_profile.as_deref(),
                         adapter,
                         &provider_type,
+                        runtime_identity.as_ref(),
                     )?;
                     Ok::<_, StepPreparationError>((materialized_body, original_request_body))
                 })
@@ -1998,6 +2123,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                     candidate.account_profile.as_deref(),
                     candidate.adapter,
                     &candidate.provider_type,
+                    runtime_identity.as_ref(),
                 )?;
                 (materialized_body, original_request_body)
             };
@@ -2928,6 +3054,7 @@ fn materialize_codex_ws_step_body(
     account_profile: Option<&CodexConcreteAccountProfile>,
     adapter: crate::orchestration::ResponsesWebSocketAdapter,
     provider_type: &str,
+    runtime_identity: Option<&CodexWsStepRuntimeIdentity>,
 ) -> Result<MaterializedCodexWsStepBody, StepPreparationError> {
     let explicit_session_key =
         crate::client_session_affinity::client_session_affinity_from_request(
@@ -3005,6 +3132,19 @@ fn materialize_codex_ws_step_body(
         explicit_session_key.as_deref(),
         None,
     );
+    // Pool outbound runtime identity: rewrite the body projections last so the
+    // profile normalization and the prompt_cache_key filler above are already
+    // in their final shape. Handshake headers are composed by the runtime.
+    if let Some(identity) = runtime_identity {
+        apply_outbound_codex_runtime_identity(
+            &mut BTreeMap::new(),
+            Some(&mut body),
+            None,
+            &identity.inbound,
+            &identity.outbound,
+            CodexRuntimeIdentitySurface::WsStepBody,
+        );
+    }
     let body_text = serde_json::to_string(&body)
         .map_err(|_| StepPreparationError::retain("account_profile_materialization_failed"))?;
     if body_text.len() > super::protocol::MAX_PUBLIC_CLIENT_PAYLOAD_BYTES {
@@ -3762,6 +3902,7 @@ mod tests {
             None,
             crate::orchestration::ResponsesWebSocketAdapter::Codex,
             "codex",
+            None,
         )
         .expect("initial body should materialize");
 
@@ -3795,6 +3936,7 @@ mod tests {
             None,
             crate::orchestration::ResponsesWebSocketAdapter::Codex,
             "codex",
+            None,
         )
         .expect("follow-up body should materialize");
 
@@ -3835,6 +3977,7 @@ mod tests {
             None,
             crate::orchestration::ResponsesWebSocketAdapter::Standard,
             "openai",
+            None,
         )
         .expect("standard body should materialize");
 

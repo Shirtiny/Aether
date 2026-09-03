@@ -756,6 +756,16 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         transport,
         provider_api_format,
     );
+    crate::ai_serving::apply_codex_pool_runtime_identity(
+        &state.runtime_state,
+        transport,
+        &mut provider_request_headers,
+        None,
+        effective_headers,
+        Some(body_json),
+        crate::codex_runtime_identity::CodexRuntimeIdentitySurface::Headers,
+    )
+    .await;
     apply_grok_chat_identity_headers(&mut provider_request_headers, transport);
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
@@ -914,6 +924,16 @@ async fn build_gemini_cli_cross_format_payload_parts(
         &resolved.transport,
         provider_api_format,
     );
+    crate::ai_serving::apply_codex_pool_runtime_identity(
+        &state.runtime_state,
+        &resolved.transport,
+        &mut provider_request_headers,
+        None,
+        effective_headers,
+        Some(original_body_json),
+        crate::codex_runtime_identity::CodexRuntimeIdentitySurface::Headers,
+    )
+    .await;
     apply_grok_chat_identity_headers(&mut provider_request_headers, &resolved.transport);
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
@@ -1186,6 +1206,16 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
         transport,
         provider_api_format,
     );
+    crate::ai_serving::apply_codex_pool_runtime_identity(
+        &state.runtime_state,
+        transport,
+        &mut provider_request_headers,
+        None,
+        effective_headers,
+        Some(body_json),
+        crate::codex_runtime_identity::CodexRuntimeIdentitySurface::Headers,
+    )
+    .await;
     apply_grok_chat_identity_headers(&mut provider_request_headers, transport);
 
     Some(LocalStandardCandidatePayloadParts {

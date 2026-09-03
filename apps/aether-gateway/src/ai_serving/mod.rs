@@ -22,7 +22,7 @@ pub(crate) use self::finalize::internal::{
 };
 pub(crate) use self::planner::{
     apply_codex_official_ws_handshake_headers, apply_codex_pool_concrete_account_profile,
-    apply_codex_pool_concrete_account_profile_for_api_format,
+    apply_codex_pool_concrete_account_profile_for_api_format, apply_codex_pool_runtime_identity,
     apply_codex_pool_stable_client_headers, apply_local_runtime_candidate_terminal_reason,
     build_codex_ws_local_openai_responses_request_body,
     build_compact_local_openai_responses_stream_plan_and_reports_for_kind_with_required_capabilities,
@@ -61,7 +61,7 @@ pub(crate) use self::planner::{
     pool_sticky_session_token_for_request, provider_key_pool_score_id,
     provider_key_pool_score_scope, read_candidate_transport_snapshot,
     record_local_runtime_candidate_skip_reason, refresh_codex_pool_key_fingerprint,
-    resolve_codex_pool_concrete_account_profile,
+    resolve_codex_pool_concrete_account_profile, resolve_codex_pool_runtime_identity_scope,
     set_local_openai_chat_execution_exhausted_diagnostic,
     set_local_openai_image_execution_exhausted_diagnostic, validate_codex_client_header_config,
     CandidateFailureDiagnostic, CandidateFailureDiagnosticKind, EligibleLocalExecutionCandidate,

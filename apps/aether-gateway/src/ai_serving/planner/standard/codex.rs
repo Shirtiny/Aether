@@ -4,7 +4,10 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
+use std::time::SystemTime;
 
+use aether_runtime_state::RuntimeState;
+use http::HeaderMap;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -16,6 +19,12 @@ use crate::codex_profile::{
     strip_codex_client_metadata_from_body, CodexConcreteAccountProfile,
     CodexProfileMaterializationOutcome, CodexProfileMaterializeInput,
     CodexProfileRequestBodyPolicy,
+};
+use crate::codex_runtime_identity::{
+    apply_outbound_codex_runtime_identity, codex_runtime_identity_rewrite_enabled,
+    resolve_outbound_codex_runtime_identity, CodexRuntimeIdentityResolution,
+    CodexRuntimeIdentityScope, CodexRuntimeIdentityStore, CodexRuntimeIdentitySurface,
+    InboundCodexRuntimeIdentity, OutboundCodexRuntimeIdentity,
 };
 
 pub(crate) use crate::ai_serving::{
@@ -323,6 +332,75 @@ pub(crate) fn resolve_codex_pool_concrete_account_profile(
         header_profile.user_agent.as_str(),
         header_profile.originator.as_str(),
     )
+}
+
+/// Outbound runtime identity synthesis scope for the selected Codex pool
+/// account. `None` when the provider is not Codex or the
+/// `pool_advanced.codex_runtime_identity` switch is off/invalid.
+///
+/// The scope is keyed by the same account selection key as the client header
+/// profile, so one upstream account always owns one synthetic tree.
+pub(crate) fn resolve_codex_pool_runtime_identity_scope(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<CodexRuntimeIdentityScope> {
+    if !transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("codex")
+    {
+        return None;
+    }
+    let pool_advanced = transport
+        .provider
+        .config
+        .as_ref()
+        .and_then(|config| config.get("pool_advanced"));
+    let config =
+        codex_runtime_identity_rewrite_enabled(pool_advanced, transport.provider.id.as_str())?;
+    let selection_key = codex_pool_client_profile_selection_key(transport);
+    Some(CodexRuntimeIdentityScope::new(
+        transport.provider.id.as_str(),
+        &selection_key,
+        config,
+    ))
+}
+
+/// HTTP-side runtime identity pass. Runs after key selection, the shared
+/// special-header pass and the concrete account profile, so it only rewrites
+/// projections that still equal the inbound official identity.
+///
+/// `original_body` / `original_headers` are the client's request as accepted
+/// (before Aether fillers), which decides what the client really sent.
+/// Returns the outbound identity when a rewrite happened.
+pub(crate) async fn apply_codex_pool_runtime_identity(
+    runtime: &RuntimeState,
+    transport: &GatewayProviderTransportSnapshot,
+    provider_request_headers: &mut BTreeMap<String, String>,
+    provider_request_body: Option<&mut Value>,
+    original_headers: &HeaderMap,
+    original_body: Option<&Value>,
+    surface: CodexRuntimeIdentitySurface,
+) -> Option<OutboundCodexRuntimeIdentity> {
+    let scope = resolve_codex_pool_runtime_identity_scope(transport)?;
+    let inbound = InboundCodexRuntimeIdentity::from_request(original_body, Some(original_headers));
+    let store = CodexRuntimeIdentityStore::new(runtime);
+    match resolve_outbound_codex_runtime_identity(&store, &scope, &inbound, None, SystemTime::now())
+        .await
+    {
+        CodexRuntimeIdentityResolution::Rewrite(outbound) => {
+            apply_outbound_codex_runtime_identity(
+                provider_request_headers,
+                provider_request_body,
+                Some(original_headers),
+                &inbound,
+                &outbound,
+                surface,
+            );
+            Some(outbound)
+        }
+        CodexRuntimeIdentityResolution::Passthrough => None,
+    }
 }
 
 fn remove_codex_pool_upstream_leak_headers(

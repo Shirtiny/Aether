@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   buildCodexClientHeadersConfig,
+  buildCodexRuntimeIdentityConfig,
   buildDefaultCodexClientHeaderProfiles,
   buildPoolCooldownFieldLayout,
   buildPoolHealthToggleCards,
@@ -27,6 +28,29 @@ describe('poolAdvancedDialog', () => {
       { user_agent: 'codex-tui/0.151.0', originator: 'codex-tui' },
       { user_agent: ' codex-tui/0.151.0 ', originator: 'codex-tui' },
     ])).toThrow('重复')
+  })
+
+  it('builds the Codex runtime identity switch with backend-aligned bounds', () => {
+    expect(buildCodexRuntimeIdentityConfig(true, 8, 64)).toEqual({
+      enabled: true,
+      expected_threads_per_day: 8,
+      expected_turns_per_day: 64,
+    })
+    expect(() => buildCodexRuntimeIdentityConfig(true, 0, 64)).toThrow('Thread')
+    expect(() => buildCodexRuntimeIdentityConfig(true, 8, 513)).toThrow('Turn')
+    expect(() => buildCodexRuntimeIdentityConfig(true, 8.5, 64)).toThrow('Thread')
+    expect(() => buildCodexRuntimeIdentityConfig(true, undefined, 64)).toThrow('Thread')
+    // Disabled keeps valid values for re-enabling and drops invalid ones instead of failing.
+    expect(buildCodexRuntimeIdentityConfig(false, 8, 64)).toEqual({
+      enabled: false,
+      expected_threads_per_day: 8,
+      expected_turns_per_day: 64,
+    })
+    expect(buildCodexRuntimeIdentityConfig(false, 0, undefined)).toEqual({
+      enabled: false,
+      expected_threads_per_day: undefined,
+      expected_turns_per_day: undefined,
+    })
   })
 
   it('returns health toggle cards in the desktop display order', () => {

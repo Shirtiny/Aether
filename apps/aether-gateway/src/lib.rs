@@ -36,6 +36,7 @@ mod cache;
 mod client_session_affinity;
 mod clock;
 mod codex_profile;
+mod codex_runtime_identity;
 mod codex_ws;
 mod codex_ws_config;
 mod constants;

@@ -905,6 +905,20 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts(
         transport,
         provider_api_format,
     );
+    // Pool outbound runtime identity synthesis runs last: it only rewrites
+    // projections that still equal the inbound official identity, so the
+    // stable prompt_cache_key filler, special headers and account profile
+    // above already see their final shape.
+    crate::ai_serving::apply_codex_pool_runtime_identity(
+        &state.runtime_state,
+        transport,
+        &mut provider_request_headers,
+        Some(&mut provider_request_body),
+        effective_headers,
+        Some(body_json),
+        crate::codex_runtime_identity::CodexRuntimeIdentitySurface::HttpResponses,
+    )
+    .await;
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
         redaction.redacted,
@@ -1116,6 +1130,16 @@ async fn resolve_local_openai_search_candidate_payload_parts(
         transport.key.decrypted_auth_config.as_deref(),
     );
     apply_codex_pool_search_account_profile(&mut provider_request_headers, transport);
+    crate::ai_serving::apply_codex_pool_runtime_identity(
+        &state.runtime_state,
+        transport,
+        &mut provider_request_headers,
+        None,
+        effective_headers,
+        Some(body_json),
+        crate::codex_runtime_identity::CodexRuntimeIdentitySurface::Headers,
+    )
+    .await;
     normalize_openai_search_headers(&mut provider_request_headers, upstream_is_stream);
 
     let Some(upstream_url) = crate::ai_serving::transport::build_local_openai_search_upstream_url(
@@ -1755,6 +1779,16 @@ async fn resolve_openai_responses_to_openai_image_payload_parts(
             transport,
             provider_api_format,
         );
+        crate::ai_serving::apply_codex_pool_runtime_identity(
+            &state.runtime_state,
+            transport,
+            &mut provider_request_headers,
+            None,
+            &parts.headers,
+            Some(body_json),
+            crate::codex_runtime_identity::CodexRuntimeIdentitySurface::Headers,
+        )
+        .await;
     }
 
     let (execution_strategy, conversion_mode) =

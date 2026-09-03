@@ -3653,6 +3653,7 @@ mod tests {
             headers: BTreeMap::new(),
             response_headers: BTreeMap::new(),
             account_profile: None,
+            runtime_identity: None,
             report_kind: "openai_responses_stream_success".to_string(),
             binding_identity: super::super::runtime::UpstreamBindingIdentity::for_test(
                 crate::orchestration::ResponsesWebSocketAdapter::Codex,

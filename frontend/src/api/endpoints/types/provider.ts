@@ -729,6 +729,17 @@ export interface PoolCodexClientHeadersConfig {
   profiles?: PoolCodexClientHeaderProfile[] | null
 }
 
+/**
+ * Codex 号池出站 Session/Thread/Turn 合成开关。开启后 Aether 以每个账号
+ * 「每日预期 thread / turn 数」为槽位上限，向上游呈现折叠后的会话树；
+ * 入站官方身份（sticky / WS 绑定 / 用量）不受影响。
+ */
+export interface PoolCodexRuntimeIdentityConfig {
+  enabled?: boolean | null
+  expected_threads_per_day?: number | null
+  expected_turns_per_day?: number | null
+}
+
 export interface PoolAdvancedConfig {
   global_priority?: number | null
   sticky_session_ttl_seconds?: number | null
@@ -773,6 +784,7 @@ export interface PoolAdvancedConfig {
   account_self_check_concurrency?: number | null
   auto_remove_banned_keys?: boolean
   codex_client_headers?: PoolCodexClientHeadersConfig | null
+  codex_runtime_identity?: PoolCodexRuntimeIdentityConfig | null
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

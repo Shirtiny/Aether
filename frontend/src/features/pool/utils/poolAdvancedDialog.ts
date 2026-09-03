@@ -1,6 +1,7 @@
 import type {
   PoolCodexClientHeaderProfile,
   PoolCodexClientHeadersConfig,
+  PoolCodexRuntimeIdentityConfig,
 } from '@/api/endpoints/types/provider'
 
 import defaultCodexClientHeaderProfiles from '../../../../../resources/codex-client-header-profiles.json'
@@ -35,6 +36,54 @@ export function buildCodexClientHeadersConfig(
   return {
     enabled,
     profiles: normalized.length > 0 ? normalized : undefined,
+  }
+}
+
+// 与后端 `codex_runtime_identity` 校验范围一致（apps/aether-gateway/src/codex_runtime_identity.rs）。
+export const CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY_RANGE = { min: 1, max: 64 } as const
+export const CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY_RANGE = { min: 1, max: 512 } as const
+export const DEFAULT_CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY = 8
+export const DEFAULT_CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY = 64
+
+function normalizeBoundedInteger(
+  value: number | null | undefined,
+  range: { readonly min: number, readonly max: number },
+): number | null {
+  if (typeof value !== 'number' || !Number.isInteger(value)) return null
+  if (value < range.min || value > range.max) return null
+  return value
+}
+
+/**
+ * 构造号池「会话身份合成」配置。开启时两个上限必填且必须在范围内；
+ * 关闭时仍保留合法的数值，便于重新开启时沿用上次的设置。
+ */
+export function buildCodexRuntimeIdentityConfig(
+  enabled: boolean,
+  expectedThreadsPerDay: number | null | undefined,
+  expectedTurnsPerDay: number | null | undefined,
+): PoolCodexRuntimeIdentityConfig {
+  const threads = normalizeBoundedInteger(expectedThreadsPerDay, CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY_RANGE)
+  const turns = normalizeBoundedInteger(expectedTurnsPerDay, CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY_RANGE)
+  if (enabled) {
+    if (threads === null) {
+      const { min, max } = CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY_RANGE
+      throw new Error(`每日预期 Thread 数必须是 ${min} 到 ${max} 之间的整数`)
+    }
+    if (turns === null) {
+      const { min, max } = CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY_RANGE
+      throw new Error(`每日预期 Turn 数必须是 ${min} 到 ${max} 之间的整数`)
+    }
+    return {
+      enabled: true,
+      expected_threads_per_day: threads,
+      expected_turns_per_day: turns,
+    }
+  }
+  return {
+    enabled: false,
+    expected_threads_per_day: threads ?? undefined,
+    expected_turns_per_day: turns ?? undefined,
   }
 }
 

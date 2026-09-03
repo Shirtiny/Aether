@@ -291,6 +291,16 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             transport,
             provider_api_format,
         );
+        crate::ai_serving::apply_codex_pool_runtime_identity(
+            &state.runtime_state,
+            transport,
+            &mut provider_request_headers,
+            None,
+            effective_headers,
+            Some(body_json),
+            crate::codex_runtime_identity::CodexRuntimeIdentitySurface::Headers,
+        )
+        .await;
         let (execution_strategy, conversion_mode) =
             ai_local_execution_contract_for_formats("openai:chat", "openai:chat");
         let resolved_report_kind =
@@ -718,6 +728,16 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         transport,
         provider_api_format.as_str(),
     );
+    crate::ai_serving::apply_codex_pool_runtime_identity(
+        &state.runtime_state,
+        transport,
+        &mut provider_request_headers,
+        None,
+        effective_headers,
+        Some(body_json),
+        crate::codex_runtime_identity::CodexRuntimeIdentitySurface::Headers,
+    )
+    .await;
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
         redaction.redacted,
@@ -876,6 +896,16 @@ async fn build_gemini_cli_openai_chat_cross_format_payload_parts(
         &resolved.transport,
         provider_api_format,
     );
+    crate::ai_serving::apply_codex_pool_runtime_identity(
+        &state.runtime_state,
+        &resolved.transport,
+        &mut provider_request_headers,
+        None,
+        effective_headers,
+        Some(original_body_json),
+        crate::codex_runtime_identity::CodexRuntimeIdentitySurface::Headers,
+    )
+    .await;
     request_identity_response_encoding_when_redacted(
         &mut provider_request_headers,
         request_redacted,
@@ -1063,6 +1093,16 @@ async fn resolve_openai_chat_to_openai_image_payload_parts(
             transport,
             provider_api_format,
         );
+        crate::ai_serving::apply_codex_pool_runtime_identity(
+            &state.runtime_state,
+            transport,
+            &mut provider_request_headers,
+            None,
+            &parts.headers,
+            Some(body_json),
+            crate::codex_runtime_identity::CodexRuntimeIdentitySurface::Headers,
+        )
+        .await;
     }
 
     let (execution_strategy, conversion_mode) =

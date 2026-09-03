@@ -407,7 +407,7 @@ where
     ])
 }
 
-fn serialize_ascii_json(value: &Value) -> Option<String> {
+pub(crate) fn serialize_ascii_json(value: &Value) -> Option<String> {
     let mut encoded = Vec::new();
     let mut serializer = serde_json::Serializer::with_formatter(&mut encoded, AsciiJsonFormatter);
     value.serialize(&mut serializer).ok()?;
@@ -735,7 +735,7 @@ fn digest_hex(bytes: &[u8]) -> String {
     format!("sha256:{}", hex_lower(&hasher.finalize()))
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write as _;

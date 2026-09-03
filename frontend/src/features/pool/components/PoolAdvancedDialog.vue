@@ -563,6 +563,69 @@
             </div>
           </div>
         </div>
+
+        <div class="space-y-3 rounded-xl border border-border/60 bg-muted/30 p-4">
+          <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div class="space-y-1">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="text-sm font-medium">会话身份合成</span>
+                <span class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                  Session / Thread / Turn
+                </span>
+              </div>
+              <p class="text-xs leading-5 text-muted-foreground">
+                开启后，每个账号对上游呈现的会话树会按下方「每日预期数」折叠：同一账号一天内只出现固定数量的 Thread，每个 Thread 只出现固定数量的 Turn。
+                客户端侧 sticky、WebSocket 绑定与用量统计仍使用原始会话身份。关闭后原样透传客户端会话 ID。
+              </p>
+            </div>
+            <Switch
+              :model-value="codexRuntimeIdentityForm.enabled"
+              class="shrink-0"
+              @update:model-value="(v: boolean) => codexRuntimeIdentityForm.enabled = v"
+            />
+          </div>
+
+          <div
+            v-if="codexRuntimeIdentityForm.enabled"
+            class="grid gap-3 sm:grid-cols-2"
+          >
+            <div class="space-y-1.5">
+              <Label>
+                每日预期 Thread 数
+                <span class="text-xs text-muted-foreground">
+                  ({{ CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY_RANGE.min }}-{{ CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY_RANGE.max }})
+                </span>
+              </Label>
+              <Input
+                :model-value="codexRuntimeIdentityForm.expected_threads_per_day ?? ''"
+                type="number"
+                :min="CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY_RANGE.min"
+                :max="CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY_RANGE.max"
+                :placeholder="String(DEFAULT_CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY)"
+                @update:model-value="(v) => codexRuntimeIdentityForm.expected_threads_per_day = parseNum(v)"
+              />
+            </div>
+            <div class="space-y-1.5">
+              <Label>
+                每日预期 Turn 数
+                <span class="text-xs text-muted-foreground">
+                  (每个 Thread，{{ CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY_RANGE.min }}-{{ CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY_RANGE.max }})
+                </span>
+              </Label>
+              <Input
+                :model-value="codexRuntimeIdentityForm.expected_turns_per_day ?? ''"
+                type="number"
+                :min="CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY_RANGE.min"
+                :max="CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY_RANGE.max"
+                :placeholder="String(DEFAULT_CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY)"
+                @update:model-value="(v) => codexRuntimeIdentityForm.expected_turns_per_day = parseNum(v)"
+              />
+            </div>
+            <p class="text-xs leading-5 text-muted-foreground sm:col-span-2">
+              建议值：Thread 8、Turn 64。数值越小，上游可见的会话数越少，但更多真实会话会共用同一个出站 Thread，跨日重连的会话仍保持原出站身份。
+            </p>
+          </div>
+        </div>
       </section>
 
       <section
@@ -739,10 +802,15 @@ import {
 import {
   buildDefaultCodexClientHeaderProfiles,
   buildCodexClientHeadersConfig,
+  buildCodexRuntimeIdentityConfig,
   buildPoolCooldownFieldLayout,
   buildPoolCostFieldLayout,
   buildPoolHealthToggleCards,
   buildPoolSecondarySectionLayout,
+  CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY_RANGE,
+  CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY_RANGE,
+  DEFAULT_CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY,
+  DEFAULT_CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY,
   isCodexFiveHourQuotaBasis,
   type PoolHealthToggleKey,
 } from '@/features/pool/utils/poolAdvancedDialog'
@@ -831,6 +899,18 @@ interface CodexHeaderFormState {
 const codexHeaderForm = ref<CodexHeaderFormState>({
   enabled: true,
   profiles: [],
+})
+
+interface CodexRuntimeIdentityFormState {
+  enabled: boolean
+  expected_threads_per_day: number | undefined
+  expected_turns_per_day: number | undefined
+}
+
+const codexRuntimeIdentityForm = ref<CodexRuntimeIdentityFormState>({
+  enabled: false,
+  expected_threads_per_day: DEFAULT_CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY,
+  expected_turns_per_day: DEFAULT_CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY,
 })
 
 interface ClaudeFormState {
@@ -1019,6 +1099,16 @@ watch(() => props.modelValue, (open) => {
     profiles: normalizeCodexHeaderProfiles(codexClientHeaders?.profiles),
   }
 
+  // 会话身份合成缺省关闭；数值缺失时展示推荐值，真正生效以保存后的配置为准。
+  const codexRuntimeIdentity = cfg?.codex_runtime_identity
+  codexRuntimeIdentityForm.value = {
+    enabled: codexRuntimeIdentity?.enabled === true,
+    expected_threads_per_day:
+      codexRuntimeIdentity?.expected_threads_per_day ?? DEFAULT_CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY,
+    expected_turns_per_day:
+      codexRuntimeIdentity?.expected_turns_per_day ?? DEFAULT_CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY,
+  }
+
   const cc = props.currentClaudeConfig
   claudeForm.value = {
     session_control_enabled: cc?.max_sessions !== null,
@@ -1102,8 +1192,14 @@ async function handleSave() {
         codexHeaderForm.value.enabled,
         codexHeaderForm.value.profiles,
       )
+      poolAdvanced.codex_runtime_identity = buildCodexRuntimeIdentityConfig(
+        codexRuntimeIdentityForm.value.enabled,
+        codexRuntimeIdentityForm.value.expected_threads_per_day,
+        codexRuntimeIdentityForm.value.expected_turns_per_day,
+      )
     } else {
       delete poolAdvanced.codex_client_headers
+      delete poolAdvanced.codex_runtime_identity
     }
 
     const payload: Parameters<typeof updateProvider>[1] = {

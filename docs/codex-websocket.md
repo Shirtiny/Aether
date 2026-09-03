@@ -338,6 +338,17 @@ profile 中任意 revision、crypto provider 或 buffer 字段不匹配都会 fa
 
 单节点内存测试不能替代多实例 Redis 验证。
 
+### 6.4 号池会话身份合成（可选）
+
+号池高级设置里的「会话身份合成」（`pool_advanced.codex_runtime_identity`，缺省关闭）
+打开后，WS 上游握手头 `session-id` / `thread-id` / `x-client-request-id` /
+`x-codex-window-id` 与每个 `response.create` 的 `client_metadata` /
+`x-codex-turn-metadata` 都改写为该账号的出站合成身份；`x-codex-parent-thread-id`
+与 `x-openai-subagent` 不再上游。绑定身份、fence、sticky 与用量仍以客户端原始
+`session_id` / `thread_id` / `turn_id` 为准，握手指纹也不包含出站 ID，因此
+连接复用与切换行为不变。设计与算法见
+`docs/architecture/codex-pool-runtime-identity-synthesis-plan-2026-09-03.md`。
+
 ## 7. 用量、结算和资源边界
 
 Aether 使用进程级有界队列，不为每个连接或 terminal 创建无界任务：

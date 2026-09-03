@@ -706,7 +706,7 @@ The implementation target is therefore:
 - normalize profile-owned fields to the selected account's concrete profile on the upstream request;
 - keep pool account/key profile template selection deterministic through stable hash/rendezvous selection;
 - parse and pass through user-supplied Codex runtime identity by default;
-- synthesize missing Codex runtime identity only in a future explicit synthetic-client mode;
+- synthesize outbound Codex runtime identity only behind the explicit `pool_advanced.codex_runtime_identity` switch (implemented 2026-09-03, default off; see `docs/architecture/codex-pool-runtime-identity-synthesis-plan-2026-09-03.md`). It rewrites the outbound copy after account selection and never touches the inbound identity used for sticky, WS binding and usage;
 - never let profile synthesis change pool-account ownership, user session ownership, or sticky binding semantics.
 
 ### Non-Negotiable Invariants
@@ -714,11 +714,11 @@ The implementation target is therefore:
 - `chatgpt-account-id` is selected-key/auth state. It must not be copied from inbound user headers.
 - pool sticky remains based on Codex session identity, not account id, hostname, IP, UA, or random request id.
 - existing sticky token format `session=<id>` remains stable.
-- if official `session_id` / `thread_id` / `turn_id` / `window_id` exists, Aether must not overwrite those runtime fields.
+- if official `session_id` / `thread_id` / `turn_id` / `window_id` exists, Aether must not overwrite those runtime fields on the default path. With `codex_runtime_identity.enabled` the outbound projections are rewritten to the synthesized per-account tree; sticky, WS binding and usage keep reading the inbound values.
 - `installation_id` is profile-owned client-install identity. For Codex pool upstream requests, it should come from the selected account's concrete profile, not from the inbound user's local Codex install.
 - if Aether normalizes `installation_id`, it must update every exposed surface consistently: direct headers, flat `client_metadata`, and parsed `x-codex-turn-metadata`.
 - Aether should not synthesize `session_id`, `thread_id`, `window_id`, or `turn_id` on the default path when the user request already carries Codex metadata.
-- if a future synthetic-client mode synthesizes runtime ids, every surface must agree on the same ids: headers, `client_metadata`, sticky token source, and compatibility fields.
+- when `codex_runtime_identity` synthesizes runtime ids, every outbound surface must agree on the same ids: dash headers, flat `client_metadata`, the `x-codex-turn-metadata` blob, `prompt_cache_key` when it was derived from the session, and the WS handshake. The sticky token source stays the inbound root.
 - the built-in/configured profile library is the durable template source, not the final account portrait.
 - each pool account/key should select one template from that library through a stable hash/rendezvous selection key.
 - each selected template must be materialized into a frozen concrete account profile for that account/key.
@@ -730,7 +730,7 @@ The implementation target is therefore:
 - prefer account id from the selected key's decrypted auth config when available; fall back to provider key id, then key name only if key id is unavailable.
 - changing the template library must not automatically change existing account concrete profiles. Hash/rendezvous selection is for first assignment/backfill unless an explicit migration is run.
 - concrete account profile state must be namespaced by provider/pool/selected account/key scope, not by inbound user session.
-- user runtime identity state, if synthetic-client mode is ever enabled, must be namespaced by Aether tenant/user/API-key scope where available.
+- synthesized runtime identity state is namespaced by provider + selected account (`selection_fp`) by design: the goal is one collapsed tree per account, so two Aether users on the same account share slots. Redis keys carry hashes only (`selection_fp`, `hash16(inbound root)`), never raw ids.
 - raw user/session/profile ids should not be used as Redis keys or logs without hashing/redaction.
 - prompt cache behavior must be preserved by default. Profile work must not add or overwrite `prompt_cache_key` on the default path.
 - prompt/instructions/environment context must not be parsed or rewritten by profile v1.
