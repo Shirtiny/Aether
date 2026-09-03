@@ -40,9 +40,9 @@ use crate::codex_profile::{
 };
 use crate::handlers::shared::provider_pool::admin_provider_pool_key_error_is_account_invalid;
 use crate::orchestration::{
-    apply_local_execution_effect, local_execution_candidate_metadata_from_report_context,
-    prepare_pool_attempt_started_effect, LocalExecutionEffect, LocalExecutionEffectContext,
-    LocalFailoverClassification,
+    apply_local_execution_effect, is_session_preserving_rate_limit,
+    local_execution_candidate_metadata_from_report_context, prepare_pool_attempt_started_effect,
+    LocalExecutionEffect, LocalExecutionEffectContext, LocalFailoverClassification,
 };
 use crate::request_candidate_runtime::record_local_request_candidate_status;
 use crate::{AppState, GatewayError};
@@ -266,7 +266,11 @@ impl CodexWsHandshakeFailure {
         StepPreparationError {
             reason: self.route_reason,
             middle_route_disposition: MiddleRouteDisposition::Retain,
-            allow_candidate_failover: self.penalize_account || !sticky_binding_established,
+            // A generic Codex gateway/proxy 429 is not proof that the OAuth
+            // account is invalid or exhausted. Keep the selected account even
+            // when this request has not established sticky state.
+            allow_candidate_failover: !(self.status_code == 429 && !self.penalize_account)
+                && (self.penalize_account || !sticky_binding_established),
         }
     }
 }
@@ -2351,7 +2355,7 @@ fn classify_codex_ws_handshake_failure(
                 ),
             };
             let penalize_account =
-                handshake_should_penalize_account(status_code, error_body.as_deref());
+                codex_handshake_should_penalize_account(status_code, error_body.as_deref());
             CodexWsHandshakeFailure {
                 status_code,
                 response_headers,
@@ -2541,6 +2545,17 @@ fn transport_handshake_failure(
 fn handshake_should_penalize_account(status_code: u16, error_body: Option<&str>) -> bool {
     matches!(status_code, 402 | 409 | 429)
         || admin_provider_pool_key_error_is_account_invalid(status_code, error_body)
+}
+
+fn codex_handshake_should_penalize_account(status_code: u16, error_body: Option<&str>) -> bool {
+    if admin_provider_pool_key_error_is_account_invalid(status_code, error_body) {
+        return true;
+    }
+    if is_session_preserving_rate_limit(status_code, error_body) {
+        return false;
+    }
+
+    matches!(status_code, 402 | 409 | 429)
 }
 
 fn handshake_utf8_diagnostic(error: &str) -> String {
@@ -4147,6 +4162,7 @@ mod tests {
 
         assert_eq!(failure.status_code, 429);
         assert!(failure.penalize_account);
+        assert!(failure.preparation_error(false).allow_candidate_failover);
         assert_eq!(
             failure.error_type,
             "responses_websocket_handshake_rate_limited"
@@ -4295,6 +4311,26 @@ mod tests {
         assert!(
             account_failure
                 .preparation_error(true)
+                .allow_candidate_failover
+        );
+        assert!(
+            account_failure
+                .preparation_error(false)
+                .allow_candidate_failover
+        );
+
+        let proxy_rate_limit = http::Response::builder()
+            .status(http::StatusCode::TOO_MANY_REQUESTS)
+            .body(Some(br#"{"detail":"Rate limit exceeded"}"#.to_vec()))
+            .expect("HTTP response should build");
+        let proxy_rate_limit = classify_codex_ws_handshake_failure(
+            WebSocketError::Http(Box::new(proxy_rate_limit)),
+            CodexWsRouteKind::Proxy,
+        );
+        assert!(!proxy_rate_limit.penalize_account);
+        assert!(
+            !proxy_rate_limit
+                .preparation_error(false)
                 .allow_candidate_failover
         );
 

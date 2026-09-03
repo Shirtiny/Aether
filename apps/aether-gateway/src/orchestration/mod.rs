@@ -27,8 +27,8 @@ pub(crate) use self::attempt::{
     SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD,
 };
 pub(crate) use self::classifier::{
-    classify_local_failover, local_failover_error_message, LocalFailoverClassification,
-    LocalFailoverInput,
+    classify_local_failover, is_session_preserving_rate_limit, local_failover_error_message,
+    LocalFailoverClassification, LocalFailoverInput,
 };
 pub(crate) use self::effects::{
     apply_local_execution_effect, apply_local_pool_terminal_effect_after_lease_release,

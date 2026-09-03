@@ -293,6 +293,7 @@ async fn apply_stream_failure_effects(
             status_code: payload.status_code,
             classification: failure_analysis.classification,
             headers: Some(&payload.headers),
+            response_text: error_body,
         }),
     )
     .await;

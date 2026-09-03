@@ -5,6 +5,7 @@ use super::{LocalFailoverPolicy, LocalFailoverRegexRule};
 
 const SESSION_PRESERVING_OVERLOAD_MESSAGE: &str =
     "Our servers are currently overloaded. Please try again later.";
+const SESSION_PRESERVING_RATE_LIMIT_MESSAGE: &str = "Rate limit exceeded";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ParsedLocalErrorResponse {
@@ -63,6 +64,12 @@ pub(crate) fn classify_local_failover(
     // candidate would move a sticky session to a different account, so it must
     // take precedence over provider-configured retryable status codes.
     if is_session_preserving_overload(input) {
+        return LocalFailoverClassification::StopErrorPattern;
+    }
+
+    // A generic gateway/proxy 429 is account-independent, just like the
+    // session-preserving overload above. Do not replace the current candidate.
+    if is_session_preserving_rate_limit(input.status_code, input.response_text) {
         return LocalFailoverClassification::StopErrorPattern;
     }
 
@@ -130,6 +137,61 @@ fn is_session_preserving_overload(input: LocalFailoverInput<'_>) -> bool {
     }) || input
         .response_text
         .is_some_and(|text| text.contains(SESSION_PRESERVING_OVERLOAD_MESSAGE))
+}
+
+/// Returns true when a 429 response is explicitly a generic gateway/proxy
+/// limiter response and does not identify an account-level Codex quota
+/// condition. Official Codex quota errors carry a structured error code (for
+/// example `rate_limit_exceeded` or `usage_limit_reached`) and keep the normal
+/// quota handling.
+pub(crate) fn is_session_preserving_rate_limit(
+    status_code: u16,
+    response_text: Option<&str>,
+) -> bool {
+    if status_code != 429 {
+        return false;
+    }
+
+    let Some(response_text) = response_text else {
+        return false;
+    };
+    let lower = response_text.to_ascii_lowercase();
+    if [
+        "rate_limit_exceeded",
+        "rate_limit_error",
+        "usage_limit_reached",
+        "usage_not_included",
+        "insufficient_quota",
+        "quota_exceeded",
+        "invalid_token",
+        "invalid token",
+        "account_locked",
+        "banned",
+        "suspended",
+        "deactivated",
+        "disabled",
+        "workspace",
+        "x-codex-",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+
+    let parsed = parse_local_error_response(Some(response_text));
+    parsed.message.as_deref().is_some_and(|message| {
+        message
+            .trim()
+            .eq_ignore_ascii_case(SESSION_PRESERVING_RATE_LIMIT_MESSAGE)
+    }) || parsed.reason.as_deref().is_some_and(|reason| {
+        reason
+            .trim()
+            .eq_ignore_ascii_case(SESSION_PRESERVING_RATE_LIMIT_MESSAGE)
+    }) || response_text
+        .trim()
+        .eq_ignore_ascii_case(SESSION_PRESERVING_RATE_LIMIT_MESSAGE)
+        || lower.contains("rate limit exceeded")
 }
 
 fn parse_local_error_response(response_text: Option<&str>) -> ParsedLocalErrorResponse {
@@ -232,8 +294,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        classify_local_failover, LocalFailoverClassification, LocalFailoverInput,
-        SESSION_PRESERVING_OVERLOAD_MESSAGE,
+        classify_local_failover, is_session_preserving_rate_limit, LocalFailoverClassification,
+        LocalFailoverInput, SESSION_PRESERVING_OVERLOAD_MESSAGE,
     };
     use crate::orchestration::{LocalFailoverPolicy, LocalFailoverRegexRule};
 
@@ -285,6 +347,33 @@ mod tests {
             ),
             LocalFailoverClassification::RetryUpstreamFailure
         );
+    }
+
+    #[test]
+    fn generic_rate_limit_is_session_preserving_but_official_quota_is_not() {
+        assert!(is_session_preserving_rate_limit(
+            429,
+            Some(r#"{"detail":"Rate limit exceeded"}"#)
+        ));
+        assert_eq!(
+            classify_local_failover(
+                &LocalFailoverPolicy {
+                    continue_status_codes: [429].into_iter().collect(),
+                    ..LocalFailoverPolicy::default()
+                },
+                LocalFailoverInput::new(429, Some(r#"{"detail":"Rate limit exceeded"}"#)),
+            ),
+            LocalFailoverClassification::StopErrorPattern
+        );
+        assert!(!is_session_preserving_rate_limit(
+            429,
+            Some(r#"{"error":{"code":"rate_limit_exceeded"}}"#)
+        ));
+        assert!(!is_session_preserving_rate_limit(
+            429,
+            Some(r#"{"error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}"#)
+        ));
+        assert!(!is_session_preserving_rate_limit(429, None));
     }
 
     #[test]

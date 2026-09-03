@@ -22,6 +22,8 @@ use super::runtime::{
     StepPreparationError, UsageReportReservation,
 };
 use super::CodexWsStepDisposition;
+use crate::handlers::shared::provider_pool::admin_provider_pool_key_error_is_account_invalid;
+use crate::orchestration::is_session_preserving_rate_limit;
 
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMEOUT_CLOSE_GRACE: Duration = Duration::from_millis(100);
@@ -2014,6 +2016,9 @@ fn terminal_outcome(
                 )
             });
         let error_body = terminal_event.provider_error_body.clone();
+        let penalize_account =
+            admin_provider_pool_key_error_is_account_invalid(status_code, error_body.as_deref())
+                || !is_session_preserving_rate_limit(status_code, error_body.as_deref());
         StepOutcome::Poisoned {
             terminal_event: Some(terminal_event),
             terminal_kind: Some(kind),
@@ -2022,7 +2027,9 @@ fn terminal_outcome(
                 error_type,
                 error_message,
                 error_body,
-                penalize_account: true,
+                // Generic gateway/proxy 429s must not rotate the OAuth account;
+                // structured official quota 429s retain quota handling.
+                penalize_account,
             },
             terminal_frames: Some(terminal_frames),
         }
@@ -3755,6 +3762,32 @@ mod tests {
                 penalize_account: true,
             }
         );
+    }
+
+    #[test]
+    fn generic_terminal_rate_limit_does_not_penalize_account() {
+        let outcome = terminal_outcome(
+            TerminalKind::Failed,
+            TerminalEventSummary {
+                provider_status_code: Some(429),
+                provider_error_message: Some("Rate limit exceeded".into()),
+                provider_error_body: Some(r#"{"detail":"Rate limit exceeded"}"#.into()),
+                ..TerminalEventSummary::default()
+            },
+            false,
+            vec![Bytes::from_static(b"{}")],
+        );
+        let StepOutcome::Poisoned { disposition, .. } = outcome else {
+            panic!("provider failure should poison the current binding");
+        };
+        assert!(matches!(
+            disposition,
+            CodexWsStepDisposition::ProviderFailure {
+                status_code: 429,
+                penalize_account: false,
+                ..
+            }
+        ));
     }
 
     fn idle_binding() -> BindingState {

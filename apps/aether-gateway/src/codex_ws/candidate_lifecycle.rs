@@ -1006,6 +1006,7 @@ async fn apply_failure_health_effects(
                 status_code,
                 classification,
                 headers: Some(&payload.headers),
+                response_text: error_body,
             }),
         ),
     )

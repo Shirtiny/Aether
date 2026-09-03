@@ -1997,6 +1997,7 @@ async fn execute_execution_runtime_sync_impl(
                 status_code: result.status_code,
                 classification: local_failover_analysis.classification,
                 headers: Some(&headers),
+                response_text: local_failover_response_text.as_deref(),
             }),
         )
         .await;

@@ -80,6 +80,7 @@ pub(crate) struct LocalAdaptiveRateLimitEffect<'a> {
     pub(crate) status_code: u16,
     pub(crate) classification: LocalFailoverClassification,
     pub(crate) headers: Option<&'a BTreeMap<String, String>>,
+    pub(crate) response_text: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1158,6 +1159,9 @@ async fn record_adaptive_rate_limit_effect(
     context: LocalExecutionEffectContext<'_>,
     effect: LocalAdaptiveRateLimitEffect<'_>,
 ) {
+    if super::is_session_preserving_rate_limit(effect.status_code, effect.response_text) {
+        return;
+    }
     let observed_at_unix_secs = current_unix_secs();
     let Some(current_key) = state
         .read_provider_catalog_keys_by_ids(std::slice::from_ref(&context.plan.key_id))
@@ -1473,6 +1477,7 @@ async fn record_pool_error_effect(
     let should_refresh_codex_quota = pool_error_should_trigger_codex_quota_refresh(
         &pool_context.provider_type,
         effect.status_code,
+        effect.error_body,
     );
     let should_record_pool_error = pool_error_should_record_or_refresh_quota(
         &pool_context.provider_type,
@@ -1764,9 +1769,16 @@ fn local_pool_failure_should_clear_sticky(
     error_body: Option<&str>,
     classification: LocalFailoverClassification,
 ) -> bool {
-    admin_provider_pool_key_terminal_error_reason(status_code, error_body).is_some()
-        || local_candidate_failure_should_record_pool_error(classification, status_code)
-        || admin_provider_pool_key_error_is_account_invalid(status_code, error_body)
+    let terminal_error = admin_provider_pool_key_terminal_error_reason(status_code, error_body);
+    let account_invalid = admin_provider_pool_key_error_is_account_invalid(status_code, error_body);
+    if terminal_error.is_some() || account_invalid {
+        return true;
+    }
+    if super::is_session_preserving_rate_limit(status_code, error_body) {
+        return false;
+    }
+
+    local_candidate_failure_should_record_pool_error(classification, status_code)
 }
 
 async fn record_pool_stream_timeout_effect(
@@ -1881,8 +1893,15 @@ fn pool_score_hard_state_for_status(
     }
 }
 
-fn pool_error_should_trigger_codex_quota_refresh(provider_type: &str, status_code: u16) -> bool {
-    status_code == 429 && provider_type.trim().eq_ignore_ascii_case("codex")
+fn pool_error_should_trigger_codex_quota_refresh(
+    provider_type: &str,
+    status_code: u16,
+    error_body: Option<&str>,
+) -> bool {
+    status_code == 429
+        && provider_type.trim().eq_ignore_ascii_case("codex")
+        && !admin_provider_pool_key_error_is_account_invalid(status_code, error_body)
+        && !super::is_session_preserving_rate_limit(status_code, error_body)
 }
 
 fn pool_error_should_record_or_refresh_quota(
@@ -1892,7 +1911,7 @@ fn pool_error_should_record_or_refresh_quota(
     classification: LocalFailoverClassification,
 ) -> bool {
     local_pool_failure_should_clear_sticky(status_code, error_body, classification)
-        || pool_error_should_trigger_codex_quota_refresh(provider_type, status_code)
+        || pool_error_should_trigger_codex_quota_refresh(provider_type, status_code, error_body)
 }
 
 fn pool_score_hard_state_for_terminal_error_reason(reason: &str) -> PoolMemberHardState {
@@ -4671,6 +4690,17 @@ mod tests {
     }
 
     #[test]
+    fn generic_session_rate_limit_does_not_clear_pool_sticky_even_if_retry_classified() {
+        let error_body = r#"{"detail":"Rate limit exceeded"}"#;
+
+        assert!(!local_pool_failure_should_clear_sticky(
+            429,
+            Some(error_body),
+            LocalFailoverClassification::RetryUpstreamFailure,
+        ));
+    }
+
+    #[test]
     fn pool_sticky_collateral_failure_detects_account_invalid_statuses() {
         assert!(admin_provider_pool_key_error_is_account_invalid(401, None));
         assert!(admin_provider_pool_key_error_is_account_invalid(
@@ -4723,12 +4753,23 @@ mod tests {
 
     #[test]
     fn only_codex_rate_limits_trigger_quota_refresh() {
-        assert!(pool_error_should_trigger_codex_quota_refresh("codex", 429));
         assert!(pool_error_should_trigger_codex_quota_refresh(
-            " CODEX ", 429
+            "codex", 429, None
         ));
-        assert!(!pool_error_should_trigger_codex_quota_refresh("codex", 402));
-        assert!(!pool_error_should_trigger_codex_quota_refresh("grok", 429));
+        assert!(pool_error_should_trigger_codex_quota_refresh(
+            " CODEX ", 429, None
+        ));
+        assert!(!pool_error_should_trigger_codex_quota_refresh(
+            "codex", 402, None
+        ));
+        assert!(!pool_error_should_trigger_codex_quota_refresh(
+            "grok", 429, None
+        ));
+        assert!(!pool_error_should_trigger_codex_quota_refresh(
+            "codex",
+            429,
+            Some(r#"{"detail":"Rate limit exceeded"}"#),
+        ));
     }
 
     #[test]
@@ -4737,6 +4778,12 @@ mod tests {
             "codex",
             429,
             None,
+            LocalFailoverClassification::StopStatusCode,
+        ));
+        assert!(!pool_error_should_record_or_refresh_quota(
+            "codex",
+            429,
+            Some(r#"{"detail":"Rate limit exceeded"}"#),
             LocalFailoverClassification::StopStatusCode,
         ));
         assert!(!pool_error_should_record_or_refresh_quota(
@@ -5154,6 +5201,7 @@ mod tests {
                     "x-ratelimit-limit-requests".to_string(),
                     "42".to_string(),
                 )])),
+                response_text: None,
             }),
         )
         .await;
@@ -5228,6 +5276,7 @@ mod tests {
                     "x-ratelimit-limit-requests".to_string(),
                     "42".to_string(),
                 )])),
+                response_text: None,
             }),
         )
         .await;
@@ -5242,6 +5291,45 @@ mod tests {
         assert_eq!(stored_key.rpm_429_count, None);
         assert_eq!(stored_key.last_429_at_unix_secs, None);
         assert_eq!(stored_key.last_429_type, None);
+    }
+
+    #[tokio::test]
+    async fn adaptive_rate_limit_effect_ignores_generic_session_rate_limit() {
+        let state = adaptive_state();
+        let plan = sample_plan();
+        let before = state
+            .read_provider_catalog_keys_by_ids(std::slice::from_ref(&plan.key_id))
+            .await
+            .expect("provider catalog keys should load")
+            .into_iter()
+            .next()
+            .expect("stored key should exist");
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: None,
+            },
+            LocalExecutionEffect::AdaptiveRateLimit(LocalAdaptiveRateLimitEffect {
+                status_code: 429,
+                classification: LocalFailoverClassification::StopStatusCode,
+                headers: None,
+                response_text: Some(r#"{"detail":"Rate limit exceeded"}"#),
+            }),
+        )
+        .await;
+
+        let after = state
+            .read_provider_catalog_keys_by_ids(std::slice::from_ref(&plan.key_id))
+            .await
+            .expect("provider catalog keys should load")
+            .into_iter()
+            .next()
+            .expect("stored key should exist");
+        assert_eq!(after.rpm_429_count, before.rpm_429_count);
+        assert_eq!(after.last_429_at_unix_secs, before.last_429_at_unix_secs);
+        assert_eq!(after.adjustment_history, before.adjustment_history);
     }
 
     #[tokio::test]
@@ -5262,6 +5350,7 @@ mod tests {
                 status_code: 429,
                 classification: LocalFailoverClassification::RetryStatusCode,
                 headers: None,
+                response_text: None,
             }),
         )
         .await;

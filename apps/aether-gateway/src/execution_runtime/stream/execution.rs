@@ -2572,6 +2572,7 @@ async fn execute_stream_from_frame_stream(
                 status_code,
                 classification: failover_analysis.classification,
                 headers: Some(&headers),
+                response_text: error_response_text.as_deref(),
             }),
         )
         .await;
