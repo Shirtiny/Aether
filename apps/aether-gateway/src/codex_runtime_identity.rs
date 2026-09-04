@@ -1087,14 +1087,26 @@ fn rewrite_codex_turn_metadata_object(
 // ---------------------------------------------------------------------------
 
 /// Hand-rolled UUIDv7 (RFC 9562): 48-bit unix millisecond timestamp, version
-/// nibble 7, RFC variant, 74 random bits. The workspace `uuid` crate is locked
+/// nibble 7, RFC variant, 72 random bits. The workspace `uuid` crate is locked
 /// without the `v7` feature and CI builds with `--locked`.
+///
+/// The two missing random bits are deliberate: real codex mints thread/session
+/// UUIDs with `Uuid::now_v7()`, whose `ContextV7` monotonic counter reseeds to a
+/// 42-bit value and is then re-encoded by shifting the counter *around* the
+/// 2-bit variant field (see uuid-1.x `Builder::from_unix_timestamp_millis` /
+/// `v7.rs`). That shift leaves a permanent 2-bit zero gap at `bytes[7]` bits 2-3
+/// (string index 17, which is therefore always one of `0,1,2,3`). Empirically,
+/// 100% of `now_v7()` outputs clear those bits while a fully-random `bytes[7]`
+/// sets them ~75% of the time — a single synthetic UUID would otherwise be a
+/// structurally impossible shape and give the whole account away. We reproduce
+/// the gap so the outbound IDs are indistinguishable from genuine codex output.
 pub(crate) fn uuid_v7_at(unix_ms: u64) -> String {
     let random = *Uuid::new_v4().as_bytes();
     let mut bytes = [0u8; 16];
     bytes[..6].copy_from_slice(&unix_ms.to_be_bytes()[2..8]);
     bytes[6] = 0x70 | (random[6] & 0x0F);
-    bytes[7] = random[7];
+    // Clear bits 2-3: the ContextV7 counter gap that real `now_v7()` always leaves.
+    bytes[7] = random[7] & 0xF3;
     bytes[8] = 0x80 | (random[8] & 0x3F);
     bytes[9..].copy_from_slice(&random[9..]);
     Uuid::from_bytes(bytes).hyphenated().to_string()
@@ -1397,6 +1409,19 @@ mod tests {
         ts[2..].copy_from_slice(&uuid.as_bytes()[..6]);
         assert_eq!(u64::from_be_bytes(ts), ms);
         assert_ne!(uuid_v7_at(ms), uuid_v7_at(ms));
+    }
+
+    #[test]
+    fn uuid_v7_reproduces_context_v7_counter_gap() {
+        // Real codex uses `Uuid::now_v7()`, whose `ContextV7` re-encoding leaves a
+        // permanent 2-bit zero gap at byte 7 bits 2-3 (string index 17 in 0..=3).
+        // A single UUID with those bits set would be a structurally impossible
+        // codex shape, so every mint must clear them.
+        for _ in 0..4096 {
+            let uuid = Uuid::parse_str(&uuid_v7_at(1_756_857_600_123u64)).unwrap();
+            let byte7 = uuid.as_bytes()[7];
+            assert_eq!(byte7 & 0x0C, 0, "byte7 counter gap not cleared: {uuid}");
+        }
     }
 
     // ----- scope ------------------------------------------------------------

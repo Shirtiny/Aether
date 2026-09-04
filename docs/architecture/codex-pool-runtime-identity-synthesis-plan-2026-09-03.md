@@ -610,7 +610,9 @@ planner 侧包装（`ai_serving/planner/standard/codex.rs`，经 `ai_serving/mod
 
 ### 18.2 UUIDv7
 
-`uuid` crate 锁在 1.22.0，workspace feature 只有 `v4` / `v5`；CI 用 `--locked`，不改 `Cargo.lock`。手写 UUIDv7：16 字节中 `[0..6]` = unix 毫秒大端 48 位，`[6]` = `0x70 | (r & 0x0F)`，`[8]` = `0x80 | (r & 0x3F)`（RFC 4122 variant），其余 74 位随机；随机源取 `Uuid::new_v4()` 的字节。经 `Uuid::from_bytes(..).hyphenated()` 输出小写。单测校验版本 / variant / 时间戳单调。
+`uuid` crate 锁在 1.22.0，workspace feature 只有 `v4` / `v5`；CI 用 `--locked`，不改 `Cargo.lock`。手写 UUIDv7：16 字节中 `[0..6]` = unix 毫秒大端 48 位，`[6]` = `0x70 | (r & 0x0F)`，`[8]` = `0x80 | (r & 0x3F)`（RFC 4122 variant），随机源取 `Uuid::new_v4()` 的字节。经 `Uuid::from_bytes(..).hyphenated()` 输出小写。
+
+**必须复刻 ContextV7 的 2 位计数器缺口（否则整个功能被单样本识破）**：官方 codex 用 `Uuid::now_v7()`，其 `ContextV7` 单调计数器 reseed 成 42 位后，编码时把计数器**绕过** variant 字段移位（uuid-1.x `v7.rs` / `Builder::from_unix_timestamp_millis`），在 `bytes[7]` 的 bit 2-3 留下一个**永久为 0 的 2 位缺口**（即字符串第 17 位恒为 `0/1/2/3`）。实测 `now_v7()` 100% 清零这两位，而全随机的 `bytes[7]` 会有约 75% 的样本把它们置位——单枚合成 UUID 就会呈现真实 codex 永不产生的形状，等于当场暴露该账号。因此 `[7] = r & 0xF3`（清 bit 2-3），有效随机位是 **72 位**而非 74 位。其余（reseed 时计数器为随机、gap 之外无强制位；`[9..]` 全随机）经实测确认无其它可检测约束。单测校验版本 / variant / 时间戳单调，并断言 `bytes[7] & 0x0C == 0`（`uuid_v7_reproduces_context_v7_counter_gap`）。
 
 ### 18.3 Redis 操作（全部走 `RuntimeState` kv API）
 

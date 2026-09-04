@@ -732,10 +732,14 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         &state.runtime_state,
         transport,
         &mut provider_request_headers,
-        None,
+        // Pass the wire body: this cross-format path injects a session-derived
+        // `prompt_cache_key` above, which must be rewritten to the synthetic
+        // outbound session so it stays bounded per pool account (HttpResponses
+        // surface = headers + body).
+        Some(&mut provider_request_body),
         effective_headers,
         Some(body_json),
-        crate::codex_runtime_identity::CodexRuntimeIdentitySurface::Headers,
+        crate::codex_runtime_identity::CodexRuntimeIdentitySurface::HttpResponses,
     )
     .await;
     request_identity_response_encoding_when_redacted(
