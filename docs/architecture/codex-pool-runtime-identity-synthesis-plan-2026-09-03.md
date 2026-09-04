@@ -1,9 +1,9 @@
 # Codex 号池出站 Session / Thread / Turn 合成与复用计划
 
-> Status: **Implemented（第四稿）— 已在 `custom` 分支落地，随 `backend-v0.7.101` 交付；线上未更新，生产号池打开开关仍受 §17 门禁**
+> Status: **Implemented（第四稿）— 已在 `custom` 分支落地，随 `backend-v0.7.101` 交付；`backend-v0.7.102` 为其 code-review 缺陷修复（UUIDv7 ContextV7 缺口 + chat/family 跨格式 `prompt_cache_key` 泄漏，见 §18.11）。线上未更新，生产号池打开开关仍受 §17 门禁**
 > Date: 2026-09-03
 > Scope: Codex OAuth 号池在选号之后，按账号、按日合成并复用上游可见的 `session_id` / `thread_id` / `turn_id` / `window_id`
-> Production changes: **本轮不更新线上。** 只提交代码并推送 `backend-v0.7.101` tag 触发 CI 构建镜像；**不执行 `update.sh`**，运行中的容器不变，功能缺省关闭
+> Production changes: **本轮不更新线上。** 只提交代码并推送 `backend-v0.7.101` / `backend-v0.7.102` tag 触发 CI 构建镜像；**不执行 `update.sh`**，运行中的容器不变，功能缺省关闭
 > Deploy: 生产更新路径仍是 tag → CI → ghcr → `update.sh`，不是 `deploy.sh`。何时执行 `update.sh`、何时在某个 provider 上 `enabled: true`，由操作员另行决定
 
 本文是第四稿（最终稿）。第四稿在第三稿基础上只做两处算法修订并补齐实现细则（§18）：turn 槽按 **出站 thread UUID** 而不是 `thread_slot` 分区（root freeze 跨日命中的 thread 不得与当天同槽的另一条 thread 共用 turn UUID）；Redis 槽位 / freeze 只用单键 SET NX，不再引入锁键。§18 记录模块 API、Redis 操作、UUIDv7 生成、调用点、WS 快照、前端开关、测试与 CI 门禁、版本号。第二稿相对第一稿补上审查硬缺口：接续冻结、turn 按 thread 分区、HTTP 身份头泄漏、配置读写语义、Redis 命名空间、握手指纹不得纳入出站 ID。第三稿按代码复核（aether `custom` 分支与官方 codex-rs @ 357696c5）修正：memory 请求改为「blob 无身份、dash / 扁平带合成身份、无 turn」而不是全剥；接续冻结重新定性为跨路径 / 跨连接 / 跨日的 thread 稳定性，freeze miss 不再透传入站；`prompt_cache_key` 与 Aether 自补短头的顺序约束；attestation 已在候选头构建前剥离；turn-state 按出站 turn 来源转发；freeze TTL 滑动；补 `request_kind` 解析与 dash 头改写落点。骨架未改：三套身份平面、选号之后改写、sticky / WS 绑定 / 结算仍读入站、缺省关闭。
@@ -682,5 +682,15 @@ cd frontend && npm run type-check
 
 - 提交在 `custom` 分支，只含本功能相关文件；不带 `docker-compose.yml`、`.env.bak.*`、`.gopath/` 等无关脏改。
 - tag：`backend-v0.7.101`（当前 `backend-v0.7.100` == `1ab530e2b`）。推 tag 触发 CI → ghcr `latest`。
+- `backend-v0.7.102`：code-review 缺陷修复（commit `465a05e7e`，见 §18.11），同样推 tag 触发 CI；线上仍不更新。
 - **不执行 `update.sh`**。线上运行的仍是 v0.7.100 镜像。
 - 之后由操作员按 §17 门禁决定是否更新与打开。
+
+### 18.11 v0.7.102 缺陷修复（code-review）
+
+第四次代码复核（与本功能同批）在 v0.7.101 上确认两处会破坏功能保证的缺陷，随 `backend-v0.7.102` 修复：
+
+- **P0 — 合成 UUID 结构可被单样本识破。** `uuid_v7_at` 原以全随机 `bytes[7] = random[7]` 输出，未复刻官方 `Uuid::now_v7()` 的 `ContextV7` 计数器在重编码时绕开 variant 字段所留下的**永久 2 位零缺口**（`bytes[7]` bit 2-3，字符串第 17 位恒 ∈ `0/1/2/3`）。真实 `now_v7()` 100% 清零这两位，全随机 `bytes[7]` 约 75% 置位；单枚合成 UUID 即成"真实 codex 永不产生"的形状，当场暴露账号。修复：`bytes[7] = random[7] & 0xF3`，有效随机位由 74 降至 72（§18.2 已同步）。新增单测 `uuid_v7_reproduces_context_v7_counter_gap`（4096 次断言 `bytes[7] & 0x0C == 0`）。
+- **P1 — 跨格式 `prompt_cache_key` 泄漏。** chat（`openai/chat/decision/request.rs:731`）与 family（`family/request.rs:759`）两条跨格式→codex 路径会经 `apply_openai_responses_stable_prompt_cache_key` 注入一个**会话派生的 UUIDv5**，但身份改写此前用 `Surface::Headers`（只改头、不改 body），注入值未重绑即原样上游 → 每个真实 session 在账号上留一个稳定、可数的指纹，重新引入"每账号会话数随真实会话无界增长"的共享特征。修复：两处改传 `Some(&mut provider_request_body)` 并改用 `Surface::HttpResponses`，使 `rewrite_body`（§9 描述的官方默认 `prompt_cache_key = session_id` 分支）把注入的 UUIDv5 重绑为**出站合成 session**。注入与改写同一函数、同一 `provider_request_body` 绑定；`inbound.prompt_cache_key_present` 取自原始客户端请求而非注入后的出站体，故仅在客户端未带 key 时改写，语义精确。
+
+**刻意未改（设计取舍，非缺陷）**：Redis 不可用 → 透传真实身份（fail-open），属可用性/隐私取舍，有 `codex_rid_store_unavailable` 打点可告警，且已文档化于 `resolve_outbound...` 注释；改 fail-closed 会把 Redis 抖动放大成 codex 全线中断，留待操作员决策（§8）。search 位点保持 `Headers`-only——已核实独立 Search 身份走 HTTP 头、不使用 body `client_metadata` 契约（`codex_profile.rs`），无泄漏面。
