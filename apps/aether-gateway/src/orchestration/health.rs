@@ -331,8 +331,10 @@ fn local_candidate_failure_should_project_health(
         LocalFailoverClassification::UseDefault | LocalFailoverClassification::StopStatusCode => {
             status_code >= 500
         }
+        // A provider-level generic 429 must not degrade the selected key's health.
         LocalFailoverClassification::StopErrorPattern
-        | LocalFailoverClassification::StopExecutionError => false,
+        | LocalFailoverClassification::StopExecutionError
+        | LocalFailoverClassification::RetryProviderRateLimit => false,
     }
 }
 

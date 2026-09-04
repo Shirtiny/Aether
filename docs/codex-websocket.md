@@ -288,9 +288,11 @@ profile 中任意 revision、crypto provider 或 buffer 字段不匹配都会 fa
 - 单次初始规划最多保留 16 个候选；
 - 连接、鉴权、限流或明确的握手失败可在 **尚未 Provider write** 时排除当前候选，
   尝试下一个账号；
-- 响应体明确为代理/网关通用限流的 `429`（例如 `{"detail":"Rate limit exceeded"}`）不证明账号失效，
-  本次请求不会切换当前候选；带有 `rate_limit_exceeded`、`usage_limit_reached` 等官方结构化额度标记的
-  429 仍按账号额度策略处理；
+- 响应体明确为代理/网关通用限流的 `429`（例如 `{"detail":"Rate limit exceeded"}`）不证明账号失效：
+  当前账号不记惩罚、不清 sticky、不触发额度刷新；同一供应商剩余候选（其他账号）会被直接跳过，
+  本次请求继续 failover 到**其他供应商**；若请求已绑定 sticky 账号，则保留该账号并返回 503 not-executed；
+  带有 `rate_limit_exceeded`、`usage_limit_reached` 等官方结构化额度标记的 429 仍按账号额度策略处理。
+  HTTP 路径同理：分类为 `retry_provider_rate_limit`，候选循环以 `provider_rate_limited` 跳过同供应商候选；
 - candidate、provider 和 key 的并发 permit 只覆盖执行 step，不覆盖连接空闲时间；
 - request body 不复制到每个候选，最终选中账号只在写入前物化一次。
 

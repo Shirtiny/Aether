@@ -63,7 +63,8 @@ const fn decision_from_classification(
         }
         LocalFailoverClassification::RetrySuccessPattern
         | LocalFailoverClassification::RetryStatusCode
-        | LocalFailoverClassification::RetryUpstreamFailure => {
+        | LocalFailoverClassification::RetryUpstreamFailure
+        | LocalFailoverClassification::RetryProviderRateLimit => {
             LocalFailoverDecision::RetryNextCandidate
         }
     }
@@ -108,6 +109,20 @@ mod tests {
             ),
             LocalFailoverDecision::StopLocalFailover
         );
+    }
+
+    #[test]
+    fn recovery_retries_next_candidate_for_generic_provider_rate_limit() {
+        let analysis = analyze_local_failover(
+            &LocalFailoverPolicy::default(),
+            LocalFailoverInput::new(429, Some(r#"{"detail":"Rate limit exceeded"}"#)),
+        );
+
+        assert_eq!(
+            analysis.classification,
+            LocalFailoverClassification::RetryProviderRateLimit
+        );
+        assert_eq!(analysis.decision, LocalFailoverDecision::RetryNextCandidate);
     }
 
     #[test]

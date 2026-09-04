@@ -213,6 +213,28 @@ impl<'a> RemainingCandidatesGuard<'a> {
         self.candidates.pop_front()
     }
 
+    /// Drop every remaining candidate of `provider_id` without connecting it. The dropped
+    /// candidates are settled as unused so their leases and scheduling state are released.
+    fn skip_provider(&mut self, provider_id: &str) {
+        let (skipped, kept): (Vec<_>, Vec<_>) = self
+            .candidates
+            .drain(..)
+            .partition(|candidate| candidate.provider_id == provider_id);
+        self.candidates = kept.into();
+        if skipped.is_empty() {
+            return;
+        }
+        tracing::info!(
+            event_name = "codex_ws_provider_candidates_skipped_after_rate_limit",
+            log_type = "event",
+            provider_id,
+            skipped_candidates = skipped.len(),
+            remaining_candidates = self.candidates.len(),
+            "Codex WebSocket skipped the remaining candidates of a generically rate-limited provider"
+        );
+        self.runtime.mark_unused_candidates_detached(skipped);
+    }
+
     fn finish(mut self) {
         self.runtime
             .mark_unused_candidates_detached(self.candidates.drain(..).collect());
@@ -1309,6 +1331,7 @@ async fn connect_candidates_for_step(
             break;
         };
         let preserve_sticky_on_timeout = candidate.sticky_binding_established;
+        let candidate_provider_id = candidate.provider_id.clone();
         step_usage.bind(&candidate, step);
         let connect_result = match tokio::time::timeout_at(
             connect_deadline,
@@ -1336,9 +1359,16 @@ async fn connect_candidates_for_step(
                 // Non-account failures preserve an established sticky account. A candidate that
                 // was only being initialized may still fail over before any provider write.
                 let allow_candidate_failover = error.allow_candidate_failover;
+                let skip_same_provider_candidates = error.skip_same_provider_candidates;
                 last_connect_error = Some(error);
                 if !allow_candidate_failover {
                     break;
+                }
+                // A generic provider rate limit is shared by every account behind the provider:
+                // trying its sibling accounts would hit the same limit, so failover moves on to
+                // the next provider instead.
+                if skip_same_provider_candidates {
+                    remaining_candidates.skip_provider(&candidate_provider_id);
                 }
             }
         }
@@ -3047,6 +3077,11 @@ mod tests {
     struct TestRuntime {
         official: Mutex<VecDeque<Box<dyn RelayPeer>>>,
         fail_first_connect: bool,
+        /// Fail the first connect as a generic provider rate limit and plan a
+        /// sibling account of the same provider right behind it.
+        rate_limit_first_provider: AtomicBool,
+        /// Plan only the failing provider's candidates.
+        only_first_provider: AtomicBool,
         sticky_binding_established: AtomicBool,
         connect_delays: Mutex<VecDeque<Duration>>,
         handshake_turn_state: Mutex<Option<String>>,
@@ -3101,6 +3136,8 @@ mod tests {
             Self {
                 official: Mutex::new(VecDeque::from([official])),
                 fail_first_connect,
+                rate_limit_first_provider: AtomicBool::new(false),
+                only_first_provider: AtomicBool::new(false),
                 sticky_binding_established: AtomicBool::new(false),
                 connect_delays: Mutex::new(VecDeque::new()),
                 handshake_turn_state: Mutex::new(None),
@@ -3153,6 +3190,15 @@ mod tests {
         fn use_established_sticky_binding(&self) {
             self.sticky_binding_established
                 .store(true, Ordering::Release);
+        }
+
+        fn rate_limit_first_provider(&self) {
+            self.rate_limit_first_provider
+                .store(true, Ordering::Release);
+        }
+
+        fn only_first_provider(&self) {
+            self.only_first_provider.store(true, Ordering::Release);
         }
 
         fn push_official(&self, official: Box<dyn RelayPeer>) {
@@ -3238,9 +3284,15 @@ mod tests {
             let mut candidates = Vec::new();
             if self.fail_first_connect {
                 candidates.push(self.configured_candidate(first_step, "provider-failed"));
+                if self.rate_limit_first_provider.load(Ordering::Acquire) {
+                    // A sibling account behind the same rate-limited provider.
+                    candidates.push(self.configured_candidate(first_step, "provider-failed"));
+                }
             }
-            candidates.push(self.configured_candidate(first_step, "provider-selected"));
-            candidates.push(self.configured_candidate(first_step, "provider-unused"));
+            if !self.only_first_provider.load(Ordering::Acquire) {
+                candidates.push(self.configured_candidate(first_step, "provider-selected"));
+                candidates.push(self.configured_candidate(first_step, "provider-unused"));
+            }
             Ok(candidates)
         }
 
@@ -3278,7 +3330,9 @@ mod tests {
                     .lock()
                     .expect("aborted candidates should lock")
                     .push(candidate.provider_id.clone());
-                return Err(if candidate.sticky_binding_established {
+                return Err(if self.rate_limit_first_provider.load(Ordering::Acquire) {
+                    StepPreparationError::skip_provider("official_ws_account_rate_limited")
+                } else if candidate.sticky_binding_established {
                     StepPreparationError::preserve_sticky("planned_handshake_failure")
                 } else {
                     StepPreparationError::exclude("planned_handshake_failure")
@@ -4274,6 +4328,102 @@ mod tests {
                 .expect("unused candidates should lock"),
             vec!["provider-selected", "provider-unused"]
         );
+    }
+
+    #[tokio::test]
+    async fn generic_provider_rate_limit_skips_sibling_accounts_and_fails_over_to_next_provider() {
+        let created = json!({
+            "type": "response.created",
+            "response": {"id": "resp-1", "model": "gpt-5.4"}
+        })
+        .to_string();
+        let terminal = json!({
+            "type": "response.completed",
+            "response": {"id": "resp-1", "model": "gpt-5.4"}
+        })
+        .to_string();
+        let (official, official_sent) = ScriptedPeer::new([
+            (Duration::ZERO, relay_text(created)),
+            (Duration::ZERO, relay_text(terminal.clone())),
+        ]);
+        let runtime = TestRuntime::new(Box::new(official), true);
+        runtime.rate_limit_first_provider();
+        let (client, client_sent) = ScriptedPeer::new([
+            (Duration::ZERO, relay_text(request())),
+            (Duration::from_millis(20), RelayFrame::Close),
+        ]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        // The rate-limited provider's sibling account is never connected; the
+        // request fails over straight to the next provider.
+        assert_eq!(runtime.connect_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *runtime
+                .started_candidates
+                .lock()
+                .expect("started candidates should lock"),
+            vec!["provider-failed", "provider-selected"]
+        );
+        assert_eq!(
+            *runtime
+                .aborted_candidates
+                .lock()
+                .expect("aborted candidates should lock"),
+            vec!["provider-failed"]
+        );
+        assert_eq!(
+            *runtime
+                .unused_candidates
+                .lock()
+                .expect("unused candidates should lock"),
+            vec!["provider-failed", "provider-unused"]
+        );
+        assert_eq!(
+            official_sent.lock().expect("official frames should lock")[0],
+            relay_text("materialized-step")
+        );
+        assert!(client_sent
+            .lock()
+            .expect("client frames should lock")
+            .contains(&relay_text(terminal)));
+    }
+
+    #[tokio::test]
+    async fn generic_provider_rate_limit_without_another_provider_does_not_switch_accounts() {
+        let (official, _) = ScriptedPeer::new([]);
+        let runtime = TestRuntime::new(Box::new(official), true);
+        runtime.rate_limit_first_provider();
+        runtime.only_first_provider();
+        let (client, client_sent) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        assert_eq!(runtime.connect_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.rejected_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *runtime
+                .rejected_reasons
+                .lock()
+                .expect("rejected reasons should lock"),
+            vec!["official_ws_account_rate_limited"]
+        );
+        assert_eq!(
+            *runtime
+                .unused_candidates
+                .lock()
+                .expect("unused candidates should lock"),
+            vec!["provider-failed"]
+        );
+        assert!(sent_text_contains(&client_sent, "proven_not_executed"));
+        assert!(sent_text_contains(
+            &client_sent,
+            "official_ws_account_rate_limited"
+        ));
     }
 
     #[tokio::test]

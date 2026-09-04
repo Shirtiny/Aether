@@ -1748,8 +1748,10 @@ fn local_candidate_failure_should_invalidate_affinity(
         LocalFailoverClassification::UseDefault | LocalFailoverClassification::StopStatusCode => {
             status_code >= 500
         }
+        // A provider-level generic 429 says nothing about the selected account.
         LocalFailoverClassification::StopErrorPattern
-        | LocalFailoverClassification::StopExecutionError => false,
+        | LocalFailoverClassification::StopExecutionError
+        | LocalFailoverClassification::RetryProviderRateLimit => false,
     }
 }
 

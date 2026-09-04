@@ -289,15 +289,25 @@ struct CodexWsHandshakeFailure {
 }
 
 impl CodexWsHandshakeFailure {
+    /// A 429 that did not penalize the account is a generic gateway/proxy rate
+    /// limit: it is not proof that the OAuth account is invalid or exhausted,
+    /// and every account behind the same provider shares that limit.
+    const fn is_provider_rate_limit(&self) -> bool {
+        self.status_code == 429 && !self.penalize_account
+    }
+
     const fn preparation_error(&self, sticky_binding_established: bool) -> StepPreparationError {
         StepPreparationError {
             reason: self.route_reason,
             middle_route_disposition: MiddleRouteDisposition::Retain,
-            // A generic Codex gateway/proxy 429 is not proof that the OAuth
-            // account is invalid or exhausted. Keep the selected account even
-            // when this request has not established sticky state.
-            allow_candidate_failover: !(self.status_code == 429 && !self.penalize_account)
-                && (self.penalize_account || !sticky_binding_established),
+            // Non-account failures may still fail over while no sticky binding
+            // is established. Once the request is bound to an account, only an
+            // account failure may replace it.
+            allow_candidate_failover: self.penalize_account || !sticky_binding_established,
+            // A generic provider rate limit skips the remaining candidates of
+            // the same provider so failover moves on to other providers instead
+            // of switching accounts inside the same pool.
+            skip_same_provider_candidates: self.is_provider_rate_limit(),
         }
     }
 }
@@ -497,7 +507,12 @@ impl UsageReportReservation {
         &self,
         existing_usage: Option<aether_contracts::StandardizedUsage>,
     ) -> Option<aether_contracts::StandardizedUsage> {
-        let plan = self.plan.as_ref()?;
+        let Some(plan) = self.plan.as_ref() else {
+            // Without a reserved plan nothing can be estimated, but usage that
+            // was already settled for the cancelled turn (for example the
+            // previous-response context floor) is still relayed as-is.
+            return existing_usage;
+        };
         aether_usage_runtime::cancelled_usage_billing_floor(plan, None, existing_usage)
     }
 
@@ -525,6 +540,10 @@ pub(crate) struct StepPreparationError {
     /// Whether another account candidate may be tried before returning this error. Non-account
     /// failures stop failover only when this request started from an established sticky binding.
     pub(crate) allow_candidate_failover: bool,
+    /// Whether the remaining candidates of the failed candidate's provider should be skipped
+    /// when failing over. Set for generic provider-level rate limits that every account behind
+    /// the provider shares, so failover continues with other providers instead.
+    pub(crate) skip_same_provider_candidates: bool,
 }
 
 impl StepPreparationError {
@@ -533,6 +552,7 @@ impl StepPreparationError {
             reason,
             middle_route_disposition: MiddleRouteDisposition::Retain,
             allow_candidate_failover: true,
+            skip_same_provider_candidates: false,
         }
     }
 
@@ -541,6 +561,7 @@ impl StepPreparationError {
             reason,
             middle_route_disposition: MiddleRouteDisposition::Exclude,
             allow_candidate_failover: true,
+            skip_same_provider_candidates: false,
         }
     }
 
@@ -549,6 +570,18 @@ impl StepPreparationError {
             reason,
             middle_route_disposition: MiddleRouteDisposition::Retain,
             allow_candidate_failover: false,
+            skip_same_provider_candidates: false,
+        }
+    }
+
+    /// A generic provider-level rate limit: the current account is kept unpenalized, and the
+    /// remaining candidates of the same provider are skipped while failing over.
+    pub(crate) const fn skip_provider(reason: &'static str) -> Self {
+        Self {
+            reason,
+            middle_route_disposition: MiddleRouteDisposition::Retain,
+            allow_candidate_failover: true,
+            skip_same_provider_candidates: true,
         }
     }
 }
@@ -4002,6 +4035,7 @@ mod tests {
                     reason,
                     middle_route_disposition: MiddleRouteDisposition::Retain,
                     allow_candidate_failover: true,
+                    skip_same_provider_candidates: false,
                 }
             );
         }
@@ -4011,6 +4045,16 @@ mod tests {
                 reason: "transport_failure",
                 middle_route_disposition: MiddleRouteDisposition::Retain,
                 allow_candidate_failover: false,
+                skip_same_provider_candidates: false,
+            }
+        );
+        assert_eq!(
+            StepPreparationError::skip_provider("provider_rate_limited"),
+            StepPreparationError {
+                reason: "provider_rate_limited",
+                middle_route_disposition: MiddleRouteDisposition::Retain,
+                allow_candidate_failover: true,
+                skip_same_provider_candidates: true,
             }
         );
     }
@@ -4070,6 +4114,26 @@ mod tests {
                 .get("usage_confidence")
                 .and_then(serde_json::Value::as_str),
             Some("billing_floor")
+        );
+    }
+
+    #[test]
+    fn reservation_without_plan_relays_settled_cancelled_usage_unchanged() {
+        let reservation = UsageReportReservation {
+            permit: None,
+            settlement_permit: None,
+            plan: None,
+            original_request_body: None,
+            lifecycle_seed: None,
+        };
+        let mut settled = aether_contracts::StandardizedUsage::new();
+        settled.input_tokens = 105;
+        settled.cache_read_tokens = 105;
+
+        assert_eq!(reservation.cancelled_usage_floor(None), None);
+        assert_eq!(
+            reservation.cancelled_usage_floor(Some(settled.clone())),
+            Some(settled)
         );
     }
 
@@ -4471,10 +4535,23 @@ mod tests {
             CodexWsRouteKind::Proxy,
         );
         assert!(!proxy_rate_limit.penalize_account);
+        assert!(proxy_rate_limit.is_provider_rate_limit());
+        // A generic proxy 429 fails over to other providers: the remaining
+        // candidates of the same provider are skipped, the account is kept.
+        let unbound = proxy_rate_limit.preparation_error(false);
+        assert!(unbound.allow_candidate_failover);
+        assert!(unbound.skip_same_provider_candidates);
+        assert_eq!(unbound.reason, "official_ws_account_rate_limited");
+        // An established sticky binding still keeps its account.
+        let bound = proxy_rate_limit.preparation_error(true);
+        assert!(!bound.allow_candidate_failover);
+        assert!(bound.skip_same_provider_candidates);
+        // Account-level failures never skip sibling accounts.
+        assert!(!account_failure.is_provider_rate_limit());
         assert!(
-            !proxy_rate_limit
+            !account_failure
                 .preparation_error(false)
-                .allow_candidate_failover
+                .skip_same_provider_candidates
         );
 
         let direct_failure = classify_codex_ws_handshake_failure(

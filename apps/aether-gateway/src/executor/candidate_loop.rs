@@ -31,7 +31,7 @@ use crate::orchestration::local_execution_candidate_metadata_from_report_context
 use crate::orchestration::{
     apply_local_execution_effect, prepare_pool_attempt_started_effect,
     release_pool_sticky_initialization_for_owner, LocalExecutionEffect,
-    LocalExecutionEffectContext, PoolAttemptStartCleanupGuard,
+    LocalExecutionEffectContext, LocalFailoverClassification, PoolAttemptStartCleanupGuard,
 };
 use crate::privacy::RedactionExecutionCandidateId;
 use crate::request_candidate_runtime::{
@@ -47,6 +47,7 @@ use crate::{AppState, GatewayError};
 const DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS: u64 = 30_000;
 const POOL_STICKY_COLLATERAL_AVOIDANCE_SKIP_REASON: &str = "pool_sticky_collateral_avoidance";
 const POOL_ACCOUNT_BLOCKED_SKIP_REASON: &str = "pool_account_blocked";
+const PROVIDER_RATE_LIMITED_SKIP_REASON: &str = "provider_rate_limited";
 
 fn attach_redaction_execution_candidate(response: &mut Response<Body>, candidate_id: Option<&str>) {
     if let Some(candidate_id) = candidate_id
@@ -80,6 +81,21 @@ struct PoolStickyCollateralLoopBlocks {
 fn new_pool_sticky_collateral_blocks() -> Arc<tokio::sync::Mutex<PoolStickyCollateralLoopBlocks>> {
     Arc::new(tokio::sync::Mutex::new(
         PoolStickyCollateralLoopBlocks::default(),
+    ))
+}
+
+/// Providers that answered this request with a generic gateway/proxy 429.
+/// Every account behind such a provider shares that limit, so the remaining
+/// candidates of the provider are skipped and failover moves on to the next
+/// provider instead of switching accounts inside the same pool.
+#[derive(Debug, Default)]
+struct ProviderRateLimitLoopBlocks {
+    provider_ids: BTreeSet<String>,
+}
+
+fn new_provider_rate_limit_blocks() -> Arc<tokio::sync::Mutex<ProviderRateLimitLoopBlocks>> {
+    Arc::new(tokio::sync::Mutex::new(
+        ProviderRateLimitLoopBlocks::default(),
     ))
 }
 
@@ -384,6 +400,77 @@ async fn record_pool_sticky_collateral_block_after_failure_if_needed(
         .await;
 }
 
+fn candidate_matches_provider_rate_limit(candidate: &StoredRequestCandidate) -> bool {
+    candidate_json_path(
+        candidate.extra_data.as_ref(),
+        &["error_flow", "classification"],
+    )
+    .and_then(serde_json::Value::as_str)
+    .is_some_and(|classification| {
+        classification == LocalFailoverClassification::RetryProviderRateLimit.as_str()
+    })
+}
+
+async fn record_provider_rate_limit_block_after_failure_if_needed(
+    state: &AppState,
+    blocks: &Arc<tokio::sync::Mutex<ProviderRateLimitLoopBlocks>>,
+    plan: &ExecutionPlan,
+) {
+    let Some(candidate_id) = plan
+        .candidate_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let Some(candidate) = read_request_candidate(state, &plan.request_id, candidate_id).await
+    else {
+        return;
+    };
+    if !candidate_matches_provider_rate_limit(&candidate) {
+        return;
+    }
+    let mut blocks = blocks.lock().await;
+    if blocks.provider_ids.insert(plan.provider_id.clone()) {
+        warn!(
+            event_name = "local_candidate_provider_rate_limited",
+            log_type = "event",
+            request_id = %short_request_id(plan.request_id.as_str()),
+            candidate_id = ?plan.candidate_id,
+            provider_id = %plan.provider_id,
+            endpoint_id = %plan.endpoint_id,
+            key_id = %plan.key_id,
+            status_code = candidate.status_code.unwrap_or(0),
+            "gateway will skip remaining candidates of this provider after a generic rate limit and fail over to other providers"
+        );
+    }
+}
+
+async fn provider_rate_limit_skip_reason(
+    state: &AppState,
+    blocks: &Arc<tokio::sync::Mutex<ProviderRateLimitLoopBlocks>>,
+    plan: &ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+) -> Option<&'static str> {
+    let should_skip = {
+        let blocks = blocks.lock().await;
+        blocks.provider_ids.contains(&plan.provider_id)
+    };
+    if !should_skip {
+        return None;
+    }
+    record_skipped_local_request_candidate(
+        state,
+        plan,
+        report_context,
+        PROVIDER_RATE_LIMITED_SKIP_REASON,
+        current_unix_ms(),
+    )
+    .await;
+    Some(PROVIDER_RATE_LIMITED_SKIP_REASON)
+}
+
 fn candidate_matches_pool_sticky_collateral_failure(candidate: &StoredRequestCandidate) -> bool {
     if !matches!(
         candidate.status,
@@ -494,6 +581,7 @@ where
             plan_kind,
             provider_session_risk_control_blocks: new_provider_session_risk_control_blocks(),
             pool_sticky_collateral_blocks: new_pool_sticky_collateral_blocks(),
+            provider_rate_limit_blocks: new_provider_rate_limit_blocks(),
         };
         match run_ai_attempt_loop(&port, plan_and_reports).await? {
             AiAttemptLoopOutcome::Responded(response) => {
@@ -540,6 +628,7 @@ where
             plan_kind,
             provider_session_risk_control_blocks: new_provider_session_risk_control_blocks(),
             pool_sticky_collateral_blocks: new_pool_sticky_collateral_blocks(),
+            provider_rate_limit_blocks: new_provider_rate_limit_blocks(),
         };
         run_dynamic_attempt_loop(
             &port,
@@ -565,6 +654,7 @@ struct SyncAttemptLoopPort<'a> {
     provider_session_risk_control_blocks:
         Arc<tokio::sync::Mutex<ProviderSessionRiskControlLoopBlocks>>,
     pool_sticky_collateral_blocks: Arc<tokio::sync::Mutex<PoolStickyCollateralLoopBlocks>>,
+    provider_rate_limit_blocks: Arc<tokio::sync::Mutex<ProviderRateLimitLoopBlocks>>,
 }
 
 #[async_trait]
@@ -585,6 +675,35 @@ where
             plan: attempt.execution_plan(),
             report_context: report_context.as_ref(),
         };
+        if let Some(skip_reason) = provider_rate_limit_skip_reason(
+            self.state,
+            &self.provider_rate_limit_blocks,
+            attempt.execution_plan(),
+            report_context.as_ref(),
+        )
+        .await
+        {
+            apply_local_execution_effect(
+                self.state,
+                context,
+                LocalExecutionEffect::PoolAttemptAborted,
+            )
+            .await;
+            warn!(
+                event_name = "local_sync_candidate_skipped_by_provider_rate_limit",
+                log_type = "event",
+                trace_id = %self.trace_id,
+                plan_kind = self.plan_kind,
+                request_id = %short_request_id(attempt.execution_plan().request_id.as_str()),
+                candidate_id = ?attempt.execution_plan().candidate_id,
+                provider_id = %attempt.execution_plan().provider_id,
+                endpoint_id = %attempt.execution_plan().endpoint_id,
+                key_id = %attempt.execution_plan().key_id,
+                skip_reason = skip_reason,
+                "gateway skipped local sync candidate because the same provider already answered this request with a generic rate limit"
+            );
+            return Ok(AiAttemptExecutionOutcome::SkippedBeforeExecutionDispatch);
+        }
         if let Some(skip_reason) = pool_sticky_collateral_skip_reason(
             self.state,
             &self.pool_sticky_collateral_blocks,
@@ -718,6 +837,12 @@ where
                 attempt.report_context().as_ref(),
             )
             .await;
+            record_provider_rate_limit_block_after_failure_if_needed(
+                self.state,
+                &self.provider_rate_limit_blocks,
+                attempt.execution_plan(),
+            )
+            .await;
         }
         if let Some(response) = response.as_mut() {
             record_provider_session_risk_control_block_if_needed(
@@ -829,6 +954,7 @@ where
             plan_kind,
             provider_session_risk_control_blocks: new_provider_session_risk_control_blocks(),
             pool_sticky_collateral_blocks: new_pool_sticky_collateral_blocks(),
+            provider_rate_limit_blocks: new_provider_rate_limit_blocks(),
         };
         match run_ai_attempt_loop(&port, plan_and_reports).await? {
             AiAttemptLoopOutcome::Responded(response) => {
@@ -873,6 +999,7 @@ where
             plan_kind,
             provider_session_risk_control_blocks: new_provider_session_risk_control_blocks(),
             pool_sticky_collateral_blocks: new_pool_sticky_collateral_blocks(),
+            provider_rate_limit_blocks: new_provider_rate_limit_blocks(),
         };
         run_dynamic_attempt_loop(
             &port,
@@ -978,6 +1105,7 @@ struct StreamAttemptLoopPort<'a> {
     provider_session_risk_control_blocks:
         Arc<tokio::sync::Mutex<ProviderSessionRiskControlLoopBlocks>>,
     pool_sticky_collateral_blocks: Arc<tokio::sync::Mutex<PoolStickyCollateralLoopBlocks>>,
+    provider_rate_limit_blocks: Arc<tokio::sync::Mutex<ProviderRateLimitLoopBlocks>>,
 }
 
 #[async_trait]
@@ -999,6 +1127,35 @@ where
             plan: &plan,
             report_context: report_context.as_ref(),
         };
+        if let Some(skip_reason) = provider_rate_limit_skip_reason(
+            self.state,
+            &self.provider_rate_limit_blocks,
+            &plan,
+            report_context.as_ref(),
+        )
+        .await
+        {
+            apply_local_execution_effect(
+                self.state,
+                context,
+                LocalExecutionEffect::PoolAttemptAborted,
+            )
+            .await;
+            warn!(
+                event_name = "local_stream_candidate_skipped_by_provider_rate_limit",
+                log_type = "event",
+                trace_id = %self.trace_id,
+                plan_kind = self.plan_kind,
+                request_id = %short_request_id(plan.request_id.as_str()),
+                candidate_id = ?plan.candidate_id,
+                provider_id = %plan.provider_id,
+                endpoint_id = %plan.endpoint_id,
+                key_id = %plan.key_id,
+                skip_reason = skip_reason,
+                "gateway skipped local stream candidate because the same provider already answered this request with a generic rate limit"
+            );
+            return Ok(AiAttemptExecutionOutcome::SkippedBeforeExecutionDispatch);
+        }
         if let Some(skip_reason) = pool_sticky_collateral_skip_reason(
             self.state,
             &self.pool_sticky_collateral_blocks,
@@ -1164,6 +1321,12 @@ where
                 &self.pool_sticky_collateral_blocks,
                 &watchdog_plan,
                 watchdog_report_context.as_ref(),
+            )
+            .await;
+            record_provider_rate_limit_block_after_failure_if_needed(
+                self.state,
+                &self.provider_rate_limit_blocks,
+                &watchdog_plan,
             )
             .await;
         }
@@ -1697,6 +1860,108 @@ mod tests {
         assert_eq!(
             timeout,
             Duration::from_millis(DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS)
+        );
+    }
+
+    fn stored_candidate_with_error_flow(
+        classification: Option<&str>,
+    ) -> aether_data_contracts::repository::candidates::StoredRequestCandidate {
+        aether_data_contracts::repository::candidates::StoredRequestCandidate {
+            id: "cand_watchdog".to_string(),
+            request_id: "req_watchdog".to_string(),
+            user_id: None,
+            api_key_id: None,
+            username: None,
+            api_key_name: None,
+            candidate_index: 0,
+            retry_index: 0,
+            provider_id: Some("provider_id".to_string()),
+            endpoint_id: Some("endpoint_id".to_string()),
+            key_id: Some("key_id".to_string()),
+            status: RequestCandidateStatus::Failed,
+            skip_reason: None,
+            is_cached: false,
+            status_code: Some(429),
+            error_type: None,
+            error_message: Some("Rate limit exceeded".to_string()),
+            latency_ms: None,
+            concurrent_requests: None,
+            extra_data: classification.map(|classification| {
+                json!({
+                    "error_flow": {
+                        "classification": classification,
+                        "decision": "retry_next_candidate",
+                    }
+                })
+            }),
+            required_capabilities: None,
+            created_at_unix_ms: 0,
+            started_at_unix_ms: None,
+            finished_at_unix_ms: None,
+        }
+    }
+
+    #[test]
+    fn provider_rate_limit_block_matches_only_generic_rate_limit_classification() {
+        assert!(candidate_matches_provider_rate_limit(
+            &stored_candidate_with_error_flow(Some(
+                LocalFailoverClassification::RetryProviderRateLimit.as_str()
+            ))
+        ));
+        assert!(!candidate_matches_provider_rate_limit(
+            &stored_candidate_with_error_flow(Some(
+                LocalFailoverClassification::RetryStatusCode.as_str()
+            ))
+        ));
+        assert!(!candidate_matches_provider_rate_limit(
+            &stored_candidate_with_error_flow(Some(
+                LocalFailoverClassification::StopErrorPattern.as_str()
+            ))
+        ));
+        assert!(!candidate_matches_provider_rate_limit(
+            &stored_candidate_with_error_flow(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_rate_limit_skip_gate_skips_only_the_rate_limited_provider() {
+        let state = AppState::new().expect("state should build");
+        let blocks = new_provider_rate_limit_blocks();
+        let plan = test_plan(None);
+        let report_context = json!({
+            "request_id": plan.request_id,
+            "candidate_id": plan.candidate_id,
+            "candidate_index": 1,
+            "retry_index": 0,
+        });
+
+        assert_eq!(
+            provider_rate_limit_skip_reason(&state, &blocks, &plan, Some(&report_context)).await,
+            None
+        );
+
+        blocks
+            .lock()
+            .await
+            .provider_ids
+            .insert(plan.provider_id.clone());
+
+        assert_eq!(
+            provider_rate_limit_skip_reason(&state, &blocks, &plan, Some(&report_context)).await,
+            Some(PROVIDER_RATE_LIMITED_SKIP_REASON)
+        );
+
+        let mut other_provider = test_plan(None);
+        other_provider.provider_id = "other_provider_id".to_string();
+        assert_eq!(
+            provider_rate_limit_skip_reason(
+                &state,
+                &blocks,
+                &other_provider,
+                Some(&report_context)
+            )
+            .await,
+            None
         );
     }
 

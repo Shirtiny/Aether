@@ -40,6 +40,10 @@ pub(crate) enum LocalFailoverClassification {
     RetrySuccessPattern,
     RetryStatusCode,
     RetryUpstreamFailure,
+    /// A generic gateway/proxy 429 that is not tied to the selected account.
+    /// The request fails over to other providers; remaining candidates of the
+    /// same provider are skipped because they would hit the same limit.
+    RetryProviderRateLimit,
 }
 
 impl LocalFailoverClassification {
@@ -52,6 +56,7 @@ impl LocalFailoverClassification {
             Self::RetrySuccessPattern => "retry_success_pattern",
             Self::RetryStatusCode => "retry_status_code",
             Self::RetryUpstreamFailure => "retry_upstream_failure",
+            Self::RetryProviderRateLimit => "retry_provider_rate_limit",
         }
     }
 }
@@ -64,12 +69,6 @@ pub(crate) fn classify_local_failover(
     // candidate would move a sticky session to a different account, so it must
     // take precedence over provider-configured retryable status codes.
     if is_session_preserving_overload(input) {
-        return LocalFailoverClassification::StopErrorPattern;
-    }
-
-    // A generic gateway/proxy 429 is account-independent, just like the
-    // session-preserving overload above. Do not replace the current candidate.
-    if is_session_preserving_rate_limit(input.status_code, input.response_text) {
         return LocalFailoverClassification::StopErrorPattern;
     }
 
@@ -86,6 +85,15 @@ pub(crate) fn classify_local_failover(
         })
     {
         return LocalFailoverClassification::StopErrorPattern;
+    }
+
+    // A generic gateway/proxy 429 is account-independent: switching to another
+    // account of the same provider would hit the same limit. Fail over to other
+    // providers instead, and leave the selected account unpenalized. This must
+    // win over `continue_status_codes` so a configured 429 retry does not turn
+    // into an in-pool account switch.
+    if is_session_preserving_rate_limit(input.status_code, input.response_text) {
+        return LocalFailoverClassification::RetryProviderRateLimit;
     }
 
     if input.status_code == 200
@@ -350,11 +358,12 @@ mod tests {
     }
 
     #[test]
-    fn generic_rate_limit_is_session_preserving_but_official_quota_is_not() {
+    fn generic_rate_limit_fails_over_to_other_providers_but_official_quota_does_not() {
         assert!(is_session_preserving_rate_limit(
             429,
             Some(r#"{"detail":"Rate limit exceeded"}"#)
         ));
+        // Wins over a configured 429 retry so the pool does not switch accounts.
         assert_eq!(
             classify_local_failover(
                 &LocalFailoverPolicy {
@@ -363,7 +372,37 @@ mod tests {
                 },
                 LocalFailoverInput::new(429, Some(r#"{"detail":"Rate limit exceeded"}"#)),
             ),
-            LocalFailoverClassification::StopErrorPattern
+            LocalFailoverClassification::RetryProviderRateLimit
+        );
+        // Also applies with the default policy (no continue_status_codes).
+        assert_eq!(
+            classify_local_failover(
+                &LocalFailoverPolicy::default(),
+                LocalFailoverInput::new(429, Some(r#"{"detail":"Rate limit exceeded"}"#)),
+            ),
+            LocalFailoverClassification::RetryProviderRateLimit
+        );
+        // An explicit provider stop rule still wins.
+        assert_eq!(
+            classify_local_failover(
+                &LocalFailoverPolicy {
+                    stop_status_codes: [429].into_iter().collect(),
+                    ..LocalFailoverPolicy::default()
+                },
+                LocalFailoverInput::new(429, Some(r#"{"detail":"Rate limit exceeded"}"#)),
+            ),
+            LocalFailoverClassification::StopStatusCode
+        );
+        // Official structured quota markers keep the ordinary 429 handling.
+        assert_eq!(
+            classify_local_failover(
+                &LocalFailoverPolicy {
+                    continue_status_codes: [429].into_iter().collect(),
+                    ..LocalFailoverPolicy::default()
+                },
+                LocalFailoverInput::new(429, Some(r#"{"error":{"code":"rate_limit_exceeded"}}"#)),
+            ),
+            LocalFailoverClassification::RetryStatusCode
         );
         assert!(!is_session_preserving_rate_limit(
             429,
