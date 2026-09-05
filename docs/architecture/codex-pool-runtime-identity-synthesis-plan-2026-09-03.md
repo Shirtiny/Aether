@@ -1,6 +1,6 @@
 # Codex 号池出站 Session / Thread / Turn 合成与复用计划
 
-> Status: **Implemented（第四稿）— 已在 `custom` 分支落地，随 `backend-v0.7.101` 交付；`backend-v0.7.102` 为其 code-review 缺陷修复（UUIDv7 ContextV7 缺口 + chat/family 跨格式 `prompt_cache_key` 泄漏，见 §18.11）；`backend-v0.7.104` 把 window 改为按合成 thread 跟踪压缩次数（`window_number` / `context_window_id` / `window_id` 随压缩推进）并加入出站字段白名单（见 §7.3、§9.2、§18.12）。操作员已于 2026-09-05 自行把线上更新到 `backend-v0.7.103` 并在 Codex Pro 号池打开开关（32 thread / 256 turn），线上验证见 §18.12；`backend-v0.7.105` 依 .104 上线后的风控复核修订短头与 `x-client-request-id` 规则（§9.1、§18.13），并对不带任何 codex 元数据的 `/responses` 请求按内容合成 root / turn 并物化官方形状、补齐被中转剥掉的官方头、剥离 `x-trace-id`（§18.14）；`backend-v0.7.106` 让 `HttpCompact` 表面补齐官方头并删 `x-client-request-id`（§18.14.3）。**线上现为 `backend-v0.7.106`（2026-09-05 06:40 UTC），.104 引入的缓存回退已由 .105 修复并验证（§18.14.7、§18.14.9）**
+> Status: **Implemented（第四稿）— 已在 `custom` 分支落地，随 `backend-v0.7.101` 交付；`backend-v0.7.102` 为其 code-review 缺陷修复（UUIDv7 ContextV7 缺口 + chat/family 跨格式 `prompt_cache_key` 泄漏，见 §18.11）；`backend-v0.7.104` 把 window 改为按合成 thread 跟踪压缩次数（`window_number` / `context_window_id` / `window_id` 随压缩推进）并加入出站字段白名单（见 §7.3、§9.2、§18.12）。操作员已于 2026-09-05 自行把线上更新到 `backend-v0.7.103` 并在 Codex Pro 号池打开开关（32 thread / 256 turn），线上验证见 §18.12；`backend-v0.7.105` 依 .104 上线后的风控复核修订短头与 `x-client-request-id` 规则（§9.1、§18.13），并对不带任何 codex 元数据的 `/responses` 请求按内容合成 root / turn 并物化官方形状、补齐被中转剥掉的官方头、剥离 `x-trace-id`（§18.14）；`backend-v0.7.106` 让 `HttpCompact` 表面补齐官方头并删 `x-client-request-id`（§18.14.3）。**线上现为 `backend-v0.7.106`（2026-09-05 06:40 UTC），.104 引入的缓存回退已由 .105 修复并验证（§18.14.7、§18.14.9）**。`backend-v0.7.107`（候选，未单独发版）把每日 thread / turn 槽数从固定值改为天花板，实际槽数按账号、按天在 `[ceil(N/2), N]` 内确定性抖动（§7.0、§18.15），同 release 顺带把内置 Codex UA 字典换成 0.153.x、`version` 头随出站 UA；`backend-v0.7.108` 包含 .107 全部内容，并把 thread 分配从哈希分槽改为按到达顺序 mint、当天名册满后复用最久没有新 turn 的 thread（§7.1、§8、§18.16）。
 > Date: 2026-09-03
 > Scope: Codex OAuth 号池在选号之后，按账号、按日合成并复用上游可见的 `session_id` / `thread_id` / `turn_id` / `window_id`
 > Production changes: 每个 tag 只触发 CI 构建镜像；线上更新一律由操作员另行授权后按 `docs/operations/release-and-container-update-spec.md` 执行（`.env` 钉 digest、只重建 `app`）。已上线：.103（操作员自行，2026-09-05 之前）→ .104（2026-09-05 02:36 UTC）→ .105（06:05 UTC）→ .106（06:40 UTC）。功能缺省关闭，当前只在 Codex Pro 号池打开（32 / 256）
@@ -16,7 +16,7 @@
 | 代码 | `apps/aether-gateway/src/codex_runtime_identity.rs`（算法、四个表面 `HttpResponses` / `HttpCompact` / `Headers` / `WsStepBody`、三表面白名单）；挂点见 §11、§18.1、§18.5、§18.6 |
 | 不变量 | 三套身份平面不混用（§5）；只改出站副本，sticky / WS 绑定 / fence / 用量读入站（§2）；任何真实单一版本 codex-rs 产生不了的确定性形状都是缺陷，优先级高于「少泄漏」（§18.13） |
 | 官方基准 | 本地 `/opt/stacks/openai-codex`；§1–§18.12 按 `357696c5` 复核，§18.13 起按 `07f18d5f`。核对时先看 checkout 版本，不上网查 |
-| 演进 | §18.11（.102 修复）→ §18.12（.104 window / 白名单 + 线上验证）→ §18.13 / §18.14（.105 风控复核、无元数据合成、官方头补齐）→ §18.14.3（.106 compact）→ §18.14.7（缓存回退根因）→ §18.14.8 / §18.14.9（未知键原则、上线验证结果） |
+| 演进 | §18.11（.102 修复）→ §18.12（.104 window / 白名单 + 线上验证）→ §18.13 / §18.14（.105 风控复核、无元数据合成、官方头补齐）→ §18.14.3（.106 compact）→ §18.14.7（缓存回退根因）→ §18.14.8 / §18.14.9（未知键原则、上线验证结果）→ §7.0 / §18.15（.107：每日槽数上限按账号按天抖动）→ §7.1 / §8 / §18.16（.108：thread 按到达顺序 mint、满员复用最久未用） |
 | 部署记录 | 仓库根 `容器更新历史.md`（操作员本地文件，未纳入 git）+ `.env.bak.<ts>_pre_vX` |
 | 残余 | §15、§18.14.5：`internal_<source>:<parent>` 形式 `prompt_cache_key` 透传；合成请求压缩探测不到；中转 65 字符 `rs_` id 400 循环另行设计 |
 
@@ -71,8 +71,8 @@
 
 ## 3. 目标
 
-1. 打开开关后，单个号池账号每天向上游 **新暴露** 的 distinct `thread_id` 不超过 `expected_threads_per_day`（跨日冻结续上的旧 UUID 不计入「新暴露」）。
-2. 同一条合成 thread 每天向上游 **新暴露** 的 distinct `turn_id` 不超过 `expected_turns_per_day`。账号最坏上限是 `N × M`（所有 thread 槽都活跃）。这是有意的：禁止用账号全局 turn 槽，避免 session A 和 session B 共用一个出站 `turn_id`。
+1. 打开开关后，单个号池账号每天向上游 **新暴露** 的 distinct `thread_id` 不超过 `expected_threads_per_day`（跨日冻结续上的旧 UUID 不计入「新暴露」）。该值是天花板：当天实际槽数 `N_day` 按账号、按天从 `[ceil(N/2), N]` 里确定性抽取（§7.0），忙账号不会天天恰好停在同一个 N，池内账号之间也不同步。
+2. 同一条合成 thread 每天向上游 **新暴露** 的 distinct `turn_id` 不超过 `expected_turns_per_day`；同样是天花板，每条 thread 当天的槽数 `M_thread` 从 `[ceil(M/2), M]` 抽取。账号最坏上限是 `N × M`（所有 thread 槽都活跃）。这是有意的：禁止用账号全局 turn 槽，避免 session A 和 session B 共用一个出站 `turn_id`。
 3. 同一入站 root session 在同一天窗口内稳定映射到同一合成 thread；接续冻结未过期时，跨日、重连、HTTP compact 与 WS 之间仍使用同一冻结 thread。
 4. 同一入站 `turn_id` 在同一合成 thread 的同一天窗口内稳定映射到同一合成 turn（含工具后续、重试、该 turn 上的 compaction/prewarm）。同一 WS 候选快照上的步骤、以及 per-turn freeze 命中的跨午夜请求，不得换 turn UUID。
 5. 出站所有身份投影一致：dash 头、扁平 `client_metadata`、规范 turn-metadata JSON、WS 握手头、HTTP 身份头。
@@ -142,8 +142,8 @@ inbound request
 |---|---|---|
 | 对象缺失 | 关闭 | 生产号池保持今天的透传 |
 | `enabled` | `false` | 必须是布尔。`true` 才改写。`false` 是合法关闭 |
-| `expected_threads_per_day` | 仅当对象存在且 `enabled: true` 时需要 | 整数，范围 `1..=64`。当天该账号活跃合成 thread 槽数 N。缺字段或越界 = 非法 |
-| `expected_turns_per_day` | 仅当对象存在且 `enabled: true` 时需要 | 整数，范围 `1..=512`。**每条合成 thread** 的当天 turn 槽数 M。不再要求 `M >= N` |
+| `expected_threads_per_day` | 仅当对象存在且 `enabled: true` 时需要 | 整数，范围 `1..=64`。该账号每天合成 thread 槽数的 **上限** N；当天实际槽数从 `[ceil(N/2), N]` 抽取（§7.0）。缺字段或越界 = 非法 |
+| `expected_turns_per_day` | 仅当对象存在且 `enabled: true` 时需要 | 整数，范围 `1..=512`。**每条合成 thread** 当天 turn 槽数的 **上限** M；实际槽数从 `[ceil(M/2), M]` 抽取。不再要求 `M >= N` |
 
 没有环境变量。
 
@@ -191,13 +191,27 @@ day_id = floor((unix_secs + account_jitter_secs) / 86400)
 
 账号不会在 UTC 0 点同时换池。`day_id` 是整数，进入 Redis key，不进上游。
 
+### 7.0 每日槽数上限抖动（v0.7.107）
+
+`expected_threads_per_day` / `expected_turns_per_day` 是天花板，不是当天的固定槽数：
+
+```text
+N_day      = ceil(N/2) + SHA256("aether:codex:rid:bound:v1" || NUL "thread" NUL || selection || NUL || day_id) 前 8 字节 % (N - ceil(N/2) + 1)
+M_thread   = ceil(M/2) + SHA256("aether:codex:rid:bound:v1" || NUL "turn" NUL || selection || NUL || day_id || NUL || outbound_thread_id) 前 8 字节 % (M - ceil(M/2) + 1)
+```
+
+- `N = 1` 恒为 1；`N = 32` 落在 `[16, 32]`；`M = 256` 落在 `[128, 256]`。
+- 为什么要抖：槽位懒 mint，轻量账号只出现实际命中的槽；但一个账号一天遇到 k 个不同入站 root 时命中槽数期望是 `N(1-(1-1/N)^k)`，k ≥ 150 就等于 N。中转流量每个新对话都是新 root，忙账号会天天恰好 N 条、池内账号彼此相同，这是任何真实 codex 用户群都产生不了的确定性形状（§18.15 有线上数据）。抖动只改天花板，不改 root / turn 冻结语义。
+- Redis 槽键已含 `day_id`（thread）与 `outbound_thread_id`（turn），不同天的取模空间不同不会串键，无需迁移；`jittered_bound` 只依赖配置值与哈希，Redis 不存 `N_day`。
+- 7.1 第 4 条与 7.2 第 4 条里的 `% N` / `% M` 均指 `% N_day` / `% M_thread`。
+
 ### 7.1 Thread 与 Session
 
 1. 入站 root = 官方 `session_id`（非空）否则 `thread_id`。与 sticky 的 `CodexSessionIdentity::root_session` 相同。
 2. 没有入站 root 时：不合成 thread/session（没有可哈希的稳定输入）。不要用 Aether API Key、trace id 或随机数当 root。
 3. 先查 7.5 的 root 冻结快照。命中则出站 `thread_id` / `session_id` / `window_id` 用冻结值，跳过本小节 mint。
-4. `thread_slot = SHA256("aether:codex:rid:thread:v1" || NUL || selection || NUL || day_id || NUL || inbound_root) 的前 8 字节 % N`。
-5. Redis 保存 `(provider_id, selection_fp, day_id, thread_slot)` → 合成 thread UUID。首个写入者 SET NX 一枚 **UUIDv7**；其余复用。
+4. 按 **到达顺序** 分配（v0.7.108，§18.16；v0.7.107 及之前是 `SHA256(... inbound_root) % N_day` 哈希分槽）：读该账号当天名册 `…:{day_id}:threads`（有序集合，成员 = 出站 thread UUID，分数 = 最后活跃 unix 秒）的大小 `active`；`active < N_day`（`N_day` 见 7.0）时对到达序号 `index ∈ [active, N_day)` 依次 `SET NX` 一枚现场 **UUIDv7** 到 `…:{day_id}:thread:{index}`，成功即 mint 并写入名册；序号全被占或 `active ≥ N_day` → 名册已满，复用分数最低（最久没有新 turn）的成员并刷新其分数。
+5. 名册分数只在该 thread mint 新 turn 时刷新（7.2）；frozen turn 回放、重试、memory / compact 不算活跃。跨日 freeze 续上的旧 thread 在其下一个新 turn 时进入今天的名册，占今天一个名额但不占到达序号。
 6. 出站 `thread_id` = 该 UUID。出站 `session_id` = **同一 UUID**（官方 `SessionId::from(ThreadId)`）。
 7. 出站 **整字段删除**（不要改写成合成 UUID 再留下形状）：
    - `parent_thread_id`、`forked_from_thread_id`、`x-codex-parent-thread-id`
@@ -208,7 +222,7 @@ day_id = floor((unix_secs + account_jitter_secs) / 86400)
 8. 保留 `request_kind`。`x-oai-attestation` 今天已经在 HTTP 与 WS 候选头构建之前被 `remove_codex_pool_upstream_leak_headers` 无条件剥掉（`planner/standard/codex.rs:153`；WS 候选头取自 `decision/request.rs:286-304` 之后的同一份 map），`official_request` 拷贝名单里的该条目（`codex_ws/runtime.rs:900`）是死代码。本功能不得新写入该头，也不得让 profile 层开始生成它。官方生成上下文只含 thread_id，app-server 包体 `{v,s,t}` 不含身份；剥离是为了不把入站 token 复用到换号后的账号，不是因为它泄漏 ID。
 9. `x-client-request-id`：见 9.1。官方 WS 契约是出站 `thread_id`。
 
-禁止全账号共用一条 thread。N 个槽位让上游看起来像少量并行会话，而不是一条无限长对话。
+禁止全账号共用一条 thread。最多 `N_day` 条按需长出来的 thread 让上游看起来像一个人陆续开了少量对话，而不是一条无限长对话，也不是 N 条整天同时活跃的对话。
 
 ### 7.2 Turn
 
@@ -217,7 +231,7 @@ Turn 槽按 **合成 thread** 分区。第一稿把 `turn_slot` 做成账号全�
 1. 入站 turn key = 官方 `turn_id`（非空）否则 `inbound_root || inbound_thread || inbound_window`。
 2. 没有 turn key 且没有 thread root：不合成 turn。
 3. 先查 7.5：WS 候选已有进程内快照 → 直接用；否则查该入站 turn 的 per-turn freeze；都没有才按下面取槽并写 per-turn freeze。任何情况都不透传入站 turn。
-4. `turn_slot = SHA256("aether:codex:rid:turn:v1" || NUL || selection || NUL || day_id || NUL || outbound_thread_id || NUL || inbound_turn_key) 的前 8 字节 % M`。
+4. `turn_slot = SHA256("aether:codex:rid:turn:v1" || NUL || selection || NUL || day_id || NUL || outbound_thread_id || NUL || inbound_turn_key) 的前 8 字节 % M_thread`（`M_thread` 见 7.0；v0.7.106 及之前是固定 `% M`）。
    分区点是 **出站 thread UUID**，不是 `thread_slot`：只把 `inbound_root` 拼进 turn key 不够（fallback turn key 已经含 root，分区点是 Redis 键和取模空间）；用 `thread_slot` 也不够，因为 root freeze 跨日命中的 thread 会与当天同槽位新 mint 的另一条 thread 共用 turn 槽空间，产生「两条 thread 同一个 turn UUID」这种官方永不产生的形状。
 5. Redis 保存 `(provider_id, selection_fp, day_id, outbound_thread_id, turn_slot)` → 合成 turn UUIDv7。
 6. 同一入站 `turn_id` 在同一合成 thread 上哈希到同一槽，因此一次真实 turn 的工具后续、重试、该 turn 上的 compaction/prewarm 共用出站 `turn_id`。不相关 turn 只在 **同一条合成 thread 内** 碰撞到 M 个槽。
@@ -319,24 +333,25 @@ HTTP 兼容短头 `session_id` / `conversation_id`（`prompt_cache_key` SHA-256 
 与 sticky 同属共享 runtime backend，多实例可见。不要放进 fingerprint JSON，不要放进 `upstream_metadata`。
 
 ```text
-ap:{provider_id}:codex_rid:{selection_fp}:{day}:thread:{slot} = uuid
+ap:{provider_id}:codex_rid:{selection_fp}:{day}:thread:{index} = uuid            (index = 当天到达序号，v0.7.108；之前是哈希槽)
+ap:{provider_id}:codex_rid:{selection_fp}:{day}:threads = zset(uuid -> 最后活跃 unix 秒)  (v0.7.108，§7.1 / §18.16)
 ap:{provider_id}:codex_rid:{selection_fp}:{day}:turn:{outbound_thread_id}:{slot} = uuid
 ap:{provider_id}:codex_rid:{selection_fp}:freeze:{inbound_root_hash} = json
 ap:{provider_id}:codex_rid:{selection_fp}:freeze:{inbound_root_hash}:turn:{inbound_turn_hash} = uuid
 ap:{provider_id}:codex_rid:{selection_fp}:window:{outbound_thread_id} = json  (v0.7.104，§7.3)
 ```
 
-第四稿去掉锁键：每个槽位 / freeze 都是单键，`RuntimeState::kv_set_if_absent`（Redis `SET NX PX`）本身原子；两实例对同一键只有一个写入成功，失败方 `kv_get` 回读赢家值。sticky 的 `sticky_init` 锁是为多键初始化准备的，这里不需要。
+第四稿去掉锁键：每个槽位 / freeze 都是单键，`RuntimeState::kv_set_if_absent`（Redis `SET NX PX`）本身原子；两实例对同一键只有一个写入成功，失败方 `kv_get` 回读赢家值。sticky 的 `sticky_init` 锁是为多键初始化准备的，这里不需要。v0.7.108 的名册是普通 ZSET（`ZADD` / `ZCARD` / `ZRANGEBYSCORE` / `ZREM` + `PEXPIRE`），到达序号仍靠 `SET NX` 保证不超额，不需要 Lua 或计数键。
 
 | 项 | 规则 |
 |---|---|
-| TTL | 日窗口剩余秒数 + 12h 余量（覆盖 jitter、迟到请求、跨午夜工具循环）；freeze 键每次命中刷新（滑动），槽位键不刷新 |
+| TTL | 日窗口剩余秒数 + 12h 余量（覆盖 jitter、迟到请求、跨午夜工具循环）；freeze 键与名册每次写入刷新（滑动），序号 / turn 槽键不刷新 |
 | Mint | 首次绑定现场生成 UUIDv7，使 ID 看起来是当天创建的。UUIDv7 带时间；把昨天的 ID 配上新的 `turn_started_at_unix_ms` 是可检测异常。freeze 命中时 **保留** 昨天的 UUIDv7，这比会话中途换 thread 更可接受 |
 | 并发 mint | 单键 SET NX（`kv_set_if_absent`），失败方回读；两个实例不得为同一槽 / 同一 freeze 得到不同值。root freeze 的 `last_turn_id` 更新用 `kv_set_if_value` CAS，失败即放弃（尽力而为） |
 | window 键 | 每请求 GET + 滑动 EXPIRE；C 缺失时 SET NX / CAS 补 mint，失败方回读；压缩推进用 CAS，并发压缩只推进一次（尽力而为） |
 | 日志 | 入站 ID 与 selection 只记哈希；禁止记录原始官方账号 ID、OAuth token、Aether API Key |
 | Redis 故障 | 该请求 **透传入站 ID**，打点 `codex_rid_store_unavailable`。禁止进程内私自 mint |
-| 独立 HTTP 请求（无 previous_response_id、无 freeze） | 按当前 day 槽映射 |
+| 独立 HTTP 请求（无 previous_response_id、无 freeze） | 按 §7.1 到达顺序 mint，当天名册满则复用最久未用 |
 | WS 候选已有快照 / 未过期 freeze | 见 7.5，忽略 day 换槽 |
 | WS | 候选首次握手解析出站 ID，冻结在该物理 binding 上；午夜日切也不换，直到连接排空。同时写入 Redis freeze，供 HTTP compact 对齐 |
 
@@ -745,6 +760,8 @@ cd frontend && npm run type-check
 - `backend-v0.7.104`（`a45fe8e80`）：codex-tui ≥ 0.153 新字段收敛（见 §18.12）。操作员授权后于 2026-09-05 02:36 UTC 上线；上线后发现缓存回退（§18.14.7）。
 - `backend-v0.7.105`（`fa0b3179c`，另含操作员 commit `5579355f9` Codex WS 读超时保留 sticky 账号）：短头删除、`x-client-request-id` = 出站 thread、无元数据请求合成、`HttpResponses` 补齐官方四头、`x-trace-id` 黑名单（§18.13、§18.14）。2026-09-05 06:05 UTC 上线，缓存命中恢复（§18.14.9）。
 - `backend-v0.7.106`（`bed5f7e2d`）：`HttpCompact` 表面补齐官方头并删 `x-client-request-id`（§18.14.3）。2026-09-05 06:40 UTC 上线。
+- `backend-v0.7.107`：每日槽数上限按账号、按天抖动（§7.0、§18.15）；同一 release 顺带把内置 Codex UA 字典 `resources/codex-client-header-profiles.json` 换成线上观察到的 0.153.x 形状（与本功能无关，属 `codex_client_headers`，gpt-6 需要 ≥ 0.153 客户端），并让 `version` 头随出站 UA。**未单独打 tag**：操作员决定直接连同 .108 一起发。
+- `backend-v0.7.108`：thread 按到达顺序 mint、当天名册满后复用最久没有新 turn 的 thread（§7.1、§8、§18.16），包含 .107 的全部内容。操作员授权「打 tag、提交、推送和更新最新版本」。
 - 每次上线均按 `docs/operations/release-and-container-update-spec.md`：`.env` 钉 amd64 digest、备份 `.env.bak.<ts>_pre_vX`、只重建 `app`、核对 `_sqlx_migrations` / `schema_backfills` 不变；逐次记录在仓库根 `容器更新历史.md`（未纳入 git）。之后仍由操作员按 §17 门禁决定是否更新与打开。
 
 ### 18.11 v0.7.102 缺陷修复（code-review）
@@ -886,3 +903,42 @@ cd frontend && npm run type-check
 - 合成请求（无元数据中转流量）n=29，miss 全为首请求，命中中位数 0.968 略低于基线 0.982，样本小，列为观察项（运维手册 §3.4）。
 - `/responses/compact` 线上 72 小时零流量，.106 的 `HttpCompact` 形状只由单测覆盖（运维手册 §3.6 给了核对语句）。
 - 上线后 .104 不再是可用的回滚目标（带缓存回退）；回滚到 .105 或更早请见运维手册 §6。
+
+### 18.15 v0.7.107 每日槽数上限按账号、按天抖动
+
+**起因**：操作员对照前端卡片文案「同一账号一天内只出现固定数量的 Thread」提出：入站请求多时，每个账号每天的出站 thread 数会不会都一样。核对代码（`thread_slot` / `turn_slot` 以 `expected_threads_per_day` / `expected_turns_per_day` 为硬模数；`account_jitter_secs` 只错开换日时刻，不改数量）与线上数据（Codex Pro 开启后约 4 小时，6 个账号各 257–395 请求，出站 thread 7–17 条，73 条 thread 的 turn 中位数 1、最大 20）：turn 侧离 256 很远不构成指纹；thread 侧按 `N(1-(1-1/N)^k)` 推算，一天 40 个不同 root 约 23 条、80 个约 30 条、150 个以上就是 32 条。中转流量（七成以上）每个新对话都是新 root，忙账号整天会稳定落在 29–32 条并且彼此相同、天天相同。按 §18.13 的标准（真实 codex-rs 用户群产生不了的确定性形状）这是缺陷。
+
+**修法（选最小的）**：天花板不变，当天实际槽数按账号、按天（turn 再按 thread）从 `[ceil(N/2), N]` / `[ceil(M/2), M]` 确定性抽取，见 §7.0。改动只在 `CodexRuntimeIdentityScope` 新增 `thread_bound` / `turn_bound` 与 `jittered_bound`，`thread_slot` / `turn_slot` 改用它们做模数；Redis 键、freeze、window、四个表面与白名单都不动。当时没有采用「按到达顺序 mint、满了复用最久未用 thread」的增长模型（形状更像真人，但要加名册状态）；操作员随后拍板把它作为 .108 实施，见 §18.16，thread 侧的哈希分槽因此只存在于 .107 工作区，从未上线。
+
+**没有改的**：`expected_threads_per_day` 字段名与范围不变（前端文案改成「每日上限」并说明抖动区间）。N 本身取多大是运维配置：一个人日常用 codex 大约几条到十几条 thread，Codex Pro 当前的 32 偏高，建议操作员在 UI 里下调（例如 8–16）；下调意味着更多不相关对话折进同一条 thread（§7.1 末段的取舍不变）。
+
+**测试**：`daily_bounds_jitter_per_account_and_day_within_band`（区间、确定性、跨日/跨账号/跨 thread 有变化、N=1 恒 1、N=2/3 边界）；既有 `thread_slots_bound_distinct_roots_and_stay_stable`（3 槽上限、仍 >1 槽）与 `turn_slots_bound_per_thread_and_never_cross_threads` 不改即通过。
+
+**同 release 的无关改动**：内置 UA 字典换成 0.153.x（23 组，全部来自线上入站真实客户端，去掉了 `codex_work_desktop` / chrome 扩展这类小众 originator），前端与后端各一条「字典全部 0.153」测试。Codex Pro 号池自己填了 32 组 0.149–0.151 自定义 UA，改字典不影响它；要让线上账号升到 0.153 需操作员在「稳定客户端请求头」里替换列表（或清空以跟随内置字典，但那要等 .107 上线后才是 0.153）并执行「一键更新 UA」批量动作，刷新只换 UA / originator，不换 `installation_id`。
+
+**`version` 头随出站 UA（同 release，复核 UA 字典时发现）**：codex-rs 在 OpenAI provider 上把 `version: <CARGO_PKG_VERSION>` 作为静态 provider 头带在 **每个** 请求上（`model-provider-info/src/lib.rs:397-401` → `codex-api/src/provider.rs:76-84` `build_request` 整份克隆；WS 握手经 `merge_request_headers` 同样带），与 originator 无关，值恒等于 UA 里的 build 版本。Aether 此前三个表面三种行为：HTTP `/responses`、compact 与 WS 握手把入站 `version` 原样透传（真实客户端 0.153.4 + 池档位 UA 0.149.1 = 同一请求两个 build 号）；中转流量入站没有 `version` 就出站也没有；Search 表面从出站 UA 派生但只看第一个空白分隔 token，`Codex Desktop/0.153.1 ...` 解析失败后整个头被删（HEAD 字典 16/32、新字典 10/23 是 Desktop）。修法：`codex_profile.rs` 新增 `codex_client_version_from_user_agent`（取第一个括号之前的产品段里第一个带 `/` 的 token）与 `apply_codex_client_identity_headers`（一次写 `user-agent` / `originator` / `version`，解析失败则删 `version`），所有写 UA 的地方（planner `apply_codex_pool_stable_client_headers` 两个分支、`apply_codex_concrete_account_profile_to_request_with_body_policy`、`..._to_search_headers`）统一走它；Search 归一化改用同一解析器。WS 握手拷贝的是 profile 之后的 `candidate.headers`，自动带上改写后的 `version`。未开稳定请求头的号池不改 UA 也就不碰 `version`，仍与入站一致。测试：`client_version_follows_user_agent_for_every_official_originator_shape`、`identity_headers_rewrite_version_with_user_agent_and_drop_it_when_unparsable`、`openai_search_headers_derive_version_from_multi_word_originator_user_agent`。操作员报告 gpt-6 对低版本客户端返回 400，上游若是看 `version` 头而非 UA，仅升 UA 字典并不够，这一条补上才闭环。
+
+线上复核（2026-09-05）把问题定性得更重：codex-rs 只在内置 `openai` provider 上挂 `version` 头（`create_openai_provider`），指向 Aether/中转的客户端走自定义 provider，入站从来没有这个头；30 分钟 808 条 Codex Pro HTTP 请求入站、出站 `version` 均为 0。也就是说「透传入站值」在 .106 上从未发生过，上游看到的 Aether 流量 100% 缺 `version`，而真实客户端 100% 带。.107 从出站 UA 派生后覆盖率直接翻到 100%，这是本 release 里最确定的形状修复。
+
+### 18.16 v0.7.108 thread 按到达顺序 mint、满员后复用最久未用
+
+**要解决的形状**：哈希分槽把每个新 root 伪随机塞进某条 thread。忙账号 k ≫ N 时所有 N 条 thread 整天同时活跃，两个不相关的对话会落进同一条 thread 并发交错；真实 codex-rs 一条 thread 里从不同时跑两个 turn，这是当前模型里最确定的机器形状，也拖低同 thread 的 prompt cache 命中。§7.0 的上限抖动只管「每天多少条」，不管「新 root 折进哪条」，两者叠加。操作员在 .107 尚未发版时决定直接做这一步（「不不 直接做最新的108」），.107 的内容随本版一起发。
+
+**实现**（只替换 §7.1 第 4–5 条，即 `resolve_inner` 里 root freeze miss 的分支，抽成 `assign_thread`；freeze、turn 槽、window、WS 快照、四个表面、白名单全部不动）：
+
+1. 名册：每账号每天一个有序集合 `ap:{provider_id}:codex_rid:{selection_fp}:{day_id}:threads`，成员 = 出站 thread UUID，分数 = 最后活跃 unix 秒；每次写入后 `PEXPIRE` 到 `scope.ttl(now)`（与 freeze 一样滑动）。
+2. 到达序号：`…:{day_id}:thread:{index}`，键形状与之前相同，`index` 从哈希槽变成到达序号。新 root 无 freeze 时先 `ZCARD` 名册得 `active`；对 `index ∈ [active, N_day)` 依次 `SET NX` 一枚现场 UUIDv7，成功即 mint（`ZADD` 进名册并返回）；序号全被占或 `active ≥ N_day` → 名册满，`ZRANGEBYSCORE 0 +inf` 取第一个（分数最低、同分按成员序）复用并刷分数，打点 `codex_rid_thread_reused`（debug）。`SET NX` 使并发新 root 不可能 mint 超过 `N_day`，比原计划的「软上限 + 事后回收」硬，也不需要 CAS 计数键或 Lua。
+3. 活跃度：只在 `resolve_turn` 的 turn mint 分支（`OutboundTurnSource::Minted`）把出站 thread `ZADD` 进当天名册并刷 TTL；frozen turn 回放、重试、memory / compact 请求不写。WS 快照路径的新 turn 同样经过这里，所以 WS 上活跃的 thread 也受保护。这一步还把跨日 freeze 续上的旧 thread 放进今天的名册：它占今天一个名额（计入 `active`）但不占到达序号，因此「今天可见的 thread 总数 ≤ N_day」对续上的旧 thread 同样成立。
+4. freeze 竞争：同一 root 的并发首请求各自 assign 后 `SET NX` freeze；输家若刚 mint 了新 thread（`fresh_mint`），`ZREM` 把它从名册撤回（序号键留到过期，当天少一个可用序号；只影响极少见的同 root 并发首请求）。
+5. 名册为空而序号全被占（Redis 淘汰、或整天全是输家）→ 直接 mint 一枚新 UUIDv7 写名册。不再保留哈希槽路径：`THREAD_SLOT_DOMAIN` / `thread_slot` 删除。Redis 不可用仍按 §7.5 透传 / 快照。
+6. 跨日：新 `day_id` 名册为空，第一批新 root 各得新 thread；旧 thread 只经 freeze 续上，并在其下一个新 turn 时进入今天的名册（第 3 条）。
+
+**结果形状**：忙账号当天出站 thread 数恰好等于 `N_day`（到达顺序会把额度填满），账号之间、跨日之间的差异来自 §7.0 的抖动；不相关对话只在名册满之后才共用一条 thread，而且落进最久没有新 turn 的那条。同一条 thread 里并发交错两个 turn，从「k ≫ N 时必然」变成「N_day 条全在活跃时才会」。
+
+**升级与迁移**：不需要迁移。升级瞬间当天已按哈希 mint 的 thread 不在名册里，也不再被新 root 命中（只经 freeze 续上，续上时进名册）；新 root 从序号 0 起 mint，所以切换当天该账号的 thread 数可能一次性略超 `N_day`（旧哈希 thread + 新序号 thread），次日恢复。回滚到 .106 时名册键与序号键自然过期。
+
+**存储层事实**（`crates/aether-runtime-state`）：内存后端与 Redis 后端都支持 `key_expire` 作用于有序集合键；`score_range_by_min` 两端都按分数升序、同分按成员字典序；`score_set` 不改 TTL，所以名册写入后必须跟一次 `key_expire`。没有公开的 INCR / Lua / pipeline。
+
+**测试**（`codex_runtime_identity::tests`）：`threads_mint_by_arrival_then_reuse_least_recent_and_stay_stable`（前 `N_day` 个 root 各 mint 新 thread 且 UUIDv7 时间戳 = 到达时刻，之后轮到最久未用；同入站再来仍 Frozen 不变）、`new_turn_protects_its_thread_from_reuse`（新 turn 刷活跃度、frozen 回放不刷）、`roster_starts_fresh_each_day_and_carried_threads_count_against_it`（跨日名册清零；续上的旧 thread 进入今天名册并占名额，满员后它作为最久未用被复用）、`concurrent_new_roots_never_mint_past_the_daily_bound`（多线程 24 个新 root 同时到达，distinct thread ≤ `N_day` 且每个 root 稳定）；既有 `concurrent_mints_converge_on_one_identity`（同 root 并发收敛到一条）与 turn / window / 跨日 freeze 测试不改。
+
+**不做**：turn 侧不改（线上 turn/thread 中位数 1、最大 20，远低于上限，且真实 turn 从不复用，M 上限本来就几乎不绑）；不引入 LRU 之外的「按对话相似度归并」；不做 Lua / 计数键；不对旧哈希 thread 做迁移。

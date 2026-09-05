@@ -1319,17 +1319,10 @@ fn normalize_openai_search_headers(
     let version = headers
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("user-agent"))
-        .and_then(|(_, value)| codex_version_from_user_agent(value));
+        .and_then(|(_, value)| crate::codex_profile::codex_client_version_from_user_agent(value));
     if let Some(version) = version {
         headers.insert("version".to_string(), version);
     }
-}
-
-fn codex_version_from_user_agent(user_agent: &str) -> Option<String> {
-    let token = user_agent.split_whitespace().next()?.trim();
-    let (_, version) = token.split_once('/')?;
-    let version = version.trim();
-    (!version.is_empty()).then(|| version.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2429,6 +2422,25 @@ mod tests {
             headers.get("accept").map(String::as_str),
             Some("text/event-stream")
         );
+    }
+
+    #[test]
+    fn openai_search_headers_derive_version_from_multi_word_originator_user_agent() {
+        // `Codex Desktop/<ver>`: the originator carries a space, so the version
+        // is not in the first whitespace token. codex-rs still sends `version`.
+        let mut headers = BTreeMap::from([
+            (
+                "user-agent".to_string(),
+                "Codex Desktop/0.153.1 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.901.31953)"
+                    .to_string(),
+            ),
+            ("Version".to_string(), "9.9.9".to_string()),
+        ]);
+
+        normalize_openai_search_headers(&mut headers, false);
+
+        assert_eq!(headers.get("version").map(String::as_str), Some("0.153.1"));
+        assert!(!headers.contains_key("Version"));
     }
 
     #[test]

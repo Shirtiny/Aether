@@ -416,22 +416,32 @@ fn codex_pool_stable_client_headers_override_client_identity_headers() {
     let mut headers = BTreeMap::from([
         ("user-agent".to_string(), "Go-http-client/2.0".to_string()),
         ("originator".to_string(), "Codex Desktop".to_string()),
+        // A real client's build number must not survive next to a different UA.
+        ("version".to_string(), "0.1.0".to_string()),
         ("x-client-request-id".to_string(), "trace-123".to_string()),
     ]);
 
     apply_codex_pool_stable_client_headers(&mut headers, &transport);
     let first_user_agent = headers.get("user-agent").cloned();
     let first_originator = headers.get("originator").cloned();
+    let expected_version = crate::codex_profile::codex_client_version_from_user_agent(
+        first_user_agent.as_deref().expect("profile user-agent applied"),
+    )
+    .expect("every built-in profile user-agent carries a version");
+    assert_eq!(headers.get("version"), Some(&expected_version));
+    assert!(expected_version.starts_with("0.153."));
 
     headers.insert(
         "user-agent".to_string(),
         "claude-cli/2.1.19 (external, sdk-cli)".to_string(),
     );
     headers.insert("originator".to_string(), "codex_vscode".to_string());
+    headers.insert("version".to_string(), "2.1.19".to_string());
     apply_codex_pool_stable_client_headers(&mut headers, &transport);
 
     assert_eq!(headers.get("user-agent").cloned(), first_user_agent);
     assert_eq!(headers.get("originator").cloned(), first_originator);
+    assert_eq!(headers.get("version"), Some(&expected_version));
     assert_eq!(
         headers.get("x-client-request-id"),
         Some(&"trace-123".to_string())
@@ -689,13 +699,15 @@ fn builtin_codex_client_header_profiles_use_current_observed_versions() {
         .map(|profile| profile.user_agent.as_str())
         .collect::<std::collections::BTreeSet<_>>();
 
-    assert_eq!(profiles.len(), 32);
+    assert_eq!(profiles.len(), 23);
     assert_eq!(unique_user_agents.len(), profiles.len());
-    assert!(profiles.iter().all(|profile| {
-        ["/0.149", "/0.150", "/0.151"]
+    // gpt-6 upstream rejects clients below 0.153; the dictionary only ships
+    // shapes observed inbound from real 0.153.x clients.
+    assert!(
+        profiles
             .iter()
-            .any(|version| profile.user_agent.contains(version))
-    }));
+            .all(|profile| profile.user_agent.contains("/0.153."))
+    );
 }
 
 #[test]

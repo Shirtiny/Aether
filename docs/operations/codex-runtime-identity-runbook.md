@@ -2,18 +2,18 @@
 
 > 对象：接手维护 `pool_advanced.codex_runtime_identity` 的人或 AI。设计与算法在
 > `docs/architecture/codex-pool-runtime-identity-synthesis-plan-2026-09-03.md`（下称「设计文档」），本文只讲线上怎么看、怎么判、怎么退。
-> 最后更新：2026-09-05（线上 `backend-v0.7.106`）。
+> 最后更新：2026-09-05（线上 `backend-v0.7.106`；`.108`（含 `.107` 候选内容）在 `custom` 分支发版中）。
 
 ## 1. 现状速览
 
 | 项 | 值 |
 |---|---|
 | 功能 | Codex OAuth 号池选号之后，把上游可见的 `session_id` / `thread_id` / `turn_id` / `window_id` 改写成「每账号每日少量 thread / turn」的合成身份；入站官方 ID 一律不动（sticky、WS 绑定、fence、用量都读入站） |
-| 开关 | 号池高级设置 →「会话身份合成」卡片；JSON 为 `pool_advanced.codex_runtime_identity {enabled, expected_threads_per_day 1..=64, expected_turns_per_day 1..=512}`；缺省关闭 |
+| 开关 | 号池高级设置 →「会话身份合成」卡片；JSON 为 `pool_advanced.codex_runtime_identity {enabled, expected_threads_per_day 1..=64, expected_turns_per_day 1..=512}`；缺省关闭。两个数字是 **每日上限**：.107 起当天实际额度按账号、按天（turn 再按 thread）在 `[⌈N/2⌉, N]` / `[⌈M/2⌉, M]` 内确定性抖动，.106 及之前是固定模数；.108 起新对话按到达顺序各开一条 thread，当天额度用满后复用最久没有新 turn 的那条（.107 及之前按哈希分槽）。一个人日常用 codex 大约几条到十几条 thread，上限建议 8–16；Codex Pro 现填 32 偏高 |
 | 线上 | `backend-v0.7.106`（2026-09-05 06:40 UTC）；Codex Pro 号池开着 32 thread/天、256 turn/天 + 请求体/响应体捕获。.104 于 02:36 UTC、.105 于 06:05 UTC 同日上线 |
 | 代码 | `apps/aether-gateway/src/codex_runtime_identity.rs`（算法、白名单、四个表面）；HTTP 挂点 `ai_serving/planner/standard/openai/responses/decision/request.rs`、`ai_serving/planner/standard/codex.rs`；WS 挂点 `codex_ws/runtime.rs`；配置校验 `handlers/admin/provider/write/normalize.rs`；前端号池高级设置卡片 |
-| 状态存储 | Redis `ap:{provider_id}:codex_rid:{selection_fp}:...`（槽位、root/turn freeze、window），全部带 TTL；进程内还有 WS 候选快照 |
-| 观测 | 日志事件 `codex_rid_config_invalid` / `codex_rid_store_unavailable` / `codex_rid_chain_freeze_miss` / `codex_rid_unknown_metadata_key`（§4） |
+| 状态存储 | Redis `ap:{provider_id}:codex_rid:{selection_fp}:...`（thread 到达序号、当天 thread 名册 ZSET（.108）、turn 槽、root/turn freeze、window），全部带 TTL；进程内还有 WS 候选快照 |
+| 观测 | 日志事件 `codex_rid_config_invalid` / `codex_rid_store_unavailable` / `codex_rid_chain_freeze_miss` / `codex_rid_unknown_metadata_key` / `codex_rid_thread_reused`（§4） |
 | 部署记录 | 仓库根 `容器更新历史.md`（操作员本地文件，未纳入 git）+ `.env.bak.<ts>_pre_vX`；更新流程见 `docs/operations/release-and-container-update-spec.md` |
 | 官方源码基准 | 本地 checkout `/opt/stacks/openai-codex`（codex-rs），**不要上网查**；核对前先 `git -C /opt/stacks/openai-codex log -1 --format='%h %cd'` 记下版本 |
 
@@ -25,6 +25,8 @@
 | .104 | window 按合成 thread 跟踪压缩；出站字段白名单 | 2026-09-05 02:36 UTC，**引入缓存回退**（§3.4） |
 | .105 | 删 Aether 自补短头、`x-client-request-id` = 出站 thread、无元数据请求合成、`HttpResponses` 补齐官方四头、`x-trace-id` 黑名单 | 2026-09-05 06:05 UTC，缓存恢复 |
 | .106 | `HttpCompact` 表面补齐 `session-id` / `thread-id` / `x-codex-window-id`，删 `x-client-request-id` | 2026-09-05 06:40 UTC |
+| .107（候选，未单独发版） | 每日 thread / turn 槽数上限按账号、按天抖动（设计文档 §7.0、§18.15）；内置 Codex UA 字典换成 23 组线上观察到的 0.153.x（gpt-6 要求 ≥ 0.153 客户端）；`version` 头随出站 UA 改写（此前透传入站值、中转无此头、Search 遇 `Codex Desktop` UA 会删掉） | 并入 .108 |
+| .108 | 含 .107 全部内容；thread 改为按到达顺序 mint、当天名册满后复用最久没有新 turn 的 thread（设计文档 §7.1、§8、§18.16）；新事件 `codex_rid_thread_reused` | 发版中；Redis 新增 `…:{day}:threads` ZSET，无需迁移，切换当天账号 thread 数可能一次性略超上限 |
 
 ## 2. 数据源与取数规矩
 
@@ -209,6 +211,19 @@ select k, count(*) from rv, jsonb_object_keys(oh) k where provider_name='Codex P
 
 期望：Q2 里 `wn_without_ctx`、`window_id_mismatch`、`header_vs_blob_window_mismatch` 为 0；Q3 无 `leak:*` 行、`session!=thread` 为 0；Q4 无 `session_id` / `conversation_id` / `x-codex-parent-thread-id` / `x-openai-subagent` / `x-trace-id`；Q6 两列都等于 `threads`；Q8 每个 provider 的 `out_threads` 不超过 `expected_threads_per_day`×账号数量级。.105 起 Q9 中 Codex Pro 应几乎没有「no blob either side」行（无元数据请求已合成）。
 
+按账号看每日出站 thread 数（.107 的抖动是否生效、忙账号是否天天停在同一个数）：
+
+```sql
+-- psql -v since='<ts>' -f per_account_threads.sql ；rv 由 review.sql 建好
+select left(md5(u.provider_api_key_id::text),6) acct, date_trunc('day', rv.created_at) d,
+       count(*) reqs, count(distinct ob->>'thread_id') out_threads, count(distinct ib->>'thread_id') in_threads
+from rv join usage u on u.request_id = rv.request_id
+where rv.rewritten and rv.provider_name = 'Codex Pro'
+group by 1,2 order by 2,4 desc;
+```
+
+判读：`out_threads` 不得超过 `expected_threads_per_day`（.108 切换当天除外，见 §1 版本表）；.107 起忙账号（日请求数远大于上限）之间的 `out_threads` 应当不同，且同一账号跨日不同；若多数账号恰好等于上限并且彼此相同，抖动没生效或上限太低。.108 起忙账号的 `out_threads` 会 **恰好** 等于它当天抖出来的额度（到达顺序会填满），这是预期；差异体现在账号之间与跨日。请求量少的账号本来就只出现实际用到的 thread 数，不是问题。
+
 ### 3.6 `/responses/compact` 表面
 
 线上截至 2026-09-05 连续 72 小时没有任何 compact 请求（入站带 `thread-id` 且无 `x-client-request-id` 的行为 0），.106 的 `HttpCompact` 形状只由单测 `http_rewrite_inserts_missing_official_headers_on_responses_and_compact` 覆盖。若以后出现，用下面语句核对：出站应有 `session-id` / `thread-id` / `x-codex-window-id`，**没有** `x-client-request-id`。
@@ -234,7 +249,8 @@ docker logs aether-app --since 2026-09-05T06:40:00Z 2>&1 | grep -E 'codex_rid_' 
 |---|---|---|
 | `codex_rid_config_invalid` | 号池 `pool_advanced.codex_runtime_identity` 形状/范围不合法 | 该池当次请求按关闭处理（透传）。到管理后台重新保存卡片；校验规则见设计文档 §6、§18.7 |
 | `codex_rid_store_unavailable` | Redis 不可用，取不到槽位/freeze | 按设计回退：HTTP 透传入站身份或用进程内快照（设计文档 §7.5、§18.3）。先看 `docs/operations/redis-runtime-runbook.md`，Redis 恢复后自愈；持续出现说明 Redis 出问题，不是本功能问题 |
-| `codex_rid_chain_freeze_miss` | 带 `previous_response_id` 或跨路径接续时找不到 freeze | 按槽正常 mint（不透传）。偶发正常（freeze TTL 到期、跨日）；集中出现查 Redis TTL 与时钟 |
+| `codex_rid_chain_freeze_miss` | 带 `previous_response_id` 或跨路径接续时找不到 freeze | 按 §7.1 正常分配 thread（不透传）。偶发正常（freeze TTL 到期、跨日）；集中出现查 Redis TTL 与时钟 |
+| `codex_rid_thread_reused`（debug 级，.108） | 该账号当天 thread 额度已用满，新对话复用了最久没有新 turn 的 thread | 正常行为，忙账号每天都会出现。若某账号几乎每个新对话都触发（复用远多于 mint），说明上限相对该账号的流量偏低，酌情上调 `expected_threads_per_day`；不出现则说明流量没到上限 |
 | `codex_rid_unknown_metadata_key` | 客户端带了三表面白名单之外的键，已被删除；每进程每 (surface, key) 只 warn 一次 | 走 §4.1 判定 |
 
 ### 4.1 未知键判定流程（白名单维护）
@@ -280,4 +296,16 @@ docker logs aether-app --since 2026-09-05T06:40:00Z 2>&1 | grep -E 'codex_rid_' 
 - `prompt_cache_key` 改写只认 `guardian:` 前缀与等于入站 session 两种；官方 Internal 会话（memory_consolidation）发的 `internal_<source>:<parent_thread_id>` 原样透传（真实 parent thread 泄漏，约 1 请求/天）。
 - 合成请求（无元数据）的压缩探测不到：window 永远 0；中转端若把摘要替换掉首条 prompt，会被当成新 thread。
 - 同一入站 thread 先经第三方中转再切回 Codex Pro，历史里的 65 字符 `rs_` item id 会触发官方 400 重试循环，与身份合成无关，待独立设计。
-- 出站 UA 档位（Codex Desktop 0.149/0.150）落后于入站主流（codex-tui 0.153.x），属 UA 刷新任务范围，与本功能无关但会影响「该版本会不会发某键」的判定。
+- 出站 UA 由 `pool_advanced.codex_client_headers`（「稳定客户端请求头」）在账号物化时冻结进 key 指纹；与本功能无关但会影响「该版本会不会发某键」的判定。.107 起内置字典是 23 组 0.153.x，但 Codex Pro 号池自己填了 32 组 0.149–0.151 自定义 UA，改字典不会自动生效：要么在卡片里把自定义列表替换成 0.153.x（或清空以跟随内置字典），再点「一键更新 UA」（会同时保存卡片当前配置；只换 UA / originator，保留 `installation_id`；列表没变时点它不会改任何账号的 UA）。gpt-6 在客户端版本低于 0.153 时上游返回 400，线上 7 天内尚未观察到这种 400，但账号 UA 落后于入站主流本身就是可见偏差。
+- `version` 头：codex-rs 对 ChatGPT 后端的每个请求都带 `version: <build 版本>`，恒等于 UA 里的版本。但这个头只挂在内置 `openai` provider 上（`model-provider-info/src/lib.rs:397-401` `create_openai_provider`），客户端把 base_url 指向 Aether 或中转时用的是自定义 provider，所以**入站根本没有这个头**：2026-09-05 线上 30 分钟 808 条 Codex Pro HTTP 请求入站 `version` 为 0 条，出站也为 0 条，即 .106 及之前上游看到的 Aether 流量 100% 缺 `version`，这是真实客户端产生不了的形状。.106 的逻辑是「有入站就透传」（Search 表面遇到 `Codex Desktop/...` UA 还会把它整个删掉），实际从未生效。.107 起所有写 UA 的地方同时把 `version` 写成出站 UA 的版本，出站覆盖率应从 0 变成 100%。核对 SQL：出站头里 `version` 应等于 `user-agent` 第一个括号前 `/` 后的那段：
+
+```sql
+select count(*) n,
+       count(*) filter (where oh ? 'version') has_version,
+       count(*) filter (where oh->>'version' = split_part(split_part(split_part(oh->>'user-agent','(',1),'/',2),' ',1)) version_matches_ua
+from (select h.provider_request_headers::jsonb oh from usage_http_audits h join usage u on u.request_id=h.request_id
+      where h.created_at >= :'since' and u.provider_name='Codex Pro'
+        and jsonb_typeof(h.provider_request_headers::jsonb)='object') s;
+```
+
+期望 .107 后 `has_version = version_matches_ua = n`。

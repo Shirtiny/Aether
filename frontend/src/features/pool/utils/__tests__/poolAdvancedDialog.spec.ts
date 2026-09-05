@@ -15,9 +15,10 @@ describe('poolAdvancedDialog', () => {
   it('ships the current observed Codex client header profiles', () => {
     const profiles = buildDefaultCodexClientHeaderProfiles()
 
-    expect(profiles).toHaveLength(32)
-    expect(new Set(profiles.map(profile => profile.user_agent)).size).toBe(32)
-    expect(profiles.every(profile => /\/0\.(149|150|151)/.test(profile.user_agent))).toBe(true)
+    expect(profiles).toHaveLength(23)
+    expect(new Set(profiles.map(profile => profile.user_agent)).size).toBe(23)
+    // gpt-6 upstream rejects clients below 0.153; every shipped shape must be 0.153.x.
+    expect(profiles.every(profile => /\/0\.153\./.test(profile.user_agent))).toBe(true)
   })
 
   it('rejects incomplete or duplicate Codex client header rows', () => {

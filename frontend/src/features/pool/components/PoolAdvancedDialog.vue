@@ -504,7 +504,7 @@
                 <Label>User-Agent</Label>
                 <Input
                   v-model="profile.user_agent"
-                  placeholder="codex-tui/0.151.0 ..."
+                  placeholder="codex-tui/0.153.4 ..."
                 />
               </div>
               <div class="space-y-1.5">
@@ -574,7 +574,8 @@
                 </span>
               </div>
               <p class="text-xs leading-5 text-muted-foreground">
-                开启后，每个账号对上游呈现的会话树会按下方「每日预期数」折叠：同一账号一天内只出现固定数量的 Thread，每个 Thread 只出现固定数量的 Turn。
+                开启后，每个账号对上游呈现的会话树会按下方「每日上限」折叠：新对话按到达顺序各开一条 Thread，当天额度用满后复用最久没有新 Turn 的那条；每个 Thread 一天内新出现的 Turn 不超过上限。
+                上限是天花板而不是固定值：当天实际额度按账号、按天在「上限的一半 ～ 上限」之间确定性抖动，流量少的账号只出现实际用到的数量，忙的账号也不会天天恰好停在同一个数。
                 客户端侧 sticky、WebSocket 绑定与用量统计仍使用原始会话身份。关闭后原样透传客户端会话 ID。
               </p>
             </div>
@@ -591,7 +592,7 @@
           >
             <div class="space-y-1.5">
               <Label>
-                每日预期 Thread 数
+                每日 Thread 上限
                 <span class="text-xs text-muted-foreground">
                   ({{ CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY_RANGE.min }}-{{ CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY_RANGE.max }})
                 </span>
@@ -607,7 +608,7 @@
             </div>
             <div class="space-y-1.5">
               <Label>
-                每日预期 Turn 数
+                每日 Turn 上限
                 <span class="text-xs text-muted-foreground">
                   (每个 Thread，{{ CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY_RANGE.min }}-{{ CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY_RANGE.max }})
                 </span>
@@ -622,7 +623,7 @@
               />
             </div>
             <p class="text-xs leading-5 text-muted-foreground sm:col-span-2">
-              建议值：Thread 8、Turn 64。数值越小，上游可见的会话数越少，但更多真实会话会共用同一个出站 Thread，跨日重连的会话仍保持原出站身份。
+              建议值：Thread 8、Turn 64。上限越小，上游可见的会话数越少，但更多真实会话会共用同一个出站 Thread；一个人日常用 Codex 大约是几条到十几条 Thread，上限不宜远超这个量级。跨日重连的会话仍保持原出站身份。
             </p>
           </div>
         </div>

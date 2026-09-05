@@ -7,8 +7,15 @@
 //! upstream is replaced, after key selection, by a per-account, per-day
 //! synthetic tree negotiated through the shared runtime state:
 //!
-//! - N thread slots per account per day window, M turn slots per synthetic
-//!   thread per day window (`expected_threads_per_day` / `expected_turns_per_day`)
+//! - at most N threads per account per day window, at most M turn slots per
+//!   synthetic thread per day window (`expected_threads_per_day` /
+//!   `expected_turns_per_day`). The effective count of a given day is drawn
+//!   per account (and per thread for turns) from `[ceil(N/2), N]` /
+//!   `[ceil(M/2), M]`, so busy accounts do not all saturate at the same
+//!   configured number every day
+//! - threads grow with activity: a new inbound root mints a new thread while
+//!   the account's day roster is below its bound, then reuses the least
+//!   recently active thread; turns are hashed into per-thread slots
 //! - the same inbound root keeps the same outbound thread across HTTP compact,
 //!   Search, WebSocket reconnects and day rollovers while its freeze is alive
 //! - the same inbound turn keeps the same outbound turn while its freeze is alive
@@ -44,8 +51,8 @@ const TTL_GRACE_SECS: u64 = 43_200;
 
 const SELECTION_FP_DOMAIN: &[u8] = b"aether:codex:rid:sel:v1";
 const JITTER_DOMAIN: &[u8] = b"aether:codex:rid:jitter:v1";
-const THREAD_SLOT_DOMAIN: &[u8] = b"aether:codex:rid:thread:v1";
 const TURN_SLOT_DOMAIN: &[u8] = b"aether:codex:rid:turn:v1";
+const BOUND_DOMAIN: &[u8] = b"aether:codex:rid:bound:v1";
 
 const X_CODEX_TURN_METADATA: &str = "x-codex-turn-metadata";
 const X_CODEX_WINDOW_ID: &str = "x-codex-window-id";
@@ -347,17 +354,35 @@ impl CodexRuntimeIdentityScope {
         Duration::from_secs(remaining + TTL_GRACE_SECS)
     }
 
-    fn thread_slot(&self, day_id: u64, inbound_root: &str) -> u64 {
+    /// Number of threads this account may show on `day_id`: a deterministic
+    /// draw from `[ceil(N/2), N]`. The configured value is the ceiling; the
+    /// per-day draw keeps busy accounts from all showing exactly N new
+    /// threads every day, which no population of real codex users produces.
+    fn thread_bound(&self, day_id: u64) -> u64 {
         let digest = sha256(&[
-            THREAD_SLOT_DOMAIN,
+            BOUND_DOMAIN,
+            b"\0thread\0",
+            self.selection_key.as_bytes(),
             b"\0",
+            day_id.to_string().as_bytes(),
+        ]);
+        jittered_bound(self.config.expected_threads_per_day, &digest)
+    }
+
+    /// Number of turn slots `outbound_thread_id` has on `day_id`: a
+    /// deterministic draw from `[ceil(M/2), M]`, keyed by the thread so
+    /// sibling threads of one account do not share a ceiling either.
+    fn turn_bound(&self, day_id: u64, outbound_thread_id: &str) -> u64 {
+        let digest = sha256(&[
+            BOUND_DOMAIN,
+            b"\0turn\0",
             self.selection_key.as_bytes(),
             b"\0",
             day_id.to_string().as_bytes(),
             b"\0",
-            inbound_root.as_bytes(),
+            outbound_thread_id.as_bytes(),
         ]);
-        u64_prefix(&digest) % u64::from(self.config.expected_threads_per_day)
+        jittered_bound(self.config.expected_turns_per_day, &digest)
     }
 
     fn turn_slot(&self, day_id: u64, outbound_thread_id: &str, inbound_turn_key: &str) -> u64 {
@@ -372,15 +397,24 @@ impl CodexRuntimeIdentityScope {
             b"\0",
             inbound_turn_key.as_bytes(),
         ]);
-        u64_prefix(&digest) % u64::from(self.config.expected_turns_per_day)
+        u64_prefix(&digest) % self.turn_bound(day_id, outbound_thread_id)
     }
 
     fn key_prefix(&self) -> String {
         format!("ap:{}:codex_rid:{}", self.provider_id, self.selection_fp)
     }
 
-    fn thread_slot_key(&self, day_id: u64, slot: u64) -> String {
-        format!("{}:{day_id}:thread:{slot}", self.key_prefix())
+    /// The `index`-th thread minted on `day_id`; indexes are claimed in
+    /// arrival order with `SET NX`, which is what bounds new threads per day.
+    fn thread_slot_key(&self, day_id: u64, index: u64) -> String {
+        format!("{}:{day_id}:thread:{index}", self.key_prefix())
+    }
+
+    /// The account's active threads of one day window: a sorted set of
+    /// outbound thread ids scored by last activity (unix seconds), read for
+    /// least-recently-active reuse once the day is full.
+    fn thread_roster_key(&self, day_id: u64) -> String {
+        format!("{}:{day_id}:threads", self.key_prefix())
     }
 
     fn turn_slot_key(&self, day_id: u64, outbound_thread_id: &str, slot: u64) -> String {
@@ -894,6 +928,54 @@ impl<'a> CodexRuntimeIdentityStore<'a> {
         }
         Ok(self.get(key).await?.unwrap_or(minted))
     }
+
+    async fn roster_len(&self, key: &str) -> Result<usize, String> {
+        self.check()?;
+        self.runtime
+            .score_len(key)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Least recently active member (lowest score; ties by member).
+    async fn roster_oldest(&self, key: &str) -> Result<Option<String>, String> {
+        self.check()?;
+        Ok(self
+            .runtime
+            .score_range_by_min(key, 0.0)
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next())
+    }
+
+    /// Inserts or re-scores `member` and slides the roster's TTL.
+    async fn roster_touch(
+        &self,
+        key: &str,
+        member: &str,
+        score: f64,
+        ttl: Duration,
+    ) -> Result<(), String> {
+        self.check()?;
+        self.runtime
+            .score_set(key, member, score)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.runtime
+            .key_expire(key, ttl)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    async fn roster_remove(&self, key: &str, member: &str) -> Result<bool, String> {
+        self.check()?;
+        self.runtime
+            .score_remove(key, member)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,13 +1139,10 @@ async fn resolve_inner(
                 provider_id = %scope.provider_id,
                 selection_fp = %scope.selection_fp,
                 inbound_root_hash = %root_hash,
-                "chained request has no root freeze; minting by slot"
+                "chained request has no root freeze; assigning a thread"
             );
         }
-        let slot = scope.thread_slot(day_id, root);
-        let thread_id = store
-            .get_or_mint(&scope.thread_slot_key(day_id, slot), ttl, now)
-            .await?;
+        let (thread_id, fresh_mint) = assign_thread(store, scope, day_id, ttl, now).await?;
         let fresh = RootFreeze {
             session_id: thread_id.clone(),
             thread_id: thread_id.clone(),
@@ -1076,10 +1155,21 @@ async fn resolve_inner(
         frozen = if store.set_if_absent(&freeze_key, &raw, ttl).await? {
             Some((raw, fresh))
         } else {
-            match store.get(&freeze_key).await? {
-                Some(existing) => RootFreeze::parse(&existing)
-                    .map(|freeze| (existing, freeze))
-                    .or(Some((raw, fresh))),
+            let winner = match store.get(&freeze_key).await? {
+                Some(existing) => RootFreeze::parse(&existing).map(|freeze| (existing, freeze)),
+                None => None,
+            };
+            match winner {
+                Some(winner) => {
+                    if fresh_mint && winner.1.thread_id != thread_id {
+                        // Lost the freeze race for this root: the thread minted
+                        // here never served a request, so it leaves the roster.
+                        let _ = store
+                            .roster_remove(&scope.thread_roster_key(day_id), &thread_id)
+                            .await?;
+                    }
+                    Some(winner)
+                }
                 None => Some((raw, fresh)),
             }
         };
@@ -1116,6 +1206,62 @@ async fn resolve_inner(
         inbound_root: root.to_string(),
         inbound_turn_key: turn_key.map(str::to_string),
     })
+}
+
+/// Picks the outbound thread for an inbound root that has no freeze yet.
+///
+/// Threads grow with activity, the way a person opens conversations: while
+/// the account's roster for `day_id` holds fewer threads than its daily bound,
+/// a fresh UUIDv7 is minted and claims the next arrival index (`SET NX`, so
+/// concurrent new roots never mint past the bound); once the roster is full,
+/// the least recently active thread is reused. Returns the thread and whether
+/// it was minted here, so a lost freeze race can withdraw it from the roster.
+async fn assign_thread(
+    store: &CodexRuntimeIdentityStore<'_>,
+    scope: &CodexRuntimeIdentityScope,
+    day_id: u64,
+    ttl: Duration,
+    now: SystemTime,
+) -> Result<(String, bool), String> {
+    let roster_key = scope.thread_roster_key(day_id);
+    let bound = scope.thread_bound(day_id);
+    let score = unix_secs(now) as f64;
+    // Every roster member either claimed an index or carried over from an
+    // earlier day (and then counts against today's bound without claiming
+    // one), so the first free index is at or after the current size.
+    let active = u64::try_from(store.roster_len(&roster_key).await?).unwrap_or(u64::MAX);
+    for index in active..bound {
+        let minted = uuid_v7_at(unix_millis(now));
+        if store
+            .set_if_absent(&scope.thread_slot_key(day_id, index), &minted, ttl)
+            .await?
+        {
+            store.roster_touch(&roster_key, &minted, score, ttl).await?;
+            return Ok((minted, true));
+        }
+    }
+    match store.roster_oldest(&roster_key).await? {
+        Some(thread_id) => {
+            store.roster_touch(&roster_key, &thread_id, score, ttl).await?;
+            debug!(
+                event_name = "codex_rid_thread_reused",
+                log_type = "event",
+                provider_id = %scope.provider_id,
+                selection_fp = %scope.selection_fp,
+                day_id,
+                bound,
+                "thread roster full; reusing least recently active thread"
+            );
+            Ok((thread_id, false))
+        }
+        None => {
+            // Roster gone while its arrival indexes survive (eviction, or a
+            // whole day of lost freeze races): start the day over.
+            let minted = uuid_v7_at(unix_millis(now));
+            store.roster_touch(&roster_key, &minted, score, ttl).await?;
+            Ok((minted, true))
+        }
+    }
 }
 
 /// Reads (and lazily initializes) the synthetic thread's context window, then
@@ -1231,6 +1377,19 @@ async fn resolve_turn(
             None => (minted, OutboundTurnSource::Minted),
         }
     };
+
+    if turn_source == OutboundTurnSource::Minted {
+        // A new turn is activity: the thread moves to the back of today's
+        // reuse order (and joins today's roster when it carried over).
+        store
+            .roster_touch(
+                &scope.thread_roster_key(day_id),
+                outbound_thread_id,
+                unix_secs(now) as f64,
+                ttl,
+            )
+            .await?;
+    }
 
     if let Some((freeze_key, raw_freeze, freeze, _)) = root_freeze {
         let mut updated = freeze.clone();
@@ -1937,6 +2096,15 @@ fn u64_prefix(digest: &[u8; 32]) -> u64 {
     u64::from_be_bytes(prefix)
 }
 
+/// Maps a digest onto `[ceil(configured / 2), configured]`. `configured` is
+/// the operator-facing ceiling (`1..=64` threads / `1..=512` turns); a value
+/// of `1` always yields `1`.
+fn jittered_bound(configured: u32, digest: &[u8; 32]) -> u64 {
+    let max = u64::from(configured.max(1));
+    let min = max.div_ceil(2);
+    min + u64_prefix(digest) % (max - min + 1)
+}
+
 /// `hex(SHA256(value)[0..16])`; inbound IDs never enter keys or logs verbatim.
 pub(crate) fn hash16(value: &str) -> String {
     hex_lower(&sha256(&[value.as_bytes()])[..16])
@@ -2284,6 +2452,47 @@ mod tests {
         // Keys never contain the raw selection key.
         assert!(!a.thread_slot_key(1, 0).contains(SELECTION));
         assert!(a.thread_slot_key(1, 0).starts_with("ap:prov-1:codex_rid:"));
+        assert!(!a.thread_roster_key(1).contains(SELECTION));
+        assert!(a.thread_roster_key(1).ends_with(":1:threads"));
+    }
+
+    #[test]
+    fn daily_bounds_jitter_per_account_and_day_within_band() {
+        let a = scope(32, 256);
+        let b = CodexRuntimeIdentityScope::new(PROVIDER, "codex:account:acc-b", config(32, 256));
+        let thread = "0199094e-7b2b-7000-8000-0123456789ab";
+        let mut a_thread_bounds = HashSet::new();
+        let mut a_turn_bounds = HashSet::new();
+        let mut differs_from_b = false;
+        for day in 20_000..20_060u64 {
+            let ta = a.thread_bound(day);
+            let ua = a.turn_bound(day, thread);
+            assert!((16..=32).contains(&ta), "day {day} thread bound {ta}");
+            assert!((128..=256).contains(&ua), "day {day} turn bound {ua}");
+            assert_eq!(ta, a.thread_bound(day), "bound must be deterministic");
+            a_thread_bounds.insert(ta);
+            a_turn_bounds.insert(ua);
+            differs_from_b |= ta != b.thread_bound(day);
+        }
+        assert!(a_thread_bounds.len() > 1, "thread bound never varied across days");
+        assert!(a_turn_bounds.len() > 1, "turn bound never varied across days");
+        assert!(differs_from_b, "two accounts never disagreed on a daily bound");
+        // Sibling threads of one account draw their own turn ceiling.
+        let mut sibling_bounds = HashSet::new();
+        for i in 0..32 {
+            sibling_bounds.insert(a.turn_bound(20_000, &format!("thread-{i}")));
+        }
+        assert!(sibling_bounds.len() > 1);
+        // A ceiling of 1 stays 1; the turn slot then is always 0.
+        let one = scope(1, 1);
+        for day in 0..10u64 {
+            assert_eq!(one.thread_bound(day), 1);
+            assert_eq!(one.turn_bound(day, thread), 1);
+            assert_eq!(one.turn_slot(day, thread, "turn"), 0);
+        }
+        // Band edges for small ceilings: N=2 → {1,2}, N=3 → {2,3}.
+        assert!((1..=2).contains(&scope(2, 2).thread_bound(7)));
+        assert!((2..=3).contains(&scope(3, 3).thread_bound(7)));
     }
 
     #[test]
@@ -2375,14 +2584,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_slots_bound_distinct_roots_and_stay_stable() {
+    async fn threads_mint_by_arrival_then_reuse_least_recent_and_stay_stable() {
         let state = memory_state();
         let store = CodexRuntimeIdentityStore::new(&state);
         let s = scope(3, 64);
-        let now = at(1_756_857_600);
-        let mut threads = HashSet::new();
+        let start = at(1_756_857_600);
+        let bound = usize::try_from(s.thread_bound(s.day_id(start))).unwrap();
+        assert!((2..=3).contains(&bound));
         let mut first = Vec::new();
-        for i in 0..40 {
+        for i in 0..40usize {
+            let now = start + Duration::from_secs(i as u64);
             let inbound = inbound(&format!("s{i}"), &format!("t{i}"), Some(&format!("u{i}")));
             let out = rewrite(
                 resolve_outbound_codex_runtime_identity(&store, &s, &inbound, None, now).await,
@@ -2392,11 +2603,27 @@ mod tests {
             assert_eq!(out.window_id, format!("{}:0", out.thread_id));
             assert!(out.turn_id.as_deref().is_some_and(is_uuid_v7));
             assert_eq!(out.turn_source, OutboundTurnSource::Minted);
-            threads.insert(out.thread_id.clone());
+            if i < bound {
+                // Arrival order: each new root opens its own thread, minted now.
+                assert!(
+                    first.iter().all(|previous: &OutboundCodexRuntimeIdentity| {
+                        previous.thread_id != out.thread_id
+                    }),
+                    "root {i} should have minted a new thread"
+                );
+                assert_eq!(v7_millis(&out.thread_id), unix_millis(now));
+            } else {
+                // Full: the least recently active thread is reused, round robin
+                // here because every root is used exactly once.
+                assert_eq!(
+                    out.thread_id, first[i - bound].thread_id,
+                    "root {i} should reuse the least recently active thread"
+                );
+            }
             first.push(out);
         }
-        assert!(threads.len() <= 3, "{} threads", threads.len());
-        assert!(threads.len() > 1, "expected spread over slots");
+        let threads: HashSet<&str> = first.iter().map(|out| out.thread_id.as_str()).collect();
+        assert_eq!(threads.len(), bound);
         // Stability: same inbound → same outbound (thread and turn), now Frozen.
         for (i, previous) in first.iter().enumerate() {
             let inbound = inbound(&format!("s{i}"), &format!("t{i}"), Some(&format!("u{i}")));
@@ -2406,13 +2633,199 @@ mod tests {
                     &s,
                     &inbound,
                     None,
-                    now + Duration::from_secs(60),
+                    start + Duration::from_secs(600),
                 )
                 .await,
             );
             assert_eq!(again.thread_id, previous.thread_id);
             assert_eq!(again.turn_id, previous.turn_id);
             assert_eq!(again.turn_source, OutboundTurnSource::Frozen);
+        }
+    }
+
+    #[tokio::test]
+    async fn new_turn_protects_its_thread_from_reuse() {
+        let state = memory_state();
+        let store = CodexRuntimeIdentityStore::new(&state);
+        let s = scope(4, 64);
+        let start = at(1_756_857_600);
+        let bound = usize::try_from(s.thread_bound(s.day_id(start))).unwrap();
+        assert!(bound >= 2);
+        let mut threads = Vec::new();
+        for i in 0..bound {
+            let out = rewrite(
+                resolve_outbound_codex_runtime_identity(
+                    &store,
+                    &s,
+                    &inbound(&format!("s{i}"), &format!("t{i}"), Some("u1")),
+                    None,
+                    start + Duration::from_secs(i as u64),
+                )
+                .await,
+            );
+            threads.push(out.thread_id);
+        }
+        // Root 0 (oldest) gets a new turn: its thread becomes the most recent.
+        let touched = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s0", "t0", Some("u2")),
+                None,
+                start + Duration::from_secs(100),
+            )
+            .await,
+        );
+        assert_eq!(touched.thread_id, threads[0]);
+        assert_eq!(touched.turn_source, OutboundTurnSource::Minted);
+        // The next new root reuses root 1's thread, not root 0's.
+        let next = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s-new", "t-new", Some("u1")),
+                None,
+                start + Duration::from_secs(101),
+            )
+            .await,
+        );
+        assert_eq!(next.thread_id, threads[1]);
+        // Replaying a frozen turn is not activity: root 2 stays the oldest.
+        let replay = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s1", "t1", Some("u1")),
+                None,
+                start + Duration::from_secs(102),
+            )
+            .await,
+        );
+        assert_eq!(replay.turn_source, OutboundTurnSource::Frozen);
+        let after_replay = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s-new-2", "t-new-2", Some("u1")),
+                None,
+                start + Duration::from_secs(103),
+            )
+            .await,
+        );
+        assert_eq!(after_replay.thread_id, threads[2 % bound]);
+    }
+
+    #[tokio::test]
+    async fn roster_starts_fresh_each_day_and_carried_threads_count_against_it() {
+        let state = memory_state();
+        let store = CodexRuntimeIdentityStore::new(&state);
+        let s = scope(4, 64);
+        let day0 = at(1_756_857_600);
+        let day1 = day0 + Duration::from_secs(DAY_WINDOW_SECS);
+        let bound0 = usize::try_from(s.thread_bound(s.day_id(day0))).unwrap();
+        let bound1 = usize::try_from(s.thread_bound(s.day_id(day1))).unwrap();
+        let mut day0_threads = HashSet::new();
+        for i in 0..bound0 {
+            let out = rewrite(
+                resolve_outbound_codex_runtime_identity(
+                    &store,
+                    &s,
+                    &inbound(&format!("s{i}"), &format!("t{i}"), Some("u1")),
+                    None,
+                    day0 + Duration::from_secs(i as u64),
+                )
+                .await,
+            );
+            day0_threads.insert(out.thread_id);
+        }
+        assert_eq!(day0_threads.len(), bound0);
+        // Day 1: root 0 continues with a new turn, keeping yesterday's thread,
+        // which thereby joins today's roster as its oldest member.
+        let carried = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s0", "t0", Some("u2")),
+                None,
+                day1,
+            )
+            .await,
+        );
+        assert!(day0_threads.contains(&carried.thread_id));
+        // New roots mint fresh threads until today's bound counts the carried one.
+        let mut day1_new = HashSet::new();
+        for i in 0..bound1 - 1 {
+            let out = rewrite(
+                resolve_outbound_codex_runtime_identity(
+                    &store,
+                    &s,
+                    &inbound(&format!("n{i}"), &format!("nt{i}"), Some("u1")),
+                    None,
+                    day1 + Duration::from_secs(1 + i as u64),
+                )
+                .await,
+            );
+            assert!(!day0_threads.contains(&out.thread_id), "day 1 reused a day 0 thread");
+            assert_eq!(v7_millis(&out.thread_id), unix_millis(day1 + Duration::from_secs(1 + i as u64)));
+            day1_new.insert(out.thread_id);
+        }
+        assert_eq!(day1_new.len(), bound1 - 1);
+        // Full for the day: the carried thread is the least recently active.
+        let reused = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("n-last", "nt-last", Some("u1")),
+                None,
+                day1 + Duration::from_secs(600),
+            )
+            .await,
+        );
+        assert_eq!(reused.thread_id, carried.thread_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_new_roots_never_mint_past_the_daily_bound() {
+        let state = std::sync::Arc::new(memory_state());
+        let s = scope(4, 64);
+        let now = at(1_756_857_600);
+        let bound = usize::try_from(s.thread_bound(s.day_id(now))).unwrap();
+        let mut handles = Vec::new();
+        for i in 0..24 {
+            let state = state.clone();
+            let s = s.clone();
+            handles.push(tokio::spawn(async move {
+                let store = CodexRuntimeIdentityStore::new(&state);
+                let inbound = inbound(&format!("s{i}"), &format!("t{i}"), Some("u1"));
+                let out = rewrite(
+                    resolve_outbound_codex_runtime_identity(&store, &s, &inbound, None, now)
+                        .await,
+                );
+                (i, out.thread_id)
+            }));
+        }
+        let mut by_root = BTreeMap::new();
+        for handle in handles {
+            let (i, thread) = handle.await.unwrap();
+            by_root.insert(i, thread);
+        }
+        let threads: HashSet<&String> = by_root.values().collect();
+        assert!(threads.len() <= bound, "{} threads for bound {bound}", threads.len());
+        assert!(threads.len() > 1);
+        // Every root keeps the thread it was assigned.
+        let store = CodexRuntimeIdentityStore::new(&state);
+        for (i, thread) in &by_root {
+            let again = rewrite(
+                resolve_outbound_codex_runtime_identity(
+                    &store,
+                    &s,
+                    &inbound(&format!("s{i}"), &format!("t{i}"), Some("u1")),
+                    None,
+                    now + Duration::from_secs(1),
+                )
+                .await,
+            );
+            assert_eq!(&again.thread_id, thread);
         }
     }
 

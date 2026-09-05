@@ -12,7 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::codex_profile::{
-    apply_codex_concrete_account_profile_to_request,
+    apply_codex_client_identity_headers, apply_codex_concrete_account_profile_to_request,
     apply_codex_concrete_account_profile_to_request_with_body_policy,
     apply_codex_concrete_account_profile_to_search_headers, codex_account_selection_key,
     materialize_codex_key_fingerprint, resolve_codex_concrete_account_profile,
@@ -79,8 +79,11 @@ pub(crate) fn apply_codex_pool_stable_client_headers(
     remove_codex_pool_upstream_leak_headers(provider_request_headers);
 
     if let Some(profile) = resolve_codex_pool_concrete_account_profile(transport) {
-        provider_request_headers.insert("user-agent".to_string(), profile.user_agent);
-        provider_request_headers.insert("originator".to_string(), profile.originator);
+        apply_codex_client_identity_headers(
+            provider_request_headers,
+            &profile.user_agent,
+            &profile.originator,
+        );
         return;
     }
 
@@ -97,8 +100,11 @@ pub(crate) fn apply_codex_pool_stable_client_headers(
         return;
     };
 
-    provider_request_headers.insert("user-agent".to_string(), header_profile.user_agent);
-    provider_request_headers.insert("originator".to_string(), header_profile.originator);
+    apply_codex_client_identity_headers(
+        provider_request_headers,
+        &header_profile.user_agent,
+        &header_profile.originator,
+    );
 }
 
 pub(crate) fn apply_codex_pool_search_account_profile(

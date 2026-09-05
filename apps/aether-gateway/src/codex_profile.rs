@@ -17,6 +17,8 @@ pub(crate) const CODEX_TRANSPORT_PROFILE_KEY: &str = "transport_profile";
 const CODEX_PROFILE_SCHEMA_VERSION: u64 = 1;
 const X_CODEX_INSTALLATION_ID: &str = "x-codex-installation-id";
 const X_CODEX_TURN_METADATA: &str = "x-codex-turn-metadata";
+/// codex-rs sends its build version in this header on every OpenAI request.
+const CLIENT_VERSION_HEADER: &str = "version";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CodexConcreteAccountProfile {
@@ -236,8 +238,11 @@ pub(crate) fn apply_codex_concrete_account_profile_to_request_with_body_policy(
     profile: &CodexConcreteAccountProfile,
     body_policy: CodexProfileRequestBodyPolicy,
 ) {
-    provider_request_headers.insert("user-agent".to_string(), profile.user_agent.clone());
-    provider_request_headers.insert("originator".to_string(), profile.originator.clone());
+    apply_codex_client_identity_headers(
+        provider_request_headers,
+        &profile.user_agent,
+        &profile.originator,
+    );
 
     normalize_installation_id_in_headers(provider_request_headers, &profile.installation_id);
     match body_policy {
@@ -254,8 +259,11 @@ pub(crate) fn apply_codex_concrete_account_profile_to_search_headers(
     provider_request_headers: &mut BTreeMap<String, String>,
     profile: &CodexConcreteAccountProfile,
 ) {
-    provider_request_headers.insert("user-agent".to_string(), profile.user_agent.clone());
-    provider_request_headers.insert("originator".to_string(), profile.originator.clone());
+    apply_codex_client_identity_headers(
+        provider_request_headers,
+        &profile.user_agent,
+        &profile.originator,
+    );
     remove_header_case_insensitive(provider_request_headers, X_CODEX_INSTALLATION_ID);
 
     // Standalone Search carries turn metadata as a header and does not use the
@@ -269,6 +277,43 @@ pub(crate) fn apply_codex_concrete_account_profile_to_search_headers(
         {
             provider_request_headers.insert(header_name, rewritten);
         }
+    }
+}
+
+/// Client build version as codex-rs reports it in the `version` header.
+///
+/// codex-rs sends `version: <CARGO_PKG_VERSION>` on every OpenAI request
+/// (responses, compact, search, websocket handshake) and formats the
+/// user-agent as `<originator>/<version> (<os> <ver>; <arch>) <terminal>`.
+/// The originator may contain spaces (`Codex Desktop/0.153.1 (...)`), so the
+/// version is read from the first `/`-bearing token of the product segment
+/// that precedes the first parenthesis, not from the first whitespace token.
+pub(crate) fn codex_client_version_from_user_agent(user_agent: &str) -> Option<String> {
+    let product = user_agent.split('(').next().unwrap_or(user_agent);
+    let token = product
+        .split_whitespace()
+        .find(|token| token.contains('/'))?;
+    let (_, version) = token.split_once('/')?;
+    let version = version.trim();
+    (!version.is_empty()).then(|| version.to_string())
+}
+
+/// Writes the client identity headers one codex-rs build sends together:
+/// `user-agent`, `originator` and `version`. The version always follows the
+/// outbound user-agent; leaving the inbound value in place would pair one
+/// build number with another build's user-agent, a shape no single client
+/// produces. When the user-agent carries no parsable version the header is
+/// dropped rather than left inconsistent.
+pub(crate) fn apply_codex_client_identity_headers(
+    provider_request_headers: &mut BTreeMap<String, String>,
+    user_agent: &str,
+    originator: &str,
+) {
+    provider_request_headers.insert("user-agent".to_string(), user_agent.to_string());
+    provider_request_headers.insert("originator".to_string(), originator.to_string());
+    remove_header_case_insensitive(provider_request_headers, CLIENT_VERSION_HEADER);
+    if let Some(version) = codex_client_version_from_user_agent(user_agent) {
+        provider_request_headers.insert(CLIENT_VERSION_HEADER.to_string(), version);
     }
 }
 
@@ -1035,6 +1080,76 @@ mod tests {
                 None,
             )
         );
+    }
+
+    #[test]
+    fn client_version_follows_user_agent_for_every_official_originator_shape() {
+        for (user_agent, expected) in [
+            (
+                "codex-tui/0.153.4 (Windows 10.0.26200; x86_64) WindowsTerminal (codex-tui; 0.153.4)",
+                Some("0.153.4"),
+            ),
+            (
+                "Codex Desktop/0.153.1 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.901.31953)",
+                Some("0.153.1"),
+            ),
+            (
+                "Codex Desktop/0.153.0-alpha.5 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 26.901.20858)",
+                Some("0.153.0-alpha.5"),
+            ),
+            (
+                "codex_cli_rs/0.153.4 (Mac OS 26.5.1; arm64) ghostty/1.3.1",
+                Some("0.153.4"),
+            ),
+            (
+                "codex_vscode/0.153.0 (Windows 10.0.26200; x86_64) unknown (VS Code; 26.901.22334)",
+                Some("0.153.0"),
+            ),
+            ("codex-tui/0.142.0", Some("0.142.0")),
+            ("codex-tui/ (Linux; x86_64)", None),
+            ("not a codex agent", None),
+        ] {
+            assert_eq!(
+                codex_client_version_from_user_agent(user_agent).as_deref(),
+                expected,
+                "user-agent {user_agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_headers_rewrite_version_with_user_agent_and_drop_it_when_unparsable() {
+        // A real client sent 0.153.4; the pool profile presents a Desktop build.
+        let mut headers = BTreeMap::from([
+            ("user-agent".to_string(), "codex-tui/0.153.4 (Linux; x86_64)".to_string()),
+            ("originator".to_string(), "codex-tui".to_string()),
+            ("Version".to_string(), "0.153.4".to_string()),
+        ]);
+        apply_codex_client_identity_headers(
+            &mut headers,
+            "Codex Desktop/0.153.1 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.901.31953)",
+            "Codex Desktop",
+        );
+        assert_eq!(
+            headers.get("originator").map(String::as_str),
+            Some("Codex Desktop")
+        );
+        assert_eq!(headers.get("version").map(String::as_str), Some("0.153.1"));
+        assert!(!headers.contains_key("Version"));
+
+        // Downstream relays send no `version`; a real codex-rs build always does.
+        let mut headers = BTreeMap::new();
+        apply_codex_client_identity_headers(
+            &mut headers,
+            "codex_cli_rs/0.153.4 (Mac OS 26.5.1; arm64) ghostty/1.3.1",
+            "codex_cli_rs",
+        );
+        assert_eq!(headers.get("version").map(String::as_str), Some("0.153.4"));
+
+        // Unparsable user-agent: no version rather than a contradictory one.
+        let mut headers = BTreeMap::from([("version".to_string(), "0.153.4".to_string())]);
+        apply_codex_client_identity_headers(&mut headers, "custom agent", "codex-tui");
+        assert!(!headers.contains_key("version"));
     }
 
     #[test]
