@@ -29,6 +29,7 @@ const TERMINAL_COMPLETE: u8 = 2;
 const TERMINAL_QUEUED: u8 = 3;
 const SETTLEMENT_LEASE_RELEASE_RETRIES: usize = 4;
 const SETTLEMENT_LEASE_RELEASE_BACKOFF_MS: [u64; 3] = [10, 25, 50];
+const CODEX_WS_READ_TIMEOUT: &str = "codex_ws_read_timeout";
 static POOL_LEASE_RELEASE_EXHAUSTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +58,18 @@ pub(crate) enum CodexWsStepDisposition {
 pub(crate) struct CodexWsCandidateSettlement {
     lifecycle: Arc<CodexWsCandidateLifecycle>,
     disposition: CodexWsStepDisposition,
+}
+
+fn pool_effect_for_stream_timeout(error_type: &str) -> LocalExecutionEffect<'static> {
+    if error_type == CODEX_WS_READ_TIMEOUT {
+        LocalExecutionEffect::PoolNonAccountFailure
+    } else {
+        LocalExecutionEffect::PoolStreamTimeout
+    }
+}
+
+fn stream_timeout_is_non_account(error_type: &str) -> bool {
+    error_type == CODEX_WS_READ_TIMEOUT
 }
 
 impl CodexWsCandidateSettlement {
@@ -567,13 +580,15 @@ impl CodexWsCandidateLifecycle {
                     .await;
                 }
             }
-            CodexWsStepDisposition::StreamTimeout { .. } => {
-                apply_local_pool_terminal_effect_after_lease_release(
-                    state,
-                    context,
-                    LocalExecutionEffect::PoolStreamTimeout,
-                )
-                .await;
+            CodexWsStepDisposition::StreamTimeout { error_type, .. } => {
+                // `codex_ws_read_timeout` is a gateway-side business-frame idle
+                // deadline, not an account-level rejection.  Keep the established
+                // client-session binding for this exact error so a long-thinking
+                // turn cannot silently rotate its OAuth account.  Other timeout
+                // classes retain the existing cooldown/failover policy.
+                let pool_effect = pool_effect_for_stream_timeout(error_type);
+                apply_local_pool_terminal_effect_after_lease_release(state, context, pool_effect)
+                    .await;
             }
             CodexWsStepDisposition::Cancelled { .. } => {
                 apply_local_pool_terminal_effect_after_lease_release(
@@ -874,17 +889,23 @@ async fn resolve_step_failure_classification(
             penalize_account: false,
             ..
         } => None,
-        CodexWsStepDisposition::StreamTimeout { .. } => Some(
-            resolve_local_failover_analysis_for_attempt(
-                state,
-                plan,
-                report_context,
-                http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
-                None,
-            )
-            .await
-            .classification,
-        ),
+        CodexWsStepDisposition::StreamTimeout { error_type, .. } => {
+            if stream_timeout_is_non_account(error_type) {
+                None
+            } else {
+                Some(
+                    resolve_local_failover_analysis_for_attempt(
+                        state,
+                        plan,
+                        report_context,
+                        http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                        None,
+                    )
+                    .await
+                    .classification,
+                )
+            }
+        }
         CodexWsStepDisposition::Completed | CodexWsStepDisposition::Cancelled { .. } => None,
     }
 }
@@ -953,19 +974,22 @@ async fn apply_step_health_effects(
             penalize_account: false,
             ..
         } => {}
-        CodexWsStepDisposition::StreamTimeout { .. } => {
-            if !apply_failure_health_effects(
-                state,
-                context,
-                payload,
-                http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
-                failure_classification.unwrap_or(LocalFailoverClassification::RetryUpstreamFailure),
-                None,
-                progress,
-            )
-            .await
-            {
-                return false;
+        CodexWsStepDisposition::StreamTimeout { error_type, .. } => {
+            if !stream_timeout_is_non_account(error_type) {
+                if !apply_failure_health_effects(
+                    state,
+                    context,
+                    payload,
+                    http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                    failure_classification
+                        .unwrap_or(LocalFailoverClassification::RetryUpstreamFailure),
+                    None,
+                    progress,
+                )
+                .await
+                {
+                    return false;
+                }
             }
         }
         CodexWsStepDisposition::Cancelled { .. } => {}
@@ -1401,6 +1425,18 @@ mod tests {
             .expect("queued settlement should claim terminal ownership")
             .complete();
         assert!(lifecycle.claim_terminal().is_none());
+    }
+
+    #[test]
+    fn codex_ws_read_timeout_preserves_pool_sticky_binding() {
+        assert!(matches!(
+            pool_effect_for_stream_timeout(CODEX_WS_READ_TIMEOUT),
+            LocalExecutionEffect::PoolNonAccountFailure
+        ));
+        assert!(matches!(
+            pool_effect_for_stream_timeout("codex_ws_first_byte_timeout"),
+            LocalExecutionEffect::PoolStreamTimeout
+        ));
     }
 
     #[tokio::test]
