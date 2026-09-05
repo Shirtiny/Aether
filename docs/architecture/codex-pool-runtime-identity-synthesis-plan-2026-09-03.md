@@ -1,10 +1,24 @@
 # Codex 号池出站 Session / Thread / Turn 合成与复用计划
 
-> Status: **Implemented（第四稿）— 已在 `custom` 分支落地，随 `backend-v0.7.101` 交付；`backend-v0.7.102` 为其 code-review 缺陷修复（UUIDv7 ContextV7 缺口 + chat/family 跨格式 `prompt_cache_key` 泄漏，见 §18.11）；`backend-v0.7.104` 把 window 改为按合成 thread 跟踪压缩次数（`window_number` / `context_window_id` / `window_id` 随压缩推进）并加入出站字段白名单（见 §7.3、§9.2、§18.12）。操作员已于 2026-09-05 自行把线上更新到 `backend-v0.7.103` 并在 Codex Pro 号池打开开关（32 thread / 256 turn），线上验证见 §18.12；`backend-v0.7.105` 依 .104 上线后的风控复核修订短头与 `x-client-request-id` 规则（§9.1、§18.13），并对不带任何 codex 元数据的 `/responses` 请求按内容合成 root / turn 并物化官方形状、补齐被中转剥掉的官方头、剥离 `x-trace-id`（§18.14）**
+> Status: **Implemented（第四稿）— 已在 `custom` 分支落地，随 `backend-v0.7.101` 交付；`backend-v0.7.102` 为其 code-review 缺陷修复（UUIDv7 ContextV7 缺口 + chat/family 跨格式 `prompt_cache_key` 泄漏，见 §18.11）；`backend-v0.7.104` 把 window 改为按合成 thread 跟踪压缩次数（`window_number` / `context_window_id` / `window_id` 随压缩推进）并加入出站字段白名单（见 §7.3、§9.2、§18.12）。操作员已于 2026-09-05 自行把线上更新到 `backend-v0.7.103` 并在 Codex Pro 号池打开开关（32 thread / 256 turn），线上验证见 §18.12；`backend-v0.7.105` 依 .104 上线后的风控复核修订短头与 `x-client-request-id` 规则（§9.1、§18.13），并对不带任何 codex 元数据的 `/responses` 请求按内容合成 root / turn 并物化官方形状、补齐被中转剥掉的官方头、剥离 `x-trace-id`（§18.14）；`backend-v0.7.106` 让 `HttpCompact` 表面补齐官方头并删 `x-client-request-id`（§18.14.3）。**线上现为 `backend-v0.7.106`（2026-09-05 06:40 UTC），.104 引入的缓存回退已由 .105 修复并验证（§18.14.7、§18.14.9）**
 > Date: 2026-09-03
 > Scope: Codex OAuth 号池在选号之后，按账号、按日合成并复用上游可见的 `session_id` / `thread_id` / `turn_id` / `window_id`
-> Production changes: **本轮不更新线上。** 只提交代码并推送 `backend-v0.7.101` / `backend-v0.7.102` / `backend-v0.7.104` tag 触发 CI 构建镜像；**不执行 `update.sh`**，运行中的容器由操作员决定何时更新（当前 `backend-v0.7.103`，尚不含 §18.12 修复），功能缺省关闭
+> Production changes: 每个 tag 只触发 CI 构建镜像；线上更新一律由操作员另行授权后按 `docs/operations/release-and-container-update-spec.md` 执行（`.env` 钉 digest、只重建 `app`）。已上线：.103（操作员自行，2026-09-05 之前）→ .104（2026-09-05 02:36 UTC）→ .105（06:05 UTC）→ .106（06:40 UTC）。功能缺省关闭，当前只在 Codex Pro 号池打开（32 / 256）
 > Deploy: 生产更新路径仍是 tag → CI → ghcr → `update.sh`，不是 `deploy.sh`。何时执行 `update.sh`、何时在某个 provider 上 `enabled: true`，由操作员另行决定
+
+### 维护者速览（最后更新 2026-09-05）
+
+接手本功能先读这一段，再按需要跳到对应章节；线上怎么查、怎么判、怎么退见 `docs/operations/codex-runtime-identity-runbook.md`。
+
+| 项 | 现状 |
+|---|---|
+| 线上版本 | `backend-v0.7.106`（2026-09-05 06:40 UTC）；Codex Pro 号池开着 32 thread/天、256 turn/天 + body capture；其他号池关闭 |
+| 代码 | `apps/aether-gateway/src/codex_runtime_identity.rs`（算法、四个表面 `HttpResponses` / `HttpCompact` / `Headers` / `WsStepBody`、三表面白名单）；挂点见 §11、§18.1、§18.5、§18.6 |
+| 不变量 | 三套身份平面不混用（§5）；只改出站副本，sticky / WS 绑定 / fence / 用量读入站（§2）；任何真实单一版本 codex-rs 产生不了的确定性形状都是缺陷，优先级高于「少泄漏」（§18.13） |
+| 官方基准 | 本地 `/opt/stacks/openai-codex`；§1–§18.12 按 `357696c5` 复核，§18.13 起按 `07f18d5f`。核对时先看 checkout 版本，不上网查 |
+| 演进 | §18.11（.102 修复）→ §18.12（.104 window / 白名单 + 线上验证）→ §18.13 / §18.14（.105 风控复核、无元数据合成、官方头补齐）→ §18.14.3（.106 compact）→ §18.14.7（缓存回退根因）→ §18.14.8 / §18.14.9（未知键原则、上线验证结果） |
+| 部署记录 | 仓库根 `容器更新历史.md`（操作员本地文件，未纳入 git）+ `.env.bak.<ts>_pre_vX` |
+| 残余 | §15、§18.14.5：`internal_<source>:<parent>` 形式 `prompt_cache_key` 透传；合成请求压缩探测不到；中转 65 字符 `rs_` id 400 循环另行设计 |
 
 本文是第四稿（最终稿）。第四稿在第三稿基础上只做两处算法修订并补齐实现细则（§18）：turn 槽按 **出站 thread UUID** 而不是 `thread_slot` 分区（root freeze 跨日命中的 thread 不得与当天同槽的另一条 thread 共用 turn UUID）；Redis 槽位 / freeze 只用单键 SET NX，不再引入锁键。§18 记录模块 API、Redis 操作、UUIDv7 生成、调用点、WS 快照、前端开关、测试与 CI 门禁、版本号。第二稿相对第一稿补上审查硬缺口：接续冻结、turn 按 thread 分区、HTTP 身份头泄漏、配置读写语义、Redis 命名空间、握手指纹不得纳入出站 ID。第三稿按代码复核（aether `custom` 分支与官方 codex-rs @ 357696c5）修正：memory 请求改为「blob 无身份、dash / 扁平带合成身份、无 turn」而不是全剥；接续冻结重新定性为跨路径 / 跨连接 / 跨日的 thread 稳定性，freeze miss 不再透传入站；`prompt_cache_key` 与 Aether 自补短头的顺序约束；attestation 已在候选头构建前剥离；turn-state 按出站 turn 来源转发；freeze TTL 滑动；补 `request_kind` 解析与 dash 头改写落点。骨架未改：三套身份平面、选号之后改写、sticky / WS 绑定 / 结算仍读入站、缺省关闭。
 
@@ -586,6 +600,7 @@ cargo test -p aether-ai-formats --lib codex
 | 仓库根 `sticky-and-profile.md`（`/opt/stacks/aether/sticky-and-profile.md`，不在 docs/） | `:717` / `:720` / `:735` 仍描述「默认不合成 / 不覆盖」，`:32` / `:35` 写 `prompt_cache_key` 默认 `thread_id`（已过时）。实现时改为：入站 ID 归 sticky / 绑定；出站合成是 `codex_runtime_identity` 显式模式 |
 | `docs/codex-websocket.md` | 绑定与 fence 仍入站；握手出站 ID 在实现后补一小节 |
 | `docs/architecture/ws-usage-session-observability.md` | usage 会话身份继续用入站 official session/thread，本功能不改 |
+| `docs/operations/codex-runtime-identity-runbook.md` | 线上检查 SQL、基线数值、`codex_rid_*` 事件处置、白名单维护流程、回滚路径（2026-09-05 起） |
 | 官方 `codex-rs` | 生成规则（UUIDv7、session=thread、window=`{thread}:{n}`、cache key=`session_id`、memory blob 无身份但 dash / 扁平带 thread、prewarm+`previous_response_id`）是出站形状与接续规则的参考，不是「禁止合成」的依据 |
 
 ## 17. 生产启用门禁（实现完成之后，仍须单独授权）
@@ -727,8 +742,10 @@ cd frontend && npm run type-check
 - tag：`backend-v0.7.101`（当前 `backend-v0.7.100` == `1ab530e2b`）。推 tag 触发 CI → ghcr `latest`。
 - `backend-v0.7.102`：code-review 缺陷修复（commit `465a05e7e`，见 §18.11），同样推 tag 触发 CI；线上仍不更新。
 - `backend-v0.7.103`：操作员的 429 failover 修复（`940098abd`，与本功能无关）。操作员于 2026-09-05 自行以此版本更新线上，并按 §17 打开 Codex Pro 号池开关（32 / 256）+ 请求体/响应体捕获，用于 §18.12 的线上验证。
-- `backend-v0.7.104`：codex-tui ≥ 0.153 新字段收敛（见 §18.12），只推 tag 触发 CI；**不执行 `update.sh`**，由操作员决定何时更新。
-- 之后由操作员按 §17 门禁决定是否更新与打开。
+- `backend-v0.7.104`（`a45fe8e80`）：codex-tui ≥ 0.153 新字段收敛（见 §18.12）。操作员授权后于 2026-09-05 02:36 UTC 上线；上线后发现缓存回退（§18.14.7）。
+- `backend-v0.7.105`（`fa0b3179c`，另含操作员 commit `5579355f9` Codex WS 读超时保留 sticky 账号）：短头删除、`x-client-request-id` = 出站 thread、无元数据请求合成、`HttpResponses` 补齐官方四头、`x-trace-id` 黑名单（§18.13、§18.14）。2026-09-05 06:05 UTC 上线，缓存命中恢复（§18.14.9）。
+- `backend-v0.7.106`（`bed5f7e2d`）：`HttpCompact` 表面补齐官方头并删 `x-client-request-id`（§18.14.3）。2026-09-05 06:40 UTC 上线。
+- 每次上线均按 `docs/operations/release-and-container-update-spec.md`：`.env` 钉 amd64 digest、备份 `.env.bak.<ts>_pre_vX`、只重建 `app`、核对 `_sqlx_migrations` / `schema_backfills` 不变；逐次记录在仓库根 `容器更新历史.md`（未纳入 git）。之后仍由操作员按 §17 门禁决定是否更新与打开。
 
 ### 18.11 v0.7.102 缺陷修复（code-review）
 
@@ -775,7 +792,7 @@ cd frontend && npm run type-check
 
 ### 18.13 v0.7.105 .104 上线后风控复核修订
 
-2026-09-05 02:36 UTC 线上更新到 v0.7.104 后，以上游风控视角复核 Codex Pro 号池出站（审计表 `usage_http_audits` + body blob，只看键名/计数，取数脚本 `/var/tmp/aether-rid/review.sql`、`review_body.py`）：
+2026-09-05 02:36 UTC 线上更新到 v0.7.104 后，以上游风控视角复核 Codex Pro 号池出站（审计表 `usage_http_audits` + body blob，只看键名/计数，取数脚本当时在 `/var/tmp/aether-rid/review.sql`、`review_body.py`，SQL 已收进 `docs/operations/codex-runtime-identity-runbook.md` §3.5）：
 
 - 合成请求 182：window 头与 blob 一致、W=0 且带 `context_window_id`、`thread_source=user`、`root_turn_id=出站 turn`、无泄漏键、无未知键、无 `codex_rid_*` 事件；7 条入站 thread → 7 条出站 thread（UUIDv7 形状正确）。压缩推进路径（W+1、新 C）线上尚未触发，需在第一次合成 thread 压缩后复核 `wn_max` 与 `context_window_id` 数。
 - **缺陷 1（泄漏）**：1/182 出站带短头 `session_id` = 入站真实 thread。来源是下游中转（入站头 `cafecode-uid`）在真实 Codex Desktop 前面加了这个头，被「入站显式短头保留」规则放过。修：短头一律删除（7.4、§9 表）。
@@ -832,7 +849,7 @@ cd frontend && npm run type-check
 5. §18.13 第 2 项（中转商 `rs_` item id 400 循环）仍待独立设计。
 6. `x-trace-id` 只在 Codex 号池出站剥离，其他 provider 类型不变。
 
-**18.14.6 压缩推进复核（已完成）**：2026-09-05 12:45 CST 以 `/var/tmp/aether-rid/review.sql`（`-v since='2026-09-05 02:36:50+00'`，线上 .104，Codex Pro）复核 §18.12 的 window 模型：改写请求 1048 条，window 头与 blob 一致 1047 / 1047（另 1 条为 memory，blob 按设计不带 window），`wn_without_ctx` 0、`window_id_mismatch` 0；出站 40 条 thread 中 5 条发生过压缩：4 条压缩 1 次后 `window_number` 最大 1、`context_window_id` 2 个，1 条压缩 2 次后最大 2、3 个。CAS 推进 W+1 与下一请求懒 mint 新 C 的路径按设计工作，§18.13 遗留的这一项关闭。
+**18.14.6 压缩推进复核（已完成）**：2026-09-05 12:45 CST 以 review.sql（现收录于 `docs/operations/codex-runtime-identity-runbook.md` §3.5；`-v since='2026-09-05 02:36:50+00'`，线上 .104，Codex Pro）复核 §18.12 的 window 模型：改写请求 1048 条，window 头与 blob 一致 1047 / 1047（另 1 条为 memory，blob 按设计不带 window），`wn_without_ctx` 0、`window_id_mismatch` 0；出站 40 条 thread 中 5 条发生过压缩：4 条压缩 1 次后 `window_number` 最大 1、`context_window_id` 2 个，1 条压缩 2 次后最大 2、3 个。CAS 推进 W+1 与下一请求懒 mint 新 C 的路径按设计工作，§18.13 遗留的这一项关闭。
 
 **18.14.7 线上缓存回退根因（v0.7.104 → v0.7.105 / .106）**
 
@@ -855,3 +872,17 @@ cd frontend && npm run type-check
 - .106 把 `HttpCompact` 补齐到官方 compact 形状（§18.14.3）。
 - 上线后复核口径：改写请求 `cache_read=0` 占比应回到个位数，`sum(cache_read)/sum(input)` 回到 0.9 附近（今天无短头子组 0.46，有短头子组 0.93）。若不恢复，兜底为在 `/responses` 出站补 `session_id` = 出站 thread（旧版 codex 形状），需另行评估。
 - 不采用「保留 Aether 自补短头」：当前官方客户端不发它，与 dash 头同时出现是任何单一版本 codex 都产生不了的混合形状。
+
+**18.14.8 白名单未知键的处理原则（`code_mode_tool_names` 案例）**
+
+.105 上线 2.5 分钟后出现首条 `codex_rid_unknown_metadata_key`（surface=`turn_metadata`，key=`code_mode_tool_names`，object）。按本地 codex-rs 核对：该键 2026-07-25（#35271）加入 turn metadata，2026-08-07（#37500）移除并列入 `core/src/responses_metadata.rs` 的 `RESERVED_METADATA_KEYS`（注释「removed inventory reserved so callers cannot reintroduce oversized metadata」），当前没有发射代码；入站是 codex-tui/0.147.0 旧客户端，Codex Pro 出站 UA 档位（Codex Desktop 0.149 / 0.150）均在移除之后。结论：白名单删除该键与出站版本一致，不加白、不改代码。
+
+由此固定处理原则（详细流程见运维手册 §4.1）：未知键先在 codex-rs 找发射代码与 `git log -S`；官方已移除/保留的键不加白；当前版本发射且不含身份的键加进 `*_PASS_KEYS` 并补单测；含身份的键归入 identity / leak 类并补改写规则。判定标准始终是「出站 UA 那个版本的 codex 会不会发这个键」，而不是「删掉会不会少一点信息」。
+
+**18.14.9 .105 / .106 上线与缓存验证结果（2026-09-05）**
+
+- .105 06:05 UTC、.106 06:40 UTC 上线，均只重建 `app`，`_sqlx_migrations` 55 / `schema_backfills` 5 不变，首分钟无 ERROR，`codex_rid_*` 仅上述一条。
+- .105 上线 15 分钟（Codex Pro HTTP 200）：改写请求 `request_kind=turn` miss 2.6%（.103 基线）→ 32.2%（.104）→ 6.9%（.105，n=58）；11 次 miss 中 10 次是该出站 thread 上线后的首个请求（新 thread 首请求，或路由头变化后存量 thread 一次性迁移），唯一线程中段 miss 是 `compaction` 请求（基线下 compaction 本就 36% miss）。命中请求 cached/input 中位数 0.986（基线 0.990，.104 0.972）。出站头 100% 官方四头、短头 0。§18.14.7 的根因判断成立，回退关闭。
+- 合成请求（无元数据中转流量）n=29，miss 全为首请求，命中中位数 0.968 略低于基线 0.982，样本小，列为观察项（运维手册 §3.4）。
+- `/responses/compact` 线上 72 小时零流量，.106 的 `HttpCompact` 形状只由单测覆盖（运维手册 §3.6 给了核对语句）。
+- 上线后 .104 不再是可用的回滚目标（带缓存回退）；回滚到 .105 或更早请见运维手册 §6。
