@@ -40,9 +40,15 @@ pub(crate) enum CodexWsStepDisposition {
         error_type: String,
         error_message: String,
         error_body: Option<String>,
-        /// False for pre-write transport/provider-path failures that are not evidence against
-        /// the selected account.
+        /// False when the failure is not evidence against the selected account
+        /// (for example an upstream transport/protocol reset after a provider
+        /// write, or a pre-write provider-path failure).
         penalize_account: bool,
+        /// True once the request bytes were handed to the provider.  An
+        /// account-neutral failure at this point has an unknown execution
+        /// result and must retain/promote the current sticky binding rather
+        /// than release a provisional one for another account.
+        provider_write_attempted: bool,
     },
     StreamTimeout {
         error_type: String,
@@ -62,7 +68,10 @@ pub(crate) struct CodexWsCandidateSettlement {
 
 fn pool_effect_for_stream_timeout(error_type: &str) -> LocalExecutionEffect<'static> {
     if error_type == CODEX_WS_READ_TIMEOUT {
-        LocalExecutionEffect::PoolNonAccountFailure
+        // A read-idle timeout happens after the provider write.  Treat its
+        // result as unknown so the selected key remains the continuation
+        // target, including when this was the first provisional binding.
+        LocalExecutionEffect::PoolExecutionUnknown
     } else {
         LocalExecutionEffect::PoolStreamTimeout
     }
@@ -385,6 +394,7 @@ impl CodexWsCandidateLifecycle {
             error_message,
             error_body: error_body.clone(),
             penalize_account,
+            provider_write_attempted: false,
         };
         let payload = GatewayStreamReportRequest {
             trace_id: self.original_request_id().to_string(),
@@ -556,6 +566,7 @@ impl CodexWsCandidateLifecycle {
                 status_code,
                 error_body,
                 penalize_account,
+                provider_write_attempted,
                 ..
             } => {
                 if *penalize_account {
@@ -572,20 +583,30 @@ impl CodexWsCandidateLifecycle {
                     )
                     .await;
                 } else {
+                    let effect = if *provider_write_attempted {
+                        // The provider may have accepted the turn even though
+                        // the response socket reset.  Keep this key as the
+                        // continuation target and do not make it look like a
+                        // failed account.
+                        LocalExecutionEffect::PoolExecutionUnknown
+                    } else {
+                        LocalExecutionEffect::PoolNonAccountFailure
+                    };
                     apply_local_pool_terminal_effect_after_lease_release(
                         state,
                         context,
-                        LocalExecutionEffect::PoolNonAccountFailure,
+                        effect,
                     )
                     .await;
                 }
             }
             CodexWsStepDisposition::StreamTimeout { error_type, .. } => {
                 // `codex_ws_read_timeout` is a gateway-side business-frame idle
-                // deadline, not an account-level rejection.  Keep the established
-                // client-session binding for this exact error so a long-thinking
-                // turn cannot silently rotate its OAuth account.  Other timeout
-                // classes retain the existing cooldown/failover policy.
+                // deadline, not an account-level rejection.  Keep/promote the
+                // current client-session binding for this exact error so a
+                // long-thinking turn cannot silently rotate its OAuth account.
+                // Other timeout classes retain the existing cooldown/failover
+                // policy.
                 let pool_effect = pool_effect_for_stream_timeout(error_type);
                 apply_local_pool_terminal_effect_after_lease_release(state, context, pool_effect)
                     .await;
@@ -1431,7 +1452,7 @@ mod tests {
     fn codex_ws_read_timeout_preserves_pool_sticky_binding() {
         assert!(matches!(
             pool_effect_for_stream_timeout(CODEX_WS_READ_TIMEOUT),
-            LocalExecutionEffect::PoolNonAccountFailure
+            LocalExecutionEffect::PoolExecutionUnknown
         ));
         assert!(matches!(
             pool_effect_for_stream_timeout("codex_ws_first_byte_timeout"),

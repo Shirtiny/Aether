@@ -29,7 +29,8 @@ pub(crate) use self::writes::{
     clear_admin_provider_pool_sticky_session_prebind_if_owner,
     prebind_admin_provider_pool_sticky_session, record_admin_provider_pool_error,
     record_admin_provider_pool_grok_auth_cooldown, record_admin_provider_pool_stream_timeout,
-    record_admin_provider_pool_success, refresh_admin_provider_pool_sticky_session_if_bound_to_key,
+    record_admin_provider_pool_success, preserve_admin_provider_pool_sticky_session,
+    refresh_admin_provider_pool_sticky_session_if_bound_to_key,
     release_admin_provider_pool_sticky_session_init_if_owner,
     renew_admin_provider_pool_sticky_session_init_if_owner,
 };

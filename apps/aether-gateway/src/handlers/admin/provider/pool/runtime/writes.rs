@@ -476,6 +476,41 @@ pub(crate) async fn record_admin_provider_pool_success(
     }
 }
 
+/// Re-establishes the selected sticky key after a provider write whose result
+/// is unknown.  This intentionally updates only the sticky binding; it does
+/// not record a success score, latency sample, quota usage, or health signal.
+pub(crate) async fn preserve_admin_provider_pool_sticky_session(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_id: &str,
+    pool_config: &AdminProviderPoolConfig,
+    sticky_session_token: Option<&str>,
+    sticky_init_owner: Option<&str>,
+    sticky_bound_key_ineligible: bool,
+    sticky_bound_key_id: Option<&str>,
+) {
+    let Some(sticky_session_token) = sticky_session_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|_| pool_config.sticky_session_ttl_seconds > 0)
+    else {
+        return;
+    };
+    let expected_previous_key = sticky_bound_key_ineligible
+        .then_some(sticky_bound_key_id)
+        .flatten();
+    publish_admin_provider_pool_sticky_session_success(
+        runtime,
+        provider_id,
+        key_id,
+        sticky_session_token,
+        sticky_init_owner,
+        std::time::Duration::from_secs(pool_config.sticky_session_ttl_seconds),
+        expected_previous_key,
+    )
+    .await;
+}
+
 async fn publish_admin_provider_pool_sticky_session_success(
     runtime: &RuntimeState,
     provider_id: &str,

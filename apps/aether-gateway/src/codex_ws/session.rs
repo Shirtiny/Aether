@@ -1959,6 +1959,11 @@ fn next_response_context_token_floor(event: &TerminalEventSummary) -> Option<i64
 }
 
 impl StepOutcome {
+    /// An active Responses WebSocket protocol/transport failure happens after the
+    /// provider write has been attempted.  The result is therefore ambiguous,
+    /// but it is not evidence that the selected OAuth account is invalid.  Keep
+    /// the account-health signal neutral; explicit account failures are produced
+    /// by `terminal_outcome` with their own status/body classification.
     fn provider_failure(error_type: &'static str, error_message: &'static str) -> Self {
         Self::Poisoned {
             terminal_event: None,
@@ -1968,7 +1973,8 @@ impl StepOutcome {
                 error_type: error_type.to_string(),
                 error_message: error_message.to_string(),
                 error_body: None,
-                penalize_account: true,
+                penalize_account: false,
+                provider_write_attempted: true,
             },
             terminal_frames: None,
         }
@@ -2060,6 +2066,7 @@ fn terminal_outcome(
                 // Generic gateway/proxy 429s must not rotate the OAuth account;
                 // structured official quota 429s retain quota handling.
                 penalize_account,
+                provider_write_attempted: true,
             },
             terminal_frames: Some(terminal_frames),
         }
@@ -3814,6 +3821,7 @@ mod tests {
                 error_type: "codex_ws_official_rate_limit_exceeded".into(),
                 error_message: "retry later".into(),
                 error_body: Some(r#"{"error":{"code":"rate_limit_exceeded"}}"#.into()),
+                provider_write_attempted: true,
                 penalize_account: true,
             }
         );
@@ -3984,9 +3992,13 @@ mod tests {
             [CodexWsStepDisposition::ProviderFailure {
                 error_type,
                 error_message,
+                penalize_account,
+                provider_write_attempted,
                 ..
             }] if error_type == "codex_ws_upstream_reset_without_close"
                 && error_message == "official Codex WebSocket reset without a closing handshake"
+                && !penalize_account
+                && *provider_write_attempted
         ));
     }
 

@@ -42,7 +42,8 @@ use crate::handlers::shared::provider_pool::{
     prebind_admin_provider_pool_sticky_session, read_admin_provider_pool_hot_runtime_state,
     read_admin_provider_pool_runtime_state, record_admin_provider_pool_error,
     record_admin_provider_pool_grok_auth_cooldown, record_admin_provider_pool_stream_timeout,
-    record_admin_provider_pool_success, refresh_admin_provider_pool_sticky_session_if_bound_to_key,
+    record_admin_provider_pool_success, preserve_admin_provider_pool_sticky_session,
+    refresh_admin_provider_pool_sticky_session_if_bound_to_key,
     release_admin_provider_pool_key_lease,
     release_admin_provider_pool_sticky_session_init_if_owner,
     renew_admin_provider_pool_sticky_session_init_if_owner, AdminProviderPoolConfig,
@@ -118,6 +119,9 @@ pub(crate) enum LocalExecutionEffect<'a> {
     PoolAttemptStarted,
     PoolAttemptAborted,
     PoolNonAccountFailure,
+    /// Provider bytes were sent but no terminal result arrived.  Preserve the
+    /// selected sticky key without recording account health failure.
+    PoolExecutionUnknown,
     PoolError(LocalPoolErrorEffect<'a>),
     PoolStreamTimeout,
 }
@@ -183,6 +187,10 @@ pub(crate) async fn apply_local_execution_effect(
             record_pool_non_account_failure_effect(state, context).await;
             release_pool_key_lease_effect(state, context).await;
         }
+        LocalExecutionEffect::PoolExecutionUnknown => {
+            record_pool_execution_unknown_effect(state, context).await;
+            release_pool_key_lease_effect(state, context).await;
+        }
         LocalExecutionEffect::PoolError(effect) => {
             record_pool_error_effect(state, context, effect).await;
             release_pool_key_lease_effect(state, context).await;
@@ -239,6 +247,9 @@ pub(crate) async fn apply_local_pool_terminal_effect_after_lease_release(
         }
         LocalExecutionEffect::PoolNonAccountFailure => {
             record_pool_non_account_failure_effect(state, context).await;
+        }
+        LocalExecutionEffect::PoolExecutionUnknown => {
+            record_pool_execution_unknown_effect(state, context).await;
         }
         LocalExecutionEffect::PoolError(effect) => {
             record_pool_error_effect(state, context, effect).await;
@@ -1152,6 +1163,41 @@ async fn record_pool_non_account_failure_effect(
         .pool_sticky_session_token
         .or_else(|| pool_feedback_sticky_session_token(context.plan, context.report_context));
     finish_pool_sticky_initialization(state, context, sticky_session_token.as_deref(), false).await;
+}
+
+/// A provider write was attempted, but the gateway never received a terminal
+/// event.  This is deliberately separate from `PoolNonAccountFailure`: the
+/// latter releases a provisional initialization so a pre-write candidate can
+/// fail over, while an unknown post-write result must keep the selected key as
+/// the next continuation target.  Publishing with the existing-key guard also
+/// prevents an older settlement from overwriting a newer binding.
+async fn record_pool_execution_unknown_effect(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+) {
+    let metadata = local_execution_candidate_metadata_from_report_context(context.report_context);
+    let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
+        cleanup_pool_sticky_initialization_without_feedback_context(state, context, false).await;
+        return;
+    };
+    preserve_admin_provider_pool_sticky_session(
+        state.runtime_state.as_ref(),
+        &context.plan.provider_id,
+        &context.plan.key_id,
+        &pool_context.pool_config,
+        pool_context.sticky_session_token.as_deref(),
+        metadata.pool_sticky_init_owner.as_deref(),
+        metadata.pool_sticky_bound_key_ineligible,
+        metadata.pool_sticky_bound_key_id.as_deref(),
+    )
+    .await;
+    finish_pool_sticky_initialization(
+        state,
+        context,
+        pool_context.sticky_session_token.as_deref(),
+        false,
+    )
+    .await;
 }
 
 async fn record_adaptive_rate_limit_effect(
@@ -3850,6 +3896,100 @@ mod tests {
                 .await
                 .expect("sticky collateral block lookup should succeed"),
             "account invalid pool errors should block the session from this provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_write_unknown_promotes_provisional_sticky_key_without_penalty() {
+        let provider_config = json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": 120
+            }
+        });
+        let pool_config = admin_provider_pool_config_from_config_value(Some(&provider_config))
+            .expect("pool config should parse");
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_health_provider().with_transport_fields(
+                true,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(provider_config),
+            )],
+            vec![sample_health_endpoint()],
+            vec![sample_health_key()],
+        ));
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        let mut plan = sample_plan();
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "session_id": "session-1"
+        }));
+        let report_context = json!({
+            "pool_sticky_session_token": "session-1",
+            "pool_sticky_init_owner": "owner-key-1",
+            "original_request_body": {
+                "model": "gpt-5",
+                "session_id": "session-1"
+            }
+        });
+        assert!(
+            claim_admin_provider_pool_sticky_session_init(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+                "owner-key-1",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        );
+        assert!(
+            prebind_admin_provider_pool_sticky_session(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+                &pool_config,
+                Some("session-1"),
+                Some("owner-key-1"),
+            )
+            .await
+        );
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::PoolExecutionUnknown,
+        )
+        .await;
+
+        let runtime = read_admin_provider_pool_runtime_state(
+            state.runtime_state.as_ref(),
+            &plan.provider_id,
+            std::slice::from_ref(&plan.key_id),
+            &pool_config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(runtime.sticky_bound_key_id.as_deref(), Some("key-1"));
+        assert!(
+            !admin_provider_pool_sticky_session_init_exists(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                Some("session-1"),
+            )
+            .await
         );
     }
 
