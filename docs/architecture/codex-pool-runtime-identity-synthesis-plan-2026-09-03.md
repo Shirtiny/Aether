@@ -1,9 +1,9 @@
 # Codex 号池出站 Session / Thread / Turn 合成与复用计划
 
-> Status: **Implemented（第四稿）— 已在 `custom` 分支落地，随 `backend-v0.7.101` 交付；`backend-v0.7.102` 为其 code-review 缺陷修复（UUIDv7 ContextV7 缺口 + chat/family 跨格式 `prompt_cache_key` 泄漏，见 §18.11）。线上未更新，生产号池打开开关仍受 §17 门禁**
+> Status: **Implemented（第四稿）— 已在 `custom` 分支落地，随 `backend-v0.7.101` 交付；`backend-v0.7.102` 为其 code-review 缺陷修复（UUIDv7 ContextV7 缺口 + chat/family 跨格式 `prompt_cache_key` 泄漏，见 §18.11）；`backend-v0.7.104` 把 window 改为按合成 thread 跟踪压缩次数（`window_number` / `context_window_id` / `window_id` 随压缩推进）并加入出站字段白名单（见 §7.3、§9.2、§18.12）。操作员已于 2026-09-05 自行把线上更新到 `backend-v0.7.103` 并在 Codex Pro 号池打开开关（32 thread / 256 turn），线上验证见 §18.12**
 > Date: 2026-09-03
 > Scope: Codex OAuth 号池在选号之后，按账号、按日合成并复用上游可见的 `session_id` / `thread_id` / `turn_id` / `window_id`
-> Production changes: **本轮不更新线上。** 只提交代码并推送 `backend-v0.7.101` / `backend-v0.7.102` tag 触发 CI 构建镜像；**不执行 `update.sh`**，运行中的容器不变，功能缺省关闭
+> Production changes: **本轮不更新线上。** 只提交代码并推送 `backend-v0.7.101` / `backend-v0.7.102` / `backend-v0.7.104` tag 触发 CI 构建镜像；**不执行 `update.sh`**，运行中的容器由操作员决定何时更新（当前 `backend-v0.7.103`，尚不含 §18.12 修复），功能缺省关闭
 > Deploy: 生产更新路径仍是 tag → CI → ghcr → `update.sh`，不是 `deploy.sh`。何时执行 `update.sh`、何时在某个 provider 上 `enabled: true`，由操作员另行决定
 
 本文是第四稿（最终稿）。第四稿在第三稿基础上只做两处算法修订并补齐实现细则（§18）：turn 槽按 **出站 thread UUID** 而不是 `thread_slot` 分区（root freeze 跨日命中的 thread 不得与当天同槽的另一条 thread 共用 turn UUID）；Redis 槽位 / freeze 只用单键 SET NX，不再引入锁键。§18 记录模块 API、Redis 操作、UUIDv7 生成、调用点、WS 快照、前端开关、测试与 CI 门禁、版本号。第二稿相对第一稿补上审查硬缺口：接续冻结、turn 按 thread 分区、HTTP 身份头泄漏、配置读写语义、Redis 命名空间、握手指纹不得纳入出站 ID。第三稿按代码复核（aether `custom` 分支与官方 codex-rs @ 357696c5）修正：memory 请求改为「blob 无身份、dash / 扁平带合成身份、无 turn」而不是全剥；接续冻结重新定性为跨路径 / 跨连接 / 跨日的 thread 稳定性，freeze miss 不再透传入站；`prompt_cache_key` 与 Aether 自补短头的顺序约束；attestation 已在候选头构建前剥离；turn-state 按出站 turn 来源转发；freeze TTL 滑动；补 `request_kind` 解析与 dash 头改写落点。骨架未改：三套身份平面、选号之后改写、sticky / WS 绑定 / 结算仍读入站、缺省关闭。
@@ -215,15 +215,34 @@ Turn 槽按 **合成 thread** 分区。第一稿把 `turn_slot` 做成账号全�
 - `x-codex-turn-metadata` blob 内 **不写** installation/session/thread/turn/window；若入站 blob 带了这些键（非官方客户端），整键删除。
 - 任何投影都 **不出现** `turn_id`；不 mint turn 槽，不写 per-turn freeze。
 - **不要透传** 入站 UUID（否则同一账号上普通请求走合成、memory 走真实客户端 ID，风控侧更脏）。
-- 仍剥离 parent/fork/subagent/`thread_source`/`subagent_kind`。
+- 仍剥离 parent/fork/subagent/`subagent_kind`；`thread_source` 保持 `memory_consolidation`（官方 memory blob 就是这个形状，`turn_metadata.rs` `detached_memory_responses_metadata`）。
 
 Aether 今天不解析 `request_kind`（代码里没有该键的读取）。实现时从 body `client_metadata["x-codex-turn-metadata"]` 与 header `x-codex-turn-metadata` 两处解析；取值不是官方 `turn` / `prewarm` / `compaction` / `memory` 之一时按普通 turn 处理。
 
 ### 7.3 Window
 
-传输 `window_id` 是 `{thread_id}:{n}`，不是 UUID。多条真实 thread 塌缩到一条合成 thread 后，继承入站 `:n` 会上下乱跳。
+传输 `window_id` 是 `{thread_id}:{window_number}`，不是 UUID。多条真实 thread 塌缩到一条合成 thread 后，继承入站 `:n` 会上下乱跳。
 
-v1 **始终**发出 `{outbound_thread_id}:0`。不要编造 compact 内部的 `first_window_id` / `previous_window_id`。冻结快照里的 window 也必须是这个形状，不要在续链时改成 `:1`。
+**v0.7.101–.103 规则（已废弃）**：始终发出 `{outbound_thread_id}:0`。v0.7.104 之前的 §18.12 初稿还打算把 codex-tui ≥ 0.153 新增的 `window_number` 恒置 0、`context_window_id` 按 thread 派生。从上游风控角度看这是一个**确定性矛盾**而不是中性形状（codex-rs @ 07f18d5f 复核，`core/src/state/auto_compact_window.rs`、`session/session.rs::responses_metadata`、`compact_remote.rs`、`session/rollout_reconstruction.rs`）：
+
+- 真实客户端 `Session::new` 时 `window_number = 0`、`window_id = Uuid::now_v7()`；**每次压缩**（本地 `/responses` `request_kind=compaction`，或远端 `/responses/compact`）之后 `advance()`：`window_number += 1`，mint 新的 `context_window_id`。
+- 压缩请求自身带完整 thread 身份头，上游**按 thread 看得到每一次压缩**。window 状态随 rollout 持久化并在 resume 时恢复，因此对一条真实 thread 来说 `window_number` 单调递增、等于上游看到的压缩次数。
+- 线上 48h 样本：70% 的真实入站请求 `window_number > 0`（最大 673）；每天 256 turn、压缩过却仍停在 window 0 的 thread，是任何真实客户端都产生不了的形状。派生的 `context_window_id` 与 thread 同一毫秒时间戳，又是一个可检测的弱指纹。
+
+**v0.7.104 规则：window 状态按合成 thread 跟踪。**
+
+| 项 | 规则 |
+|---|---|
+| 状态 | Redis `…:window:{outbound_thread_id}` = `{"number":W,"context_window_id":C?}`，滑动 TTL 同 freeze，不按日分区（真实 thread 跨日也不换 window） |
+| 初始 | thread 首次被请求命中时 W=0，C = 当时 mint 的 UUIDv7（与 thread 相差几毫秒，同真实客户端） |
+| 推进 | 入站 `request_kind=compaction`（本地与远端压缩 blob 都带此 kind，线上 24/24）：**该压缩请求本身仍带当前 W / C**；随后 CAS 写 `{number: W+1}`（无 C）。下一条命中该 thread 的请求懒 mint C = 当时的 UUIDv7——时间戳在压缩完成之后，与真实客户端一致 |
+| 投影 | blob `window_number = W`、`context_window_id = C`、`window_id = {T}:{W}`；扁平 `x-codex-window-id` 与 dash 头同值；**memory 请求恒为 `{T}:0`**（`memories/write/src/runtime.rs:270` 硬编码 `format!("{}:0", thread_id)`），blob 内无 window 键 |
+| 入站 window | 一律忽略。镜像入站 `window_number` 会在 failover / 多真实会话折叠时产生「没压缩却推进」 |
+| 不变量 | W == 上游在该合成 thread 上看到的压缩请求数（真实客户端满足 W ≤ 该数；压缩失败时它不推进，我们推进——见 §15） |
+| WS | 快照只冻结 session / thread；每个 step 从 store 读当前 window；store 故障回退到快照里的 window（fail-open）。握手 `x-codex-window-id` 用连接建立时的 W（真实客户端 turn 中途压缩也不会重连） |
+| 只改已存在键 | `window_number` / `context_window_id` 旧客户端不带则不补；store 故障导致 C 缺失时删除该键而不是透传入站值 |
+
+`RootFreeze.window_id` 字段保留以兼容旧值，但不再作为输出来源。
 
 ### 7.4 `prompt_cache_key`
 
@@ -290,6 +309,7 @@ ap:{provider_id}:codex_rid:{selection_fp}:{day}:thread:{slot} = uuid
 ap:{provider_id}:codex_rid:{selection_fp}:{day}:turn:{outbound_thread_id}:{slot} = uuid
 ap:{provider_id}:codex_rid:{selection_fp}:freeze:{inbound_root_hash} = json
 ap:{provider_id}:codex_rid:{selection_fp}:freeze:{inbound_root_hash}:turn:{inbound_turn_hash} = uuid
+ap:{provider_id}:codex_rid:{selection_fp}:window:{outbound_thread_id} = json  (v0.7.104，§7.3)
 ```
 
 第四稿去掉锁键：每个槽位 / freeze 都是单键，`RuntimeState::kv_set_if_absent`（Redis `SET NX PX`）本身原子；两实例对同一键只有一个写入成功，失败方 `kv_get` 回读赢家值。sticky 的 `sticky_init` 锁是为多键初始化准备的，这里不需要。
@@ -299,6 +319,7 @@ ap:{provider_id}:codex_rid:{selection_fp}:freeze:{inbound_root_hash}:turn:{inbou
 | TTL | 日窗口剩余秒数 + 12h 余量（覆盖 jitter、迟到请求、跨午夜工具循环）；freeze 键每次命中刷新（滑动），槽位键不刷新 |
 | Mint | 首次绑定现场生成 UUIDv7，使 ID 看起来是当天创建的。UUIDv7 带时间；把昨天的 ID 配上新的 `turn_started_at_unix_ms` 是可检测异常。freeze 命中时 **保留** 昨天的 UUIDv7，这比会话中途换 thread 更可接受 |
 | 并发 mint | 单键 SET NX（`kv_set_if_absent`），失败方回读；两个实例不得为同一槽 / 同一 freeze 得到不同值。root freeze 的 `last_turn_id` 更新用 `kv_set_if_value` CAS，失败即放弃（尽力而为） |
+| window 键 | 每请求 GET + 滑动 EXPIRE；C 缺失时 SET NX / CAS 补 mint，失败方回读；压缩推进用 CAS，并发压缩只推进一次（尽力而为） |
 | 日志 | 入站 ID 与 selection 只记哈希；禁止记录原始官方账号 ID、OAuth token、Aether API Key |
 | Redis 故障 | 该请求 **透传入站 ID**，打点 `codex_rid_store_unavailable`。禁止进程内私自 mint |
 | 独立 HTTP 请求（无 previous_response_id、无 freeze） | 按当前 day 槽映射 |
@@ -329,9 +350,9 @@ key 构造函数放在新模块 `codex_runtime_identity.rs` 内（与 sticky 的
 | 表面 | 动作 |
 |---|---|
 | dash `session-id` / `thread-id` | 写成出站 UUID。HTTP planner 今天没有任何投影代码，这两个头是入站透传；改写是对透传头的新 pass（9.1 末段） |
-| `x-codex-window-id` | `{outbound_thread}:0` |
-| `x-codex-turn-metadata` | 解析后改写 `session_id`/`thread_id`/`turn_id`/`window_id`/`installation_id`（后者仍走 profile）；**只改写已存在的键，不补缺失键**（`request_kind` 缺失时官方 blob 本就没有 installation/window；memory 见 7.2）；删除 7.1 的泄漏键；Unicode 继续 ASCII escape，保持 HTTP 头安全 |
-| 扁平 `client_metadata` | `session_id`、`thread_id`、`turn_id`、`x-codex-window-id`、`x-codex-installation-id`；删除 parent/subagent/`thread_source`/`subagent_kind` 扁平键 |
+| `x-codex-window-id` | `{outbound_thread}:{W}`（W 为该合成 thread 的 window 状态，§7.3；memory 恒 `:0`） |
+| `x-codex-turn-metadata` | 解析后改写 `session_id`/`thread_id`/`turn_id`/`window_id`/`window_number`/`context_window_id`/`installation_id`（后者仍走 profile）；`agent_name` → `/root`、`thread_source` → `user`（memory 保持）、`root_turn_id` → 出站 turn（根 turn 的 root 就是自己，线上 1908/2032）；**只改写已存在的键，不补缺失键**（`request_kind` 缺失时官方 blob 本就没有 installation/window；memory 见 7.2）；删除 7.1 的泄漏键（含 `forked_from_ordinal_exclusive`）；其余键按 §9.2 白名单；Unicode 继续 ASCII escape，保持 HTTP 头安全 |
+| 扁平 `client_metadata` | `session_id`、`thread_id`、`turn_id`、`root_turn_id`（→ 出站 turn）、`x-codex-window-id`、`x-codex-installation-id`；删除 parent/subagent/`thread_source`/`subagent_kind` 扁平键；其余键按 §9.2 白名单 |
 | `x-client-request-id` | 见 9.1 |
 | Compact `openai:responses:compact` | body `client_metadata` **继续整段剥离**；请求头仍改写，且必须走 7.5 freeze |
 | Search | 只改 header 里的 turn-metadata；继续剥离 `x-codex-installation-id` |
@@ -355,6 +376,20 @@ key 构造函数放在新模块 `codex_runtime_identity.rs` 内（与 sticky 的
 WS `official_request` **始终** 写 `x-client-request-id = outbound.thread_id`（官方 WS 契约），不管入站是什么。
 
 HTTP planner 今天对 dash `session-id` / `thread-id` / `x-codex-window-id` 没有任何投影代码，它们是入站透传。改写实现为对透传头的新 pass：值等于入站 session/thread/turn/window（去空白后全等）→ 换成对应出站投影；其它值不动。短头 `session_id` / `conversation_id` 按 7.4 删除。
+
+### 9.2 出站字段白名单（v0.7.104）
+
+`window_number` / `context_window_id` 两次「新字段原样透传」说明：只列泄漏键的黑名单跟不上 codex-rs 加字段的速度。合成开启时，三个表面上的每个键都必须落在一个类里，**不在名单上的键一律删除**，并以 `codex_rid_unknown_metadata_key`（warn，首次；之后 debug；只记表面、键名、JSON 类型，不记值）上报。名单以 codex-rs 07f18d5f `core/src/responses_metadata.rs` 为准，加上线上样本里确认无害的键。
+
+| 表面 | 改写 | 归一化 | 删除（不上报） | 原样转发 |
+|---|---|---|---|---|
+| blob `x-codex-turn-metadata` | installation_id（profile）、session_id、thread_id、turn_id、window_id、window_number、context_window_id | agent_name → `/root`；thread_source → `user`（memory 保持）；root_turn_id → 出站 turn | forked_from_thread_id、forked_from_ordinal_exclusive、parent_thread_id、parent_turn_id、subagent_kind | request_kind、compaction、turn_trigger、sandbox、sandbox_mode、auto_review_enabled、node_repl_auto_review_required、node_repl_disabled、workspaces、workspace_kind、tool_namespaces_info、turn_started_at_unix_ms、history_ingest_requested |
+| 扁平 `client_metadata` | x-codex-installation-id（profile）、session_id、thread_id、turn_id、root_turn_id、x-codex-window-id、x-codex-turn-metadata、x-codex-turn-state（按 7.6） | — | x-codex-parent-thread-id、x-openai-subagent、parent_thread_id、forked_from_thread_id、parent_turn_id、subagent_kind、thread_source | ws_request_header_x_openai_internal_codex_responses_lite、x-codex-ws-stream-request-start-ms、guardian_ticket、guardian_ticket_requested；Aether 自身的 `sub2api_*` / `aether.*` 控制键 |
+| HTTP 请求头（仅 `x-codex-` / `x-openai-` / `x-oai-` / `x-responsesapi-` 前缀） | x-codex-window-id、x-codex-turn-metadata、x-codex-turn-state（按 7.6） | — | x-codex-parent-thread-id、x-openai-subagent、x-oai-attestation | x-codex-installation-id、x-codex-beta-features、x-codex-routing-hint、x-openai-internal-codex-responses-lite、x-openai-memgen-request、x-responsesapi-include-timing-metrics |
+
+不在前缀内的头（`openai-beta`、`originator`、`session-id` 等）不受白名单影响，仍按 §9 / §9.1 处理。WS 握手 `official_request` 本来就是拷贝名单，不另加。合成关闭时白名单不生效（透传路径不变）。
+
+线上 7 天样本里会被白名单删掉的键：blob `model` / `reasoning_effort`（codex-tui 0.153.3，3 条；官方源码里它们是 MCP `_meta` 键，不该出现在 Responses blob）。`workspace_kind`（Codex Desktop，127 条，取值 project / projectless）确认无害，直接进转发名单。新版本客户端一旦带新键，warn 日志会给出键名，评估后加进名单即可，不需要改结构。
 
 ## 10. WebSocket
 
@@ -398,7 +433,8 @@ HTTP planner 今天对 dash `session-id` / `thread-id` / `x-codex-window-id` 没
 - `validate_codex_runtime_identity_config`（写路径）与 `codex_runtime_identity_rewrite_enabled`（读路径，非法即关）
 - day id / jitter / slot hash / `selection_fp`
 - Redis get-or-mint 与 freeze
-- `OutboundCodexRuntimeIdentity { session_id, thread_id, turn_id, window_id }`
+- `OutboundCodexRuntimeIdentity { session_id, thread_id, turn_id, window_id, window_number, context_window_id }`；`ThreadWindow` 状态与 `resolve_window`（§7.3）
+- 三表面白名单常量与 `retain_known_keys` / `retain_known_headers` / `report_unknown_metadata_key`（§9.2）
 - headers + `client_metadata` + turn-metadata JSON 改写（复用 `codex_profile.rs` 的 ASCII JSON / Unicode escape）
 - `request_kind` 解析（body / header turn-metadata；Aether 今天没有）、memory 形状、泄漏键删除、短头删除、`x-client-request-id` 条件改写、turn-state 按来源转发 / 剥离
 
@@ -449,8 +485,10 @@ HTTP planner 今天对 dash `session-id` / `thread-id` / `x-codex-window-id` 没
 - 入站 turn 映射出的 distinct 出站 turn：同一合成 thread 内 ≤ M；同一入站 `turn_id` 稳定
 - **不同出站 thread 不得共用出站 `turn_id`**；同一出站 thread 内的不同入站 root 可以碰撞到同一 turn 槽（这是「每条 thread 每日 ≤ M 个 turn」的必然结果），账号全局 turn 计数上限仍是 N×M
 - turn 槽按出站 thread 分区：root freeze 跨日命中的 thread 与当天同槽位新 mint 的 thread 不共用 turn UUID
-- 出站 `session_id == thread_id`；`window_id == "{thread}:0"`；WS `x-client-request-id == thread_id`
-- 出站剥离 parent/fork/subagent/`thread_source`/`subagent_kind`；WS 绑定仍用入站 ID
+- 出站 `session_id == thread_id`；`window_id == "{thread}:{W}"`，未压缩时 `:0`；WS `x-client-request-id == thread_id`
+- window：首请求 W=0 且 C 为当时 mint 的 UUIDv7；同 window 内 C 稳定；压缩请求自身带旧 W/C，store 内推进为 `{number: W+1}` 无 C；下一请求 W+1 且 C 为新的、时间戳在压缩之后；折叠到同一 thread 的另一真实会话看到同一 W/C；memory 投影 `:0`；WS 快照按 step 读 window，store 故障回退快照 window
+- 白名单：blob / 扁平 / 头三表面未知键删除、已知转发键保留、Aether 控制键保留；`agent_name` → `/root`、`thread_source` → `user`（memory 保持）、`root_turn_id` → 出站 turn；`forked_from_ordinal_exclusive` 删除；C 缺失时删键不透传
+- 出站剥离 parent/fork/subagent/`subagent_kind`，`thread_source` 归一化为 `user`；WS 绑定仍用入站 ID
 - dash 头、扁平 metadata、turn-metadata JSON 三者一致
 - compact：body 仍无 `client_metadata`，头已改写，且与同 root 的 WS 主 turn 出站 session/thread 相同
 - Search：header metadata 已改写，仍无 `x-codex-installation-id`
@@ -513,7 +551,9 @@ cargo test -p aether-ai-formats --lib codex
 把大量真实会话塌缩到 N 条 thread、每条 thread M 个 turn **不是**官方 Codex 行为。ChatGPT 侧能看到：
 
 - UUIDv7 时间与 `turn_started_at_unix_ms` 不完全同序（碰撞 turn 会复用较早 mint 的 v7）
-- 所有合成会话 `window_id` 停在 `:0`
+- window 按合成 thread 计数：多条真实会话折叠后，一条合成 thread 的压缩次数是它们的总和；上游压缩失败时真实客户端不推进而我们推进（不做响应回写）；并发压缩只推进一次
+- 合成 thread 一律是 `/root` 用户线程：真实 subagent / review / thread_title 线程的 `agent_name` / `thread_source` 归一化，`turn_trigger` 等其它标记保留
+- 不在白名单的新客户端字段被删除，直到评估后加入名单；期间与最新客户端形状有差
 - 没有 parent/subagent/`thread_source` 树
 - 多段无关 prompt 共享同一 `prompt_cache_key`（出站 session）
 - 跨午夜的长会话继续使用「昨天」的 UUIDv7（接续冻结，滑动 TTL）。这比会话中途换 thread 更可接受
@@ -521,7 +561,7 @@ cargo test -p aether-ai-formats --lib codex
 - 同一 ChatGPT 账号的两把号池 key 共享合成树（也已经共享 `installation_id`）
 - 账号最坏 turn 计数是 `N × M` 而不是 `M`
 
-这就是功能本身。设计内缓解：每日新 UUIDv7（无 freeze 时）、N>1 槽、session==thread、window `:0`、turn-state 只在同一出站 turn 上回带、不泄漏入站 ID、Redis 协商同一 UUID、freeze 未过期则冻结合成身份。v1 不追求「看起来完全像一台真实 Codex」。
+这就是功能本身。设计内缓解：每日新 UUIDv7（无 freeze 时）、N>1 槽、session==thread、window 随该 thread 上游可见的压缩推进、turn-state 只在同一出站 turn 上回带、不泄漏入站 ID、字段白名单、Redis 协商同一 UUID、freeze 未过期则冻结合成身份。v1 不追求「看起来完全像一台真实 Codex」。
 
 **不接受**（实现前必须避免）：
 
@@ -531,7 +571,9 @@ cargo test -p aether-ai-formats --lib codex
 - memory 请求透传入站 UUID，或把 memory 剥成没有任何 thread 的请求
 - 合成开启后仍向上游发 Aether 自补的 `session_id` / `conversation_id` 短头
 - 为新 mint 的出站 turn 回带别的 turn 的 `x-codex-turn-state`
-- 出站仍带 `thread_source` / `subagent_kind`
+- 出站仍带 `subagent_kind` / parent / fork 键，或非 memory 请求的 `thread_source` ≠ `user`
+- 压缩过的合成 thread 仍发 `window_number = 0`，或 `window_id` 与 `window_number` 不一致，或入站 `context_window_id` 透传
+- 白名单之外的键原样上游
 - HTTP 把入站 thread 当 `x-client-request-id` 上游
 - 非法配置静默变成 6/48
 - 握手指纹因出站 ID 变化而打断可复用连接
@@ -634,6 +676,7 @@ planner 侧包装（`ai_serving/planner/standard/codex.rs`，经 `ai_serving/mod
 - `codex_rid_config_invalid`（warn，含 provider_id、error）
 - `codex_rid_store_unavailable`（warn，含 provider_id、selection_fp、error）
 - `codex_rid_chain_freeze_miss`（debug，含 provider_id、selection_fp、inbound_root_hash）
+- `codex_rid_unknown_metadata_key`（每进程每 (surface, key) 首次 warn、之后 debug；含 surface、key、value_type，不含值）——出现即说明客户端带了白名单之外的键，评估后加进 §9.2 名单
 
 日志只带 `selection_fp` 与 hash，不带原始 ID。
 
@@ -683,7 +726,8 @@ cd frontend && npm run type-check
 - 提交在 `custom` 分支，只含本功能相关文件；不带 `docker-compose.yml`、`.env.bak.*`、`.gopath/` 等无关脏改。
 - tag：`backend-v0.7.101`（当前 `backend-v0.7.100` == `1ab530e2b`）。推 tag 触发 CI → ghcr `latest`。
 - `backend-v0.7.102`：code-review 缺陷修复（commit `465a05e7e`，见 §18.11），同样推 tag 触发 CI；线上仍不更新。
-- **不执行 `update.sh`**。线上运行的仍是 v0.7.100 镜像。
+- `backend-v0.7.103`：操作员的 429 failover 修复（`940098abd`，与本功能无关）。操作员于 2026-09-05 自行以此版本更新线上，并按 §17 打开 Codex Pro 号池开关（32 / 256）+ 请求体/响应体捕获，用于 §18.12 的线上验证。
+- `backend-v0.7.104`：codex-tui ≥ 0.153 新字段收敛（见 §18.12），只推 tag 触发 CI；**不执行 `update.sh`**，由操作员决定何时更新。
 - 之后由操作员按 §17 门禁决定是否更新与打开。
 
 ### 18.11 v0.7.102 缺陷修复（code-review）
@@ -694,3 +738,37 @@ cd frontend && npm run type-check
 - **P1 — 跨格式 `prompt_cache_key` 泄漏。** chat（`openai/chat/decision/request.rs:731`）与 family（`family/request.rs:759`）两条跨格式→codex 路径会经 `apply_openai_responses_stable_prompt_cache_key` 注入一个**会话派生的 UUIDv5**，但身份改写此前用 `Surface::Headers`（只改头、不改 body），注入值未重绑即原样上游 → 每个真实 session 在账号上留一个稳定、可数的指纹，重新引入"每账号会话数随真实会话无界增长"的共享特征。修复：两处改传 `Some(&mut provider_request_body)` 并改用 `Surface::HttpResponses`，使 `rewrite_body`（§9 描述的官方默认 `prompt_cache_key = session_id` 分支）把注入的 UUIDv5 重绑为**出站合成 session**。注入与改写同一函数、同一 `provider_request_body` 绑定；`inbound.prompt_cache_key_present` 取自原始客户端请求而非注入后的出站体，故仅在客户端未带 key 时改写，语义精确。
 
 **刻意未改（设计取舍，非缺陷）**：Redis 不可用 → 透传真实身份（fail-open），属可用性/隐私取舍，有 `codex_rid_store_unavailable` 打点可告警，且已文档化于 `resolve_outbound...` 注释；改 fail-closed 会把 Redis 抖动放大成 codex 全线中断，留待操作员决策（§8）。search 位点保持 `Headers`-only——已核实独立 Search 身份走 HTTP 头、不使用 body `client_metadata` 契约（`codex_profile.rs`），无泄漏面。
+
+
+### 18.12 v0.7.104 线上验证、window 模型修订与出站字段白名单
+
+**线上验证（2026-09-05，`backend-v0.7.103`，Codex Pro 号池开启 32/256）**：以 `usage_http_audits.provider_request_headers` + `usage_body_blobs` 对照入站/出站，凡 `thread_id` 已被改写的请求：头部、扁平 `client_metadata`、`x-codex-turn-metadata` blob 三处 session / thread / turn 一致且均为合成值；出站 UUIDv7 `bytes[7]` 缺口全部清零；`prompt_cache_key` 已重绑到合成 session；树形键已剥离；Redis 下 `thread:*` / `turn:*` / `freeze:*` 键按预期 mint；无 `codex_rid_*` warn。开关切换前几分钟的透传流量造成聚合口径上 out_threads > in_threads，按「入站 thread == 出站 thread」拆分后已排除，属预期。
+
+**新发现的盲区（客户端 codex-tui 0.153.x / Codex Desktop 0.153.x，晚于设计所依 codex-rs 基线 357696c5）**：
+
+- **P1 — `window_number` 原样透传。** blob 新增 `window_number`（该 thread 已压缩次数，2026-08-26 加入）。官方 `window_id = format!("{thread_id}:{window_number}")`，真实客户端两者恒一致；我们 `window_id` 恒 `{thread}:0` 而 `window_number` 透传真值，形成真实客户端永不产生的自相矛盾，同时把真实压缩计数泄给上游。
+- **P1 — `context_window_id` 原样透传。** 每个真实（thread, window）一个 UUIDv7（2026-08-21 加入），透传等于给同一合成 thread 下的每个真实会话留一个稳定指纹——与 §18.11 P1 同性质。
+- **P2 — `forked_from_ordinal_exclusive` 未在泄漏键名单**（7 天 29 条），fork 标记漏出；`agent_name` 透传 subagent 路径（`/root/<name>`，7 天 96 条）而 parent 键已剥，形成「有 subagent 路径却没有父线程」的矛盾。
+
+**48h 线上量化（HTTP 审计）**
+
+| 口径 | 数值 |
+|---|---|
+| 请求总数 | 2028 |
+| 已改写到合成 thread 的请求 / 合成 thread 数 | 80 / 1 |
+| 入站 `request_kind` 分布 | turn 1946，prewarm 56，compaction 17，memory 6 |
+| 入站 `window_number > 0` | 1416（70%，最大 673） |
+| 合成 thread 上「`window_id :0` 且透传 `window_number > 0`」 | 80 / 80 |
+| 合成 thread 上已出现的压缩请求 | 1 |
+
+**第一版修复方案（未发布，已否决）**：`window_number` 恒置 0，`context_window_id` 按 thread 派生。否决理由见 §7.3：上游按 thread 看得到每次压缩，「压缩过却停在 window 0」是确定性矛盾；每天 256 turn 却零压缩也是群体离群点；派生 `context_window_id` 与 thread 同毫秒时间戳是弱指纹。
+
+**最终修复（`codex_runtime_identity.rs`，随 `backend-v0.7.104`）**
+
+1. **window 状态按合成 thread 跟踪**（§7.3）：新 Redis 键 `…:window:{T}`，`ThreadWindow { number, context_window_id }`，滑动 TTL；首请求 W=0 并 mint C；入站 `request_kind=compaction` 的请求自身带旧 W/C，随后 CAS 推进到 W+1（C 置空，由下一请求懒 mint，时间戳落在压缩之后）；blob `window_number` / `context_window_id` / `window_id`、扁平与 dash `x-codex-window-id` 全部投影自该状态；memory 恒 `:0`；入站 window 一律忽略。`OutboundCodexRuntimeIdentity` 增加 `window_number` / `context_window_id`；WS 快照只冻结 session / thread，每 step 读 window，store 故障回退快照 window。`context_window_id_for_thread` 删除。
+2. **出站字段白名单**（§9.2）：blob / 扁平 / 前缀头三表面每键归入「改写 / 归一化 / 删除 / 转发」四类，未知键删除并以 `codex_rid_unknown_metadata_key` 上报（首次 warn，之后 debug，不记值）。同时补上 `forked_from_ordinal_exclusive` 删除、`agent_name → /root`、`thread_source → user`（memory 保持 `memory_consolidation`）、`root_turn_id → 出站 turn`（线上根 turn 1908/2032 满足 `root_turn_id == turn_id`）。转发名单含线上确认无害的 Desktop 键 `workspace_kind`。
+3. 单测：`blob_rewrite_follows_thread_window_and_normalizes_tree_keys`、`whitelist_strips_unknown_keys_on_every_surface`、`thread_window_advances_on_compaction_and_mints_context_lazily`；既有 `body_rewrite_keeps_flat_and_blob_consistent` / `memory_blob_drops_identity_but_flat_and_headers_keep_thread` 按新形状调整。
+
+**刻意不做**：白名单不做可配置 UI（改名单即改代码，随 codex-rs 版本走）；不做「压缩响应失败则回滚 window」（需要响应回写，收益是极少数失败压缩的 1 次偏差）；不改合成关闭时的透传路径；不改 thread / turn 槽模型；不给 WS 握手拷贝名单加 `x-codex-routing-hint`（线上 7 天 HTTP 样本中未见该头，且 Aether 模型映射时它会与 body 模型不一致，另议）。
+
+**为何 v1 设计漏掉**：§7.3 只依据 codex-rs 357696c5 基线，`window_number` / `context_window_id` 是之后加入的字段；黑名单式的泄漏键清单必然滞后于客户端加字段。v0.7.104 起以白名单兜底，新字段的默认命运是「删除 + 告警」而不是「透传」。

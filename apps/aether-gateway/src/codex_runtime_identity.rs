@@ -19,7 +19,8 @@
 //!
 //! See `docs/architecture/codex-pool-runtime-identity-synthesis-plan-2026-09-03.md`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_runtime_state::RuntimeState;
@@ -55,7 +56,73 @@ const X_CLIENT_REQUEST_ID: &str = "x-client-request-id";
 const SESSION_ID_HEADER: &str = "session-id";
 const THREAD_ID_HEADER: &str = "thread-id";
 const GUARDIAN_PROMPT_CACHE_PREFIX: &str = "guardian:";
+/// `AgentPath::root()` — the only agent a synthetic root thread ever has.
+const ROOT_AGENT_NAME: &str = "/root";
+/// `ThreadSource::User` — every folded thread presents as a plain user thread.
+const USER_THREAD_SOURCE: &str = "user";
 
+// Outbound field whitelist. Every key a request can carry on a surface falls
+// into exactly one class: rewritten to the synthetic identity, normalized to
+// the root user-thread shape, removed as an inbound-tree marker, or forwarded
+// verbatim. Anything else is unknown: removed and reported once per process
+// as `codex_rid_unknown_metadata_key`, so a new codex-rs field can never leak
+// through unrewritten (the `window_number` / `context_window_id` lesson).
+// Reference: `core/src/responses_metadata.rs` @ codex-rs 07f18d5f.
+
+/// Turn-metadata blob keys rewritten to the synthetic identity. Official
+/// `request_kind=memory` blobs omit all of them. `installation_id` is owned by
+/// the account profile pass and listed only so it is known here.
+const BLOB_IDENTITY_KEYS: &[&str] = &[
+    "installation_id",
+    "session_id",
+    "thread_id",
+    "turn_id",
+    "window_id",
+    "window_number",
+    "context_window_id",
+];
+/// Blob keys normalized instead of removed: `agent_name` → `/root`,
+/// `thread_source` → `user` (memory keeps `memory_consolidation`),
+/// `root_turn_id` → the outbound turn (root turns are their own root).
+const BLOB_NORMALIZED_KEYS: &[&str] = &["agent_name", "thread_source", "root_turn_id"];
+/// Blob keys that only exist on forked / child threads; a root thread never
+/// carries them.
+const BLOB_LEAK_KEYS: &[&str] = &[
+    "forked_from_thread_id",
+    "forked_from_ordinal_exclusive",
+    "parent_thread_id",
+    "parent_turn_id",
+    "subagent_kind",
+];
+/// Blob keys forwarded verbatim (`CodexResponsesMetadata` fields plus the
+/// Desktop `workspace_kind` extra observed in production).
+const BLOB_PASS_KEYS: &[&str] = &[
+    "request_kind",
+    "compaction",
+    "turn_trigger",
+    "sandbox",
+    "sandbox_mode",
+    "auto_review_enabled",
+    "node_repl_auto_review_required",
+    "node_repl_disabled",
+    "workspaces",
+    "workspace_kind",
+    "tool_namespaces_info",
+    "turn_started_at_unix_ms",
+    "history_ingest_requested",
+];
+/// Flat `client_metadata` keys rewritten to the synthetic identity (the
+/// installation id by the profile pass, the blob by the blob pass).
+const FLAT_IDENTITY_KEYS: &[&str] = &[
+    "x-codex-installation-id",
+    "session_id",
+    "thread_id",
+    "turn_id",
+    "root_turn_id",
+    X_CODEX_WINDOW_ID,
+    X_CODEX_TURN_METADATA,
+    X_CODEX_TURN_STATE,
+];
 /// Flat `client_metadata` keys that expose the inbound session tree.
 const FLAT_LEAK_KEYS: &[&str] = &[
     X_CODEX_PARENT_THREAD_ID,
@@ -63,26 +130,40 @@ const FLAT_LEAK_KEYS: &[&str] = &[
     "parent_thread_id",
     "forked_from_thread_id",
     "parent_turn_id",
-    "root_turn_id",
     "subagent_kind",
     "thread_source",
 ];
-/// Turn-metadata blob keys that expose the inbound session tree.
-const BLOB_LEAK_KEYS: &[&str] = &[
-    "forked_from_thread_id",
-    "parent_thread_id",
-    "parent_turn_id",
-    "root_turn_id",
-    "subagent_kind",
-    "thread_source",
+/// Flat keys forwarded verbatim (`client_metadata()` WebSocket extras and the
+/// guardian receipt keys).
+const FLAT_PASS_KEYS: &[&str] = &[
+    "ws_request_header_x_openai_internal_codex_responses_lite",
+    "x-codex-ws-stream-request-start-ms",
+    "guardian_ticket",
+    "guardian_ticket_requested",
 ];
-/// Blob identity keys that official `request_kind=memory` requests omit.
-const BLOB_IDENTITY_KEYS: &[&str] = &[
-    "installation_id",
-    "session_id",
-    "thread_id",
-    "turn_id",
-    "window_id",
+/// Aether's own WebSocket step-control keys are not client metadata.
+const FLAT_CONTROL_PREFIXES: &[&str] = &["sub2api_", "aether."];
+/// Request header prefixes that carry Codex client identity or routing.
+const HEADER_IDENTITY_PREFIXES: &[&str] = &["x-codex-", "x-openai-", "x-oai-", "x-responsesapi-"];
+/// Prefixed headers a real codex-rs client sends and Aether forwards
+/// (rewritten above where they carry identity).
+const HEADER_PASS_KEYS: &[&str] = &[
+    "x-codex-installation-id",
+    X_CODEX_WINDOW_ID,
+    X_CODEX_TURN_METADATA,
+    X_CODEX_TURN_STATE,
+    "x-codex-beta-features",
+    "x-codex-routing-hint",
+    "x-openai-internal-codex-responses-lite",
+    "x-openai-memgen-request",
+    "x-responsesapi-include-timing-metrics",
+];
+/// Prefixed headers removed without a report: tree markers, and attestation
+/// (already dropped by the pool blocklist; must never resurface).
+const HEADER_STRIP_KEYS: &[&str] = &[
+    X_CODEX_PARENT_THREAD_ID,
+    X_OPENAI_SUBAGENT,
+    "x-oai-attestation",
 ];
 /// HTTP compatibility short headers Aether derives from `prompt_cache_key`.
 /// Official Codex HTTP clients never send them.
@@ -291,6 +372,12 @@ impl CodexRuntimeIdentityScope {
         format!("{}:freeze:{inbound_root_hash}", self.key_prefix())
     }
 
+    /// Context-window state of one synthetic thread (not day-scoped: a thread
+    /// keeps its window across day rollovers like a real one).
+    fn window_key(&self, outbound_thread_id: &str) -> String {
+        format!("{}:window:{outbound_thread_id}", self.key_prefix())
+    }
+
     fn turn_freeze_key(&self, inbound_root_hash: &str, inbound_turn_hash: &str) -> String {
         format!(
             "{}:freeze:{inbound_root_hash}:turn:{inbound_turn_hash}",
@@ -449,6 +536,12 @@ impl InboundCodexRuntimeIdentity {
         self.request_kind == Some(CodexRequestKind::Memory)
     }
 
+    /// Local (`/responses`, `request_kind=compaction`) and remote
+    /// (`/responses/compact`) compactions both carry this kind in the blob.
+    pub(crate) fn is_compaction(&self) -> bool {
+        self.request_kind == Some(CodexRequestKind::Compaction)
+    }
+
     fn matches_session(&self, value: &str) -> bool {
         let value = value.trim();
         !value.is_empty()
@@ -490,7 +583,14 @@ pub(crate) enum OutboundTurnSource {
 pub(crate) struct OutboundCodexRuntimeIdentity {
     pub(crate) session_id: String,
     pub(crate) thread_id: String,
+    /// `{thread_id}:{window_number}`; memory requests always project `:0`
+    /// like `memories/write/src/runtime.rs` does.
     pub(crate) window_id: String,
+    /// Compactions upstream has seen on this synthetic thread.
+    pub(crate) window_number: u64,
+    /// UUIDv7 minted when the current window started; `None` only when the
+    /// store could not answer (the blob key is then removed, never leaked).
+    pub(crate) context_window_id: Option<String>,
     pub(crate) turn_id: Option<String>,
     pub(crate) turn_source: OutboundTurnSource,
     pub(crate) inbound_root: String,
@@ -516,6 +616,7 @@ pub(crate) enum CodexRuntimeIdentityResolution {
 struct RootFreeze {
     session_id: String,
     thread_id: String,
+    /// Legacy (`{thread}:0`); the live window is read from `window_key`.
     window_id: String,
     day_id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -533,6 +634,39 @@ impl RootFreeze {
 
     fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+/// Per-thread context window, mirroring codex-rs `AutoCompactWindowIds`: the
+/// real client starts at window 0 with a fresh `Uuid::now_v7()`, and every
+/// compaction (local or remote, both upstream-visible per thread) increments
+/// the number and mints a new context window id. Upstream therefore expects
+/// `window_number == compactions seen on this thread`; a thread that compacts
+/// but never advances would be a shape no real client produces.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct ThreadWindow {
+    #[serde(default)]
+    number: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_window_id: Option<String>,
+}
+
+impl ThreadWindow {
+    fn parse(raw: &str) -> Option<Self> {
+        serde_json::from_str::<Self>(raw).ok()
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+/// `x-codex-window-id` / blob `window_id` projection of a thread window.
+fn window_id_projection(thread_id: &str, window_number: u64, memory: bool) -> String {
+    if memory {
+        format!("{thread_id}:0")
+    } else {
+        format!("{thread_id}:{window_number}")
     }
 }
 
@@ -659,17 +793,14 @@ pub(crate) async fn resolve_outbound_codex_runtime_identity(
         inbound.turn_key()
     };
     let snapshot = ws_snapshot.filter(|snapshot| snapshot.inbound_root == root);
-    match resolve_inner(
-        store,
-        scope,
+    let request = ResolveRequest {
         root,
-        turn_key.as_deref(),
-        inbound.previous_response_id_present,
-        snapshot,
-        now,
-    )
-    .await
-    {
+        turn_key: turn_key.as_deref(),
+        chained: inbound.previous_response_id_present,
+        memory: inbound.is_memory(),
+        compaction: inbound.is_compaction(),
+    };
+    match resolve_inner(store, scope, &request, snapshot, now).await {
         Ok(outbound) => CodexRuntimeIdentityResolution::Rewrite(outbound),
         Err(error) => {
             warn!(
@@ -689,6 +820,11 @@ pub(crate) async fn resolve_outbound_codex_runtime_identity(
                 Some(snapshot) => {
                     let mut outbound = snapshot.clone();
                     outbound.inbound_turn_key = turn_key;
+                    outbound.window_id = window_id_projection(
+                        &snapshot.thread_id,
+                        snapshot.window_number,
+                        inbound.is_memory(),
+                    );
                     if inbound.is_memory() {
                         outbound.turn_id = None;
                         outbound.turn_source = OutboundTurnSource::None;
@@ -703,15 +839,34 @@ pub(crate) async fn resolve_outbound_codex_runtime_identity(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ResolveRequest<'a> {
+    root: &'a str,
+    turn_key: Option<&'a str>,
+    /// `previous_response_id` present: continue the root's last turn on a
+    /// per-turn freeze miss.
+    chained: bool,
+    /// `request_kind=memory`: no turn, window projected as `:0`.
+    memory: bool,
+    /// `request_kind=compaction`: this request carries the current window and
+    /// the thread's window advances for every request after it.
+    compaction: bool,
+}
+
 async fn resolve_inner(
     store: &CodexRuntimeIdentityStore<'_>,
     scope: &CodexRuntimeIdentityScope,
-    root: &str,
-    turn_key: Option<&str>,
-    chained: bool,
+    request: &ResolveRequest<'_>,
     snapshot: Option<&OutboundCodexRuntimeIdentity>,
     now: SystemTime,
 ) -> Result<OutboundCodexRuntimeIdentity, String> {
+    let ResolveRequest {
+        root,
+        turn_key,
+        chained,
+        memory,
+        compaction,
+    } = *request;
     let day_id = scope.day_id(now);
     let ttl = scope.ttl(now);
     let root_hash = hash16(root);
@@ -740,10 +895,13 @@ async fn resolve_inner(
                 .await?
             }
         };
+        let window = resolve_window(store, scope, &snapshot.thread_id, compaction, ttl, now).await?;
         return Ok(OutboundCodexRuntimeIdentity {
             session_id: snapshot.session_id.clone(),
             thread_id: snapshot.thread_id.clone(),
-            window_id: snapshot.window_id.clone(),
+            window_id: window_id_projection(&snapshot.thread_id, window.number, memory),
+            window_number: window.number,
+            context_window_id: window.context_window_id,
             turn_id,
             turn_source,
             inbound_root: root.to_string(),
@@ -815,15 +973,83 @@ async fn resolve_inner(
         }
     };
 
+    let window = resolve_window(store, scope, &freeze.thread_id, compaction, ttl, now).await?;
     Ok(OutboundCodexRuntimeIdentity {
         session_id: freeze.session_id,
+        window_id: window_id_projection(&freeze.thread_id, window.number, memory),
+        window_number: window.number,
+        context_window_id: window.context_window_id,
         thread_id: freeze.thread_id,
-        window_id: freeze.window_id,
         turn_id,
         turn_source,
         inbound_root: root.to_string(),
         inbound_turn_key: turn_key.map(str::to_string),
     })
+}
+
+/// Reads (and lazily initializes) the synthetic thread's context window, then
+/// advances it when this request is a compaction.
+///
+/// * A window whose `context_window_id` is still unset (thread just minted, or
+///   the previous request was a compaction) mints one `now`: like the real
+///   client, the new window id is timestamped after the compaction finished,
+///   not together with the thread.
+/// * The compaction request itself still carries the current window; the
+///   advance is a compare-and-set to `number + 1` with no context id, so the
+///   next request on the thread mints it. A concurrent writer wins silently.
+/// * Sliding TTL like the root freeze; an active thread never regresses.
+async fn resolve_window(
+    store: &CodexRuntimeIdentityStore<'_>,
+    scope: &CodexRuntimeIdentityScope,
+    outbound_thread_id: &str,
+    compaction: bool,
+    ttl: Duration,
+    now: SystemTime,
+) -> Result<ThreadWindow, String> {
+    let key = scope.window_key(outbound_thread_id);
+    let mut raw = store.get(&key).await?;
+    let mut window = raw
+        .as_deref()
+        .and_then(ThreadWindow::parse)
+        .unwrap_or_default();
+    if window.context_window_id.is_none() {
+        let mut minted = window.clone();
+        minted.context_window_id = Some(uuid_v7_at(unix_millis(now)));
+        let minted_raw = minted.to_json();
+        let won = match raw.as_deref() {
+            None => store.set_if_absent(&key, &minted_raw, ttl).await?,
+            Some(current) => store.set_if_value(&key, current, &minted_raw, ttl).await?,
+        };
+        if won {
+            window = minted;
+            raw = Some(minted_raw);
+        } else {
+            match store.get(&key).await? {
+                Some(existing) => {
+                    window = ThreadWindow::parse(&existing).unwrap_or(minted);
+                    raw = Some(existing);
+                }
+                None => {
+                    window = minted;
+                    raw = Some(minted_raw);
+                }
+            }
+        }
+    } else if let Some(current) = raw.as_deref() {
+        let _ = store.expire_if_value(&key, current, ttl).await?;
+    }
+    if compaction {
+        if let Some(current) = raw.as_deref() {
+            let advanced = ThreadWindow {
+                number: window.number.saturating_add(1),
+                context_window_id: None,
+            };
+            let _ = store
+                .set_if_value(&key, current, &advanced.to_json(), ttl)
+                .await?;
+        }
+    }
+    Ok(window)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -907,7 +1133,9 @@ pub(crate) enum CodexRuntimeIdentitySurface {
 ///
 /// Only existing keys are rewritten; missing keys are never added (the
 /// official blob shape depends on `request_kind`). Inbound-tree keys
-/// (parent / fork / subagent / `thread_source` / `subagent_kind`) are removed.
+/// (parent / fork / subagent) are removed, `agent_name` / `thread_source` /
+/// `root_turn_id` are normalized to the root user-thread shape, and any key
+/// outside the per-surface whitelist is removed and reported.
 pub(crate) fn apply_outbound_codex_runtime_identity(
     headers: &mut BTreeMap<String, String>,
     body: Option<&mut Value>,
@@ -963,11 +1191,10 @@ fn rewrite_headers(
             headers.insert(name, rewritten);
         }
     }
-    remove_header(headers, X_CODEX_PARENT_THREAD_ID);
-    remove_header(headers, X_OPENAI_SUBAGENT);
     if !outbound.forwards_turn_state() {
         remove_header(headers, X_CODEX_TURN_STATE);
     }
+    retain_known_headers(headers);
     // Aether-derived short headers would be a 16-hex fingerprint of the real
     // session. Official HTTP clients never send them; explicit inbound values
     // are the client's own business and stay.
@@ -1014,9 +1241,14 @@ fn rewrite_body(
     set_if_present(client_metadata, "thread_id", &outbound.thread_id);
     set_if_present(client_metadata, X_CODEX_WINDOW_ID, &outbound.window_id);
     match outbound.turn_id.as_deref() {
-        Some(turn_id) => set_if_present(client_metadata, "turn_id", turn_id),
+        Some(turn_id) => {
+            set_if_present(client_metadata, "turn_id", turn_id);
+            // A root turn is its own root.
+            set_if_present(client_metadata, "root_turn_id", turn_id);
+        }
         None => {
             client_metadata.remove("turn_id");
+            client_metadata.remove("root_turn_id");
         }
     }
     for key in FLAT_LEAK_KEYS {
@@ -1028,6 +1260,7 @@ fn rewrite_body(
     if !outbound.forwards_turn_state() {
         client_metadata.remove(X_CODEX_TURN_STATE);
     }
+    retain_known_keys(client_metadata, "client_metadata", flat_key_known);
 }
 
 /// Rewrites a serialized `x-codex-turn-metadata` blob (header or
@@ -1062,23 +1295,162 @@ fn rewrite_codex_turn_metadata_object(
     let memory = non_empty_str(object.get("request_kind")).map(CodexRequestKind::parse)
         == Some(CodexRequestKind::Memory);
     if memory {
-        // Official memory blobs carry no installation/session/thread/turn/window.
+        // Official memory blobs carry no installation/session/thread/turn/
+        // root_turn/window/window_number/context_window_id.
         for key in BLOB_IDENTITY_KEYS {
             object.remove(*key);
         }
+        object.remove("root_turn_id");
     } else {
         set_if_present(object, "session_id", &outbound.session_id);
         set_if_present(object, "thread_id", &outbound.thread_id);
         set_if_present(object, "window_id", &outbound.window_id);
+        // codex-tui >= 0.153: `window_id == "{thread}:{window_number}"` and one
+        // `context_window_id` per (thread, window). Both follow the synthetic
+        // thread's own window state; the inbound values never pass through.
+        if object.contains_key("window_number") {
+            object.insert(
+                "window_number".to_string(),
+                Value::from(outbound.window_number),
+            );
+        }
+        if object.contains_key("context_window_id") {
+            match outbound.context_window_id.as_deref() {
+                Some(context_window_id) => {
+                    object.insert(
+                        "context_window_id".to_string(),
+                        Value::String(context_window_id.to_string()),
+                    );
+                }
+                None => {
+                    object.remove("context_window_id");
+                }
+            }
+        }
         match outbound.turn_id.as_deref() {
             Some(turn_id) => set_if_present(object, "turn_id", turn_id),
             None => {
                 object.remove("turn_id");
             }
         }
+        // Folded subagent / feature threads present as the root user thread,
+        // whose root turn is the turn itself.
+        set_if_present(object, "agent_name", ROOT_AGENT_NAME);
+        set_if_present(object, "thread_source", USER_THREAD_SOURCE);
+        match outbound.turn_id.as_deref() {
+            Some(turn_id) => set_if_present(object, "root_turn_id", turn_id),
+            None => {
+                object.remove("root_turn_id");
+            }
+        }
     }
     for key in BLOB_LEAK_KEYS {
         object.remove(*key);
+    }
+    retain_known_keys(object, "turn_metadata", blob_key_known);
+}
+
+// ---------------------------------------------------------------------------
+// Whitelist
+// ---------------------------------------------------------------------------
+
+fn blob_key_known(key: &str) -> bool {
+    [
+        BLOB_IDENTITY_KEYS,
+        BLOB_NORMALIZED_KEYS,
+        BLOB_LEAK_KEYS,
+        BLOB_PASS_KEYS,
+    ]
+    .iter()
+    .any(|set| set.contains(&key))
+}
+
+fn flat_key_known(key: &str) -> bool {
+    [FLAT_IDENTITY_KEYS, FLAT_LEAK_KEYS, FLAT_PASS_KEYS]
+        .iter()
+        .any(|set| set.contains(&key))
+        || FLAT_CONTROL_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+}
+
+/// Removes every key the whitelist does not know and reports it (name and
+/// JSON type only; values are never logged).
+fn retain_known_keys(
+    object: &mut Map<String, Value>,
+    surface: &'static str,
+    known: fn(&str) -> bool,
+) {
+    let unknown = object
+        .keys()
+        .filter(|key| !known(key))
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in unknown {
+        let value_type = object.get(&key).map(json_type_name).unwrap_or("null");
+        report_unknown_metadata_key(surface, &key, value_type);
+        object.remove(&key);
+    }
+}
+
+/// Request headers under the Codex identity prefixes: forward the known real
+/// client set, drop tree markers silently, drop and report everything else.
+fn retain_known_headers(headers: &mut BTreeMap<String, String>) {
+    let names = headers.keys().cloned().collect::<Vec<_>>();
+    for name in names {
+        let lower = name.trim().to_ascii_lowercase();
+        if !HEADER_IDENTITY_PREFIXES
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+            || HEADER_PASS_KEYS.contains(&lower.as_str())
+        {
+            continue;
+        }
+        if !HEADER_STRIP_KEYS.contains(&lower.as_str()) {
+            report_unknown_metadata_key("header", &lower, "string");
+        }
+        headers.remove(&name);
+    }
+}
+
+/// `warn` on the first sighting of a (surface, key) per process, `debug`
+/// afterwards, so a new client field is visible without flooding the log.
+fn report_unknown_metadata_key(surface: &'static str, key: &str, value_type: &'static str) {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let first_sighting = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut seen| seen.insert(format!("{surface}\0{key}")))
+        .unwrap_or(true);
+    if first_sighting {
+        warn!(
+            event_name = "codex_rid_unknown_metadata_key",
+            log_type = "event",
+            surface,
+            key,
+            value_type,
+            "unknown codex client metadata key removed from the synthetic outbound request; add it to the whitelist if benign"
+        );
+    } else {
+        debug!(
+            event_name = "codex_rid_unknown_metadata_key",
+            log_type = "event",
+            surface,
+            key,
+            value_type,
+            "unknown codex client metadata key removed"
+        );
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -1101,7 +1473,13 @@ fn rewrite_codex_turn_metadata_object(
 /// structurally impossible shape and give the whole account away. We reproduce
 /// the gap so the outbound IDs are indistinguishable from genuine codex output.
 pub(crate) fn uuid_v7_at(unix_ms: u64) -> String {
-    let random = *Uuid::new_v4().as_bytes();
+    uuid_v7_from_parts(unix_ms, Uuid::new_v4().as_bytes())
+}
+
+/// Lays out a UUIDv7 from a 48-bit millisecond timestamp and 16 bytes of
+/// entropy (only bytes 6..16 are used). Single source of the byte shape so every
+/// synthetic ID, random or derived, carries the same version/variant/gap bits.
+fn uuid_v7_from_parts(unix_ms: u64, random: &[u8; 16]) -> String {
     let mut bytes = [0u8; 16];
     bytes[..6].copy_from_slice(&unix_ms.to_be_bytes()[2..8]);
     bytes[6] = 0x70 | (random[6] & 0x0F);
@@ -1205,6 +1583,11 @@ mod tests {
 
     const PROVIDER: &str = "prov-1";
     const SELECTION: &str = "codex:account:acc-a";
+    const FIXTURE_CONTEXT_WINDOW: &str = "0199094e-7b2b-7000-8000-0123456789ab";
+
+    fn v7_millis(id: &str) -> u64 {
+        u64::from_str_radix(&id.replace('-', "")[..12], 16).unwrap()
+    }
 
     fn memory_state() -> RuntimeState {
         RuntimeState::memory(MemoryRuntimeStateConfig::default())
@@ -1277,6 +1660,8 @@ mod tests {
             session_id: "out-thread".to_string(),
             thread_id: "out-thread".to_string(),
             window_id: "out-thread:0".to_string(),
+            window_number: 0,
+            context_window_id: Some(FIXTURE_CONTEXT_WINDOW.to_string()),
             turn_id: turn.map(str::to_string),
             turn_source: source,
             inbound_root: "in-session".to_string(),
@@ -1981,6 +2366,7 @@ mod tests {
         for key in FLAT_LEAK_KEYS {
             assert!(!meta.contains_key(*key), "{key} leaked");
         }
+        assert_eq!(meta["root_turn_id"], "out-turn", "root turn is its own root");
         assert!(!meta.contains_key("x-codex-turn-state"));
         let raw = meta["x-codex-turn-metadata"].as_str().unwrap();
         assert!(raw.is_ascii(), "{raw}");
@@ -1992,6 +2378,7 @@ mod tests {
         assert_eq!(blob["window_id"], "out-thread:0");
         assert_eq!(blob["sandbox"], "workspace-write");
         assert_eq!(blob["workspaces"][0], "/tmp/项目");
+        assert_eq!(blob["thread_source"], "user", "folded thread presents as user");
         for key in BLOB_LEAK_KEYS {
             assert!(blob.get(*key).is_none(), "{key} leaked");
         }
@@ -2111,7 +2498,10 @@ mod tests {
         assert!(!meta.contains_key("turn_id"));
         let blob: Value =
             serde_json::from_str(meta["x-codex-turn-metadata"].as_str().unwrap()).unwrap();
-        assert_eq!(blob, json!({ "request_kind": "memory" }));
+        assert_eq!(
+            blob,
+            json!({ "request_kind": "memory", "thread_source": "memory_consolidation" })
+        );
     }
 
     #[test]
@@ -2151,6 +2541,252 @@ mod tests {
             body["client_metadata"]["x-codex-turn-metadata"],
             json!({ "thread_id": "out-thread" })
         );
+    }
+
+    #[test]
+    fn blob_rewrite_follows_thread_window_and_normalizes_tree_keys() {
+        // codex-tui >= 0.153 fields follow the synthetic thread's own window
+        // state: `window_id == "{thread}:{window_number}"` and one context
+        // window id per (thread, window). Inbound values never pass through.
+        let mut outbound = outbound_fixture(Some("out-turn"), OutboundTurnSource::Frozen);
+        outbound.window_number = 3;
+        outbound.window_id = "out-thread:3".to_string();
+        let rewritten = rewrite_codex_turn_metadata_string(
+            r#"{"session_id":"in","thread_id":"in","turn_id":"t","window_id":"in:71","window_number":71,"context_window_id":"01a06ee4-8a47-79a0-b871-dfca8c798e84","request_kind":"turn","agent_name":"/root/final_check","thread_source":"subagent","root_turn_id":"other","forked_from_ordinal_exclusive":4,"workspace_kind":"project","model":"gpt-5","compaction":{"phase":"mid_turn"}}"#,
+            &outbound,
+        )
+        .unwrap();
+        let blob: Value = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(blob["window_id"], "out-thread:3");
+        assert_eq!(blob["window_number"], 3);
+        assert_eq!(blob["context_window_id"], FIXTURE_CONTEXT_WINDOW);
+        assert_eq!(blob["agent_name"], "/root");
+        assert_eq!(blob["thread_source"], "user");
+        assert_eq!(blob["root_turn_id"], "out-turn");
+        assert!(blob.get("forked_from_ordinal_exclusive").is_none(), "fork leaked");
+        assert_eq!(blob["workspace_kind"], "project", "known extra kept");
+        assert_eq!(blob["compaction"]["phase"], "mid_turn");
+        assert!(blob.get("model").is_none(), "unknown key must be stripped");
+        assert!(!rewritten.contains("01a06ee4"), "real context window leaked");
+
+        // Store outage on a fresh thread: no context id → key removed, not leaked.
+        outbound.context_window_id = None;
+        let degraded = rewrite_codex_turn_metadata_string(
+            r#"{"thread_id":"in","window_number":2,"context_window_id":"x","request_kind":"turn"}"#,
+            &outbound,
+        )
+        .unwrap();
+        let degraded: Value = serde_json::from_str(&degraded).unwrap();
+        assert_eq!(degraded["window_number"], 3);
+        assert!(degraded.get("context_window_id").is_none());
+
+        // Never added when absent (older clients).
+        let older = rewrite_codex_turn_metadata_string(
+            r#"{"session_id":"in","thread_id":"in","window_id":"in:2"}"#,
+            &outbound,
+        )
+        .unwrap();
+        let older: Value = serde_json::from_str(&older).unwrap();
+        assert_eq!(older["window_id"], "out-thread:3");
+        assert!(older.get("window_number").is_none());
+        assert!(older.get("context_window_id").is_none());
+
+        // Memory blobs: no identity and no window keys at all.
+        let memory = rewrite_codex_turn_metadata_string(
+            r#"{"request_kind":"memory","thread_id":"in","window_number":5,"context_window_id":"x","root_turn_id":"r"}"#,
+            &outbound,
+        )
+        .unwrap();
+        let memory: Value = serde_json::from_str(&memory).unwrap();
+        assert_eq!(memory, json!({ "request_kind": "memory" }));
+    }
+
+    #[test]
+    fn whitelist_strips_unknown_keys_on_every_surface() {
+        let inbound = inbound("in-session", "in-thread", Some("in-turn"));
+        let outbound = outbound_fixture(Some("out-turn"), OutboundTurnSource::Frozen);
+        let mut body = json!({
+            "client_metadata": {
+                "session_id": "in-session",
+                "thread_id": "in-thread",
+                "turn_id": "in-turn",
+                "guardian_ticket_requested": "true",
+                "ws_request_header_x_openai_internal_codex_responses_lite": "true",
+                "sub2api_step_correlation_id": "corr",
+                "x-codex-brand-new-flat-key": "leak",
+                "x-codex-turn-metadata": json!({
+                    "thread_id": "in-thread",
+                    "request_kind": "turn",
+                    "reasoning_effort": "high"
+                }).to_string()
+            }
+        });
+        let mut headers = btree(&[
+            ("x-codex-beta-features", "a,b"),
+            ("x-codex-routing-hint", "model=gpt-5;tier=x"),
+            ("x-openai-internal-codex-responses-lite", "true"),
+            ("X-Codex-Brand-New-Header", "leak"),
+            ("x-oai-attestation", "att"),
+            ("openai-beta", "responses_websockets=2026-02-06"),
+            ("session-id", "in-session"),
+        ]);
+        apply_outbound_codex_runtime_identity(
+            &mut headers,
+            Some(&mut body),
+            None,
+            &inbound,
+            &outbound,
+            CodexRuntimeIdentitySurface::HttpResponses,
+        );
+        let meta = body["client_metadata"].as_object().unwrap();
+        assert_eq!(meta["guardian_ticket_requested"], "true");
+        assert_eq!(
+            meta["ws_request_header_x_openai_internal_codex_responses_lite"],
+            "true"
+        );
+        assert_eq!(meta["sub2api_step_correlation_id"], "corr");
+        assert!(!meta.contains_key("x-codex-brand-new-flat-key"));
+        let blob: Value =
+            serde_json::from_str(meta["x-codex-turn-metadata"].as_str().unwrap()).unwrap();
+        assert_eq!(blob, json!({ "thread_id": "out-thread", "request_kind": "turn" }));
+        assert_eq!(headers["x-codex-beta-features"], "a,b");
+        assert_eq!(headers["x-codex-routing-hint"], "model=gpt-5;tier=x");
+        assert_eq!(headers["x-openai-internal-codex-responses-lite"], "true");
+        assert_eq!(headers["openai-beta"], "responses_websockets=2026-02-06");
+        assert_eq!(headers["session-id"], "out-thread");
+        assert!(!headers.contains_key("X-Codex-Brand-New-Header"));
+        assert!(!headers.contains_key("x-oai-attestation"));
+        assert!(!body.to_string().contains("leak"));
+    }
+
+    #[tokio::test]
+    async fn thread_window_advances_on_compaction_and_mints_context_lazily() {
+        let state = memory_state();
+        let store = CodexRuntimeIdentityStore::new(&state);
+        let s = scope(1, 64);
+        let t0 = at(1_756_857_600);
+
+        // Window 0: context id minted with the first request on the thread.
+        let first = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s", "t", Some("u1")),
+                None,
+                t0,
+            )
+            .await,
+        );
+        let thread = first.thread_id.clone();
+        assert_eq!(first.window_number, 0);
+        assert_eq!(first.window_id, format!("{thread}:0"));
+        let ctx0 = first.context_window_id.clone().expect("context minted");
+        assert!(is_uuid_v7(&ctx0));
+        assert_eq!(v7_millis(&ctx0), 1_756_857_600_000);
+        assert_ne!(ctx0, thread);
+
+        // Stable across requests of the same window.
+        let again = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s", "t", Some("u2")),
+                None,
+                at(1_756_857_650),
+            )
+            .await,
+        );
+        assert_eq!(again.thread_id, thread);
+        assert_eq!(again.window_number, 0);
+        assert_eq!(again.context_window_id.as_deref(), Some(ctx0.as_str()));
+
+        // The compaction request itself still carries window 0 ...
+        let mut compaction = inbound("s", "t", Some("u3"));
+        compaction.request_kind = Some(CodexRequestKind::Compaction);
+        let during = rewrite(
+            resolve_outbound_codex_runtime_identity(&store, &s, &compaction, None, at(1_756_857_700))
+                .await,
+        );
+        assert_eq!(during.window_number, 0);
+        assert_eq!(during.window_id, format!("{thread}:0"));
+        assert_eq!(during.context_window_id.as_deref(), Some(ctx0.as_str()));
+        // ... and leaves the thread on window 1 without a context id yet.
+        let stored = state.kv_get(&s.window_key(&thread)).await.unwrap().unwrap();
+        assert_eq!(ThreadWindow::parse(&stored).unwrap(), ThreadWindow { number: 1, context_window_id: None });
+
+        // Next request on the thread: window 1, new context id timestamped now.
+        let after = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s", "t", Some("u4")),
+                None,
+                at(1_756_857_760),
+            )
+            .await,
+        );
+        assert_eq!(after.window_number, 1);
+        assert_eq!(after.window_id, format!("{thread}:1"));
+        let ctx1 = after.context_window_id.clone().expect("context minted");
+        assert!(is_uuid_v7(&ctx1));
+        assert_ne!(ctx1, ctx0);
+        assert_eq!(v7_millis(&ctx1), 1_756_857_760_000);
+
+        // Another real session folded onto the same thread sees the same window
+        // (one thread, one window), and a memory request projects `:0` anyway.
+        let other = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s2", "t2", Some("v1")),
+                None,
+                at(1_756_857_800),
+            )
+            .await,
+        );
+        assert_eq!(other.thread_id, thread);
+        assert_eq!(other.window_number, 1);
+        assert_eq!(other.context_window_id.as_deref(), Some(ctx1.as_str()));
+        let mut memory = inbound("s", "t", None);
+        memory.request_kind = Some(CodexRequestKind::Memory);
+        let memory = rewrite(
+            resolve_outbound_codex_runtime_identity(&store, &s, &memory, None, at(1_756_857_810))
+                .await,
+        );
+        assert_eq!(memory.window_number, 1);
+        assert_eq!(memory.window_id, format!("{thread}:0"));
+        assert_eq!(memory.turn_id, None);
+
+        // WS snapshot taken at window 0 keeps session/thread but reads the live
+        // window per step; a store outage falls back to the snapshot's window.
+        let step = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s", "t", Some("u1")),
+                Some(&first),
+                at(1_756_857_820),
+            )
+            .await,
+        );
+        assert_eq!(step.thread_id, thread);
+        assert_eq!(step.window_number, 1);
+        assert_eq!(step.window_id, format!("{thread}:1"));
+        assert_eq!(step.turn_source, OutboundTurnSource::Snapshot);
+        let unavailable = CodexRuntimeIdentityStore::unavailable(&state);
+        let degraded = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &unavailable,
+                &s,
+                &inbound("s", "t", Some("u1")),
+                Some(&first),
+                at(1_756_857_830),
+            )
+            .await,
+        );
+        assert_eq!(degraded.window_number, 0);
+        assert_eq!(degraded.window_id, format!("{thread}:0"));
+        assert_eq!(degraded.context_window_id.as_deref(), Some(ctx0.as_str()));
     }
 
     #[test]
