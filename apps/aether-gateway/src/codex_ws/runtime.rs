@@ -3172,7 +3172,6 @@ fn materialize_codex_ws_step_body(
         apply_outbound_codex_runtime_identity(
             &mut BTreeMap::new(),
             Some(&mut body),
-            None,
             &identity.inbound,
             &identity.outbound,
             CodexRuntimeIdentitySurface::WsStepBody,

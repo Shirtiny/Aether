@@ -1,6 +1,6 @@
 # Codex 号池出站 Session / Thread / Turn 合成与复用计划
 
-> Status: **Implemented（第四稿）— 已在 `custom` 分支落地，随 `backend-v0.7.101` 交付；`backend-v0.7.102` 为其 code-review 缺陷修复（UUIDv7 ContextV7 缺口 + chat/family 跨格式 `prompt_cache_key` 泄漏，见 §18.11）；`backend-v0.7.104` 把 window 改为按合成 thread 跟踪压缩次数（`window_number` / `context_window_id` / `window_id` 随压缩推进）并加入出站字段白名单（见 §7.3、§9.2、§18.12）。操作员已于 2026-09-05 自行把线上更新到 `backend-v0.7.103` 并在 Codex Pro 号池打开开关（32 thread / 256 turn），线上验证见 §18.12**
+> Status: **Implemented（第四稿）— 已在 `custom` 分支落地，随 `backend-v0.7.101` 交付；`backend-v0.7.102` 为其 code-review 缺陷修复（UUIDv7 ContextV7 缺口 + chat/family 跨格式 `prompt_cache_key` 泄漏，见 §18.11）；`backend-v0.7.104` 把 window 改为按合成 thread 跟踪压缩次数（`window_number` / `context_window_id` / `window_id` 随压缩推进）并加入出站字段白名单（见 §7.3、§9.2、§18.12）。操作员已于 2026-09-05 自行把线上更新到 `backend-v0.7.103` 并在 Codex Pro 号池打开开关（32 thread / 256 turn），线上验证见 §18.12；`backend-v0.7.105` 依 .104 上线后的风控复核修订短头与 `x-client-request-id` 规则（§9.1、§18.13），并对不带任何 codex 元数据的 `/responses` 请求按内容合成 root / turn 并物化官方形状、补齐被中转剥掉的官方头、剥离 `x-trace-id`（§18.14）**
 > Date: 2026-09-03
 > Scope: Codex OAuth 号池在选号之后，按账号、按日合成并复用上游可见的 `session_id` / `thread_id` / `turn_id` / `window_id`
 > Production changes: **本轮不更新线上。** 只提交代码并推送 `backend-v0.7.101` / `backend-v0.7.102` / `backend-v0.7.104` tag 触发 CI 构建镜像；**不执行 `update.sh`**，运行中的容器由操作员决定何时更新（当前 `backend-v0.7.103`，尚不含 §18.12 修复），功能缺省关闭
@@ -257,7 +257,7 @@ Aether 今天不解析 `request_kind`（代码里没有该键的读取）。实�
 
 不要解析或改写 `instructions` / `input` / `<environment_context>`。
 
-HTTP 兼容短头 `session_id` / `conversation_id`（`prompt_cache_key` SHA-256 前 8 字节的 16 hex）不是官方运行时身份，官方 HTTP 客户端根本不发它们（`codex-api/src/requests/headers.rs` 只有 `session-id` / `thread-id`）。WS 握手已经排除它们。不要用它们当映射输入。今天它们由 `apply_codex_openai_responses_special_headers`（`decision/request.rs:893`）在缺失时从 **入站** `prompt_cache_key` 派生，且该步骤在 profile apply（`:902`）之前；若身份改写放在 profile 之后而不处理短头，上游会收到与真实 session 一一对应的 16 hex 指纹。规则：合成开启且有入站 root 时，**删除** Aether 自补的这两个短头（官方形状）；入站显式带来的短头保留。备选是按出站 cache key 重算，但没有理由保留一个官方不发的头。
+HTTP 兼容短头 `session_id` / `conversation_id`（`prompt_cache_key` SHA-256 前 8 字节的 16 hex）不是官方运行时身份，官方 HTTP 客户端根本不发它们（`codex-api/src/requests/headers.rs` 只有 `session-id` / `thread-id`）。WS 握手已经排除它们。不要用它们当映射输入。今天它们由 `apply_codex_openai_responses_special_headers`（`decision/request.rs:893`）在缺失时从 **入站** `prompt_cache_key` 派生，且该步骤在 profile apply（`:902`）之前；若身份改写放在 profile 之后而不处理短头，上游会收到与真实 session 一一对应的 16 hex 指纹。规则：合成开启且有入站 root 时，**删除** 这两个短头，不论是 Aether 自补还是入站显式带来（v0.7.105 前保留入站显式值；.104 线上复核发现下游中转会把 `session_id` 短头设成真实 thread 并原样到达上游，见 §18.13）。备选是按出站 cache key 重算，但没有理由保留一个官方不发的头。
 
 ### 7.5 接续冻结（`previous_response_id` 与跨路径快照）
 
@@ -359,7 +359,7 @@ key 构造函数放在新模块 `codex_runtime_identity.rs` 内（与 sticky 的
 | `chatgpt-account-id` | 仍是选中 key 的 auth，不碰 |
 | `installation_id` | 仍是 profile 所有，不由本功能生成 |
 | `previous_response_id` | HTTP Codex 继续剥；WS 经 fence 后原样转发 |
-| 短头 `session_id` / `conversation_id` | 合成开启且有入站 root：删除 Aether 自补值；入站显式值保留（7.4） |
+| 短头 `session_id` / `conversation_id` | 合成开启且有入站 root：一律删除，不论来源（7.4；v0.7.105） |
 
 `turn_started_at_unix_ms`、`sandbox*`、`workspaces`、`tool_namespaces_info`、`compaction`、`request_kind`：v1 原样保留（memory 的 blob 形状见 7.2）。Aether 今天不读 `request_kind`，需新增解析（11 节）。不要重写 `turn_started_at_unix_ms` 去「对齐」UUIDv7 时间戳。
 
@@ -369,9 +369,9 @@ key 构造函数放在新模块 `codex_runtime_identity.rs` 内（与 sticky 的
 
 | 入站值 | 出站 |
 |---|---|
-| 缺失 | WS：写出站 `thread_id`。HTTP：保持现有「填 trace」行为，**不要**为了合成去新写 thread_id（避免把非 Codex HTTP 客户端改成官方形状） |
+| 缺失 | WS：写出站 `thread_id`。HTTP：special-headers 先填 Aether request id，随后被身份改写成出站 `thread_id`（只改写已存在的头，不新增） |
 | 等于入站 `thread_id` 或入站 `session_id`（大小写敏感，去空白后全等） | 改写成出站 `thread_id` |
-| 其它显式值（trace UUID、Aether request id 等） | 保留 |
+| 其它显式值（trace UUID、Aether request id 等） | v0.7.105 起同样改写成出站 `thread_id`：官方 HTTP（`codex-api/src/endpoint/responses.rs`）与 WS（`core/src/client.rs`）都恒写 thread_id；.104 线上复核 188/188 合成请求带的是 Aether 随机 request id，是 100% 确定性偏差（§18.13） |
 
 WS `official_request` **始终** 写 `x-client-request-id = outbound.thread_id`（官方 WS 契约），不管入站是什么。
 
@@ -501,9 +501,9 @@ HTTP planner 今天对 dash `session-id` / `thread-id` / `x-codex-window-id` 没
 - **同一入站 root 跨日 / 重连：root freeze 命中则 session/thread 不换；同一入站 turn 跨午夜 per-turn freeze 命中则 turn 不换；freeze miss 时按槽 mint，不透传入站**
 - WS：`previous_response_id` 只在同一候选快照上被接受（fence 不变），该快照上所有步骤出站 session/thread/turn 相同
 - **WS freeze + HTTP compact：同一入站 root、同一 `selection_fp` 得到同一出站 session/thread**
-- HTTP `x-client-request-id` 等于入站 thread/session 时改写出站 thread；其它 trace 保留
+- HTTP `x-client-request-id` 存在时一律改写为出站 thread（v0.7.105；此前只改等于入站 ID 的值）
 - `request_kind=memory`：blob 无 installation/session/thread/turn/window；dash 头与扁平 metadata 带合成 thread 的 session/thread/window；任何投影无 `turn_id`；不是透传入站值
-- 合成开启时 Aether 自补短头 `session_id` / `conversation_id` 不再出现；入站显式短头保留
+- 合成开启时短头 `session_id` / `conversation_id` 不再出现，不论 Aether 自补还是入站显式（v0.7.105）
 - turn-state：出站 turn 来自候选快照 / per-turn freeze 时转发，新 mint 时剥离
 - freeze 滑动 TTL：命中后 TTL 被刷新；槽位键不刷新
 - 非法 JSON：写路径拒绝；读路径关闭合成，不出现 6/48
@@ -569,12 +569,12 @@ cargo test -p aether-ai-formats --lib codex
 - 同一入站 root 在 HTTP compact / WS / 重连 / 跨日之间换 thread（freeze 未过期时）
 - freeze miss 时透传入站身份
 - memory 请求透传入站 UUID，或把 memory 剥成没有任何 thread 的请求
-- 合成开启后仍向上游发 Aether 自补的 `session_id` / `conversation_id` 短头
+- 合成开启后仍向上游发 `session_id` / `conversation_id` 短头（不论来源）
 - 为新 mint 的出站 turn 回带别的 turn 的 `x-codex-turn-state`
 - 出站仍带 `subagent_kind` / parent / fork 键，或非 memory 请求的 `thread_source` ≠ `user`
 - 压缩过的合成 thread 仍发 `window_number = 0`，或 `window_id` 与 `window_number` 不一致，或入站 `context_window_id` 透传
 - 白名单之外的键原样上游
-- HTTP 把入站 thread 当 `x-client-request-id` 上游
+- HTTP `x-client-request-id` 不等于出站 thread（入站 thread 泄漏，或 Aether 随机 request id）
 - 非法配置静默变成 6/48
 - 握手指纹因出站 ID 变化而打断可复用连接
 - 前端 / admin 保存丢掉本对象
@@ -772,3 +772,63 @@ cd frontend && npm run type-check
 **刻意不做**：白名单不做可配置 UI（改名单即改代码，随 codex-rs 版本走）；不做「压缩响应失败则回滚 window」（需要响应回写，收益是极少数失败压缩的 1 次偏差）；不改合成关闭时的透传路径；不改 thread / turn 槽模型；不给 WS 握手拷贝名单加 `x-codex-routing-hint`（线上 7 天 HTTP 样本中未见该头，且 Aether 模型映射时它会与 body 模型不一致，另议）。
 
 **为何 v1 设计漏掉**：§7.3 只依据 codex-rs 357696c5 基线，`window_number` / `context_window_id` 是之后加入的字段；黑名单式的泄漏键清单必然滞后于客户端加字段。v0.7.104 起以白名单兜底，新字段的默认命运是「删除 + 告警」而不是「透传」。
+
+### 18.13 v0.7.105 .104 上线后风控复核修订
+
+2026-09-05 02:36 UTC 线上更新到 v0.7.104 后，以上游风控视角复核 Codex Pro 号池出站（审计表 `usage_http_audits` + body blob，只看键名/计数，取数脚本 `/var/tmp/aether-rid/review.sql`、`review_body.py`）：
+
+- 合成请求 182：window 头与 blob 一致、W=0 且带 `context_window_id`、`thread_source=user`、`root_turn_id=出站 turn`、无泄漏键、无未知键、无 `codex_rid_*` 事件；7 条入站 thread → 7 条出站 thread（UUIDv7 形状正确）。压缩推进路径（W+1、新 C）线上尚未触发，需在第一次合成 thread 压缩后复核 `wn_max` 与 `context_window_id` 数。
+- **缺陷 1（泄漏）**：1/182 出站带短头 `session_id` = 入站真实 thread。来源是下游中转（入站头 `cafecode-uid`）在真实 Codex Desktop 前面加了这个头，被「入站显式短头保留」规则放过。修：短头一律删除（7.4、§9 表）。
+- **缺陷 2（确定性偏差）**：188/188 出站 `x-client-request-id` 是 Aether special-headers 填的随机 request id（UUIDv4，每请求不同），官方 HTTP/WS 恒等于 thread_id。修：该头存在时一律写出站 thread（§9.1）。
+- 单测：`minted_turn_strips_turn_state_and_short_headers`、`headers_rewrite_only_values_equal_to_inbound_ids`（`x-client-request-id` 分支改为一律改写）。
+
+同轮发现、**不在本功能范围**的两项（记录供后续决策）：
+
+1. 号池约 73% 请求来自同一下游中转且不带任何 codex 元数据（无 root → 不合成），上游看到 codex UA / originator + 非官方头 `session_id` / `conversation_id` / `x-trace-id`。可选：中转透传 `x-codex-*`；或 Aether 对无 root 请求也合成并删这三个头。
+2. 同一入站 thread 先经第三方中转商再切回 Codex Pro，历史里带中转商 mint 的 65 字符 `rs_` item id，官方返回 400 `Invalid 'input[N].id': string too long`，Codex Desktop 每 turn 重试 30 次（一个账号 11 分钟 90+ 个 400）。这不是身份合成的问题，需要出站 input item id 清洗或 thread 级 provider 粘性，另行设计。
+
+### 18.14 v0.7.105 无元数据请求的身份合成、官方头补齐与 `x-trace-id`
+
+§18.13 第 1 项在本轮纳入范围。目标重述（操作员）：每个账号在上游看起来只有一个 codex 在用，thread / turn 都是少量，账号之间没有关联。一条带 codex UA / originator、却没有任何 thread / session / turn 的 `/responses` 请求，是真实 codex-rs 产生不了的形状（HTTP 客户端无条件发 `session-id` / `thread-id` / `x-codex-window-id` / `x-client-request-id`，见 codex-api `build_session_headers`、`endpoint/responses.rs`），且这类请求在 Codex Pro 号池占约 73%（复核窗口 3581 条审计），是当前最大的确定性偏差。
+
+**18.14.1 合成 root / turn（`InboundCodexRuntimeIdentity::synthesize_missing_root`）**
+
+只对 HTTP `/responses` 表面、且入站没有官方 root（无 `session_id` / `thread_id` 于 dash 头、扁平、blob 任一处）的请求执行；有官方身份的请求走原来的改写路径，不受影响。派生规则：
+
+| 量 | 定义 | 为什么 |
+|---|---|---|
+| `downstream` | `hex16(SHA256(domain, 存在的下游标识头 name/value…))`，名单 `cafecode-uid` / `authorization` / `x-api-key` | 同一下游用户在同一账号下应是同一个「人」；不同下游用户不能折进一条 thread |
+| root | `hex16(SHA256(domain, downstream, 第一条真实用户 prompt))` | `store:false` 客户端每轮原样回放历史，第一条 prompt 在整段对话里恒定 → 同一对话映射到同一 thread 槽 |
+| turn key | `hex16(SHA256(domain, root, 最后一条真实用户 prompt 的 index 与文本))` | 同一 turn 内的重试、tool-call 续请求只追加 `function_call(_output)`，最后一条 prompt 不变 → 同一 turn；新 prompt → 新 turn |
+| 回退 | 无可用 prompt，或带 `previous_response_id`（历史在上游，没有稳定 prompt）：root = `hex16(SHA256(domain, downstream, "no-prompt"))`，turn key = `H(root, input 长度)` | 每个下游调用者一条 thread，不拒绝、不透传 |
+
+「真实用户 prompt」= `type` 缺省或 `message`、`role=user`、文本为字符串或 `input_text` / `text` 片段拼接、trim 后非空，且**排除**以 `<tag>`（小写字母 / 下划线）开头的注入包装（`<user_instructions>`、`<environment_context>`、`<turn_aborted>`、`<skill>`…）和以 `Another language model started to solve this problem` 开头的压缩摘要。派生值只保存 16 字节哈希，不落 prompt 文本和下游凭据。root / turn key 之后进入既有的槽位 / freeze / window 模型（§7.2、§7.3），因此账号级 N thread / M turn 上限、跨日 freeze、压缩 window 推进对合成 thread 一样成立。
+
+内容来源：客户端 body 是 Responses 形状（有 `input`）时读客户端 body；chat / family 跨格式路径（§18.11）的客户端 body 没有 `input`，改读转换后的 wire body。这两条路径出站同样是带 codex UA 的 `/responses`，此前同样没有 thread。
+
+**18.14.2 物化官方 HTTP 形状（`materialize_http_responses`）**
+
+合成请求没有可「改写」的键，改为整体写出官方形状：
+
+- 头：`session-id` = `thread-id` = 出站 thread；`x-codex-window-id` = 出站 window；`x-client-request-id` = 出站 thread；`x-codex-turn-metadata` = 下述 blob（ASCII JSON）；删 `x-codex-turn-state`、Aether 短头 `session_id` / `conversation_id`；前缀头白名单照常。不加 `x-codex-beta-features`（只有配置了 feature 的客户端才发）。
+- body：`prompt_cache_key` = 出站 session（官方默认）；`client_metadata` 按官方 `client_metadata()` 顺序重建：`x-codex-installation-id`（取 profile 已写入的头，缺则不写）、`session_id`、`thread_id`、`x-codex-window-id`、`turn_id`、`root_turn_id`、`x-codex-turn-metadata`；原有非身份键（guardian 回执、Aether step 控制键）保留并过白名单。
+- blob 字段顺序与 `CodexTurnMetadataPayload` 一致：`installation_id?`、`session_id`、`thread_id`、`agent_name=/root`、`turn_id`、`window_id`、`window_number`、`context_window_id`、`request_kind=turn`、`root_turn_id=turn_id`、`thread_source=user`、`sandbox` / `sandbox_mode`、`auto_review_enabled=false`、`node_repl_auto_review_required=false`、`node_repl_disabled=false`、`turn_started_at_unix_ms`（= 出站 turn UUIDv7 的毫秒时间戳，官方在 turn 开始时打点，两者本就同刻）。`sandbox` 按出站 UA 的操作系统取 codex-rs `sandbox_tags.rs` 的取值：Mac OS → `seatbelt`，Windows → `windows_elevated`，其余 → `seccomp`；`sandbox_mode` 用默认策略 `workspace-write`。刻意不写 `workspaces` / `turn_trigger` / `tool_namespaces_info` / `history_ingest_requested`（只在部分环境出现，缺省即官方允许的形状）。
+
+**18.14.3 表面拆分与官方头补齐**
+
+- `CodexRuntimeIdentitySurface` 新增 `HttpCompact`：`/responses/compact` 走「只改写、不物化」（compact 本来就剥 `client_metadata`，无 root 的 compact 保持透传）。规划器按 `openai:responses:compact` 别名选表面。
+- **改写模式下 `HttpResponses` 表面补齐缺失的四个官方头**（`session-id` / `thread-id` / `x-codex-window-id` / `x-client-request-id`）：下游中转有时只剥这四个头而保留 blob，剩下的形状真实客户端产生不了。`Headers` / `HttpCompact` / `WsStepBody` 表面维持「只改写已存在的头」。这条**取代** §18.13 中「`x-client-request-id` 不存在时不补」的说法。
+- `x-trace-id`（Aether 请求追踪头，`TRACE_ID_HEADER`）加入 `CODEX_POOL_UPSTREAM_HEADER_BLOCKLIST`：codex-rs 不发它，且同一值随一次入站请求跨账号重试，是账号间的关联标记。Aether 自身的日志 / 响应头 / 审计仍用它，只是不再送上游。
+
+**18.14.4 单测**（`codex_runtime_identity.rs`、`planner/standard/codex/tests.rs`）：`synthetic_root_follows_first_prompt_and_turn_follows_latest_prompt`（同 turn 续请求同 key、新 prompt 新 turn、不同下游不同 root、包装 / 摘要 / 链式回退、官方身份优先、无 `input` 不合成）；`synthetic_request_materializes_official_http_shape`（头 / 扁平 / blob 键序与取值、短头与 turn-state 删除、三种 UA 的 sandbox、`turn_started_at_unix_ms` = turn v7 时间戳、重试同身份、非 `HttpResponses` 表面不物化）；`http_rewrite_inserts_missing_official_headers_only_on_responses_surface`；`synthetic_prompt_extraction_skips_wrappers_and_reads_string_forms`；规划器泄漏头测试加 `x-trace-id`。
+
+**18.14.5 残余与刻意不做**
+
+1. 合成 thread 上的压缩：无元数据客户端的 compact 请求同样没有 root，探测不到 → 该 thread 的 window 停在 0，而历史里会出现摘要消息；压缩把第一条 prompt 换成摘要时，root 变化 → 折到另一条 thread 槽。两者都只影响这类中转流量，且上限仍受 N / M 约束；要消除需按内容识别压缩，另议。
+2. 链式（`previous_response_id`）无元数据请求全部折进「每下游一条 thread」。线上未观察到此形态。
+3. 内容层面的同一性（同一段对话文本先后出现在两个账号）不在身份层解决。
+4. WS 无 root 仍透传（线上未见此形态）；body 有 blob 而头无 blob 的请求不物化（未见）。
+5. §18.13 第 2 项（中转商 `rs_` item id 400 循环）仍待独立设计。
+6. `x-trace-id` 只在 Codex 号池出站剥离，其他 provider 类型不变。
+
+**18.14.6 压缩推进复核（已完成）**：2026-09-05 12:45 CST 以 `/var/tmp/aether-rid/review.sql`（`-v since='2026-09-05 02:36:50+00'`，线上 .104，Codex Pro）复核 §18.12 的 window 模型：改写请求 1048 条，window 头与 blob 一致 1047 / 1047（另 1 条为 memory，blob 按设计不带 window），`wn_without_ctx` 0、`window_id_mismatch` 0；出站 40 条 thread 中 5 条发生过压缩：4 条压缩 1 次后 `window_number` 最大 1、`context_window_id` 2 个，1 条压缩 2 次后最大 2、3 个。CAS 推进 W+1 与下一请求懒 mint 新 C 的路径按设计工作，§18.13 遗留的这一项关闭。

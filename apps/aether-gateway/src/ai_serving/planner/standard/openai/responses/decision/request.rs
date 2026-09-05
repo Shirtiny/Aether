@@ -908,7 +908,14 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts(
     // Pool outbound runtime identity synthesis runs last: it only rewrites
     // projections that still equal the inbound official identity, so the
     // stable prompt_cache_key filler, special headers and account profile
-    // above already see their final shape.
+    // above already see their final shape. Only `/responses` proper may
+    // synthesize an identity for a request that carries none.
+    let identity_surface =
+        if api_format_alias_matches(provider_api_format, "openai:responses:compact") {
+            crate::codex_runtime_identity::CodexRuntimeIdentitySurface::HttpCompact
+        } else {
+            crate::codex_runtime_identity::CodexRuntimeIdentitySurface::HttpResponses
+        };
     crate::ai_serving::apply_codex_pool_runtime_identity(
         &state.runtime_state,
         transport,
@@ -916,7 +923,7 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts(
         Some(&mut provider_request_body),
         effective_headers,
         Some(body_json),
-        crate::codex_runtime_identity::CodexRuntimeIdentitySurface::HttpResponses,
+        identity_surface,
     )
     .await;
     request_identity_response_encoding_when_redacted(

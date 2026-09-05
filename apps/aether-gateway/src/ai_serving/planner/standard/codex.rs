@@ -46,6 +46,10 @@ const CODEX_POOL_UPSTREAM_HEADER_BLOCKLIST: &[&str] = &[
     // pooled request can switch the upstream account and concrete profile, so
     // it must not reuse an inbound client attestation.
     "x-oai-attestation",
+    // Aether's own request trace id (minted or taken from the downstream
+    // relay). No codex-rs client sends it, and the same value follows one
+    // inbound request across accounts on retry.
+    "x-trace-id",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -383,7 +387,22 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
     surface: CodexRuntimeIdentitySurface,
 ) -> Option<OutboundCodexRuntimeIdentity> {
     let scope = resolve_codex_pool_runtime_identity_scope(transport)?;
-    let inbound = InboundCodexRuntimeIdentity::from_request(original_body, Some(original_headers));
+    let mut inbound =
+        InboundCodexRuntimeIdentity::from_request(original_body, Some(original_headers));
+    if surface == CodexRuntimeIdentitySurface::HttpResponses {
+        // A `/responses` egress without any official identity (a relay that
+        // strips codex headers in front of a real client, or a chat/family
+        // request converted to Responses) gets a content-derived root, so the
+        // account never shows a Codex user-agent without a thread. Prompts are
+        // read from the client's body when it is a Responses body, otherwise
+        // from the converted wire body. Compact and header-only surfaces stay
+        // passthrough.
+        let content = match original_body {
+            Some(body) if body.get("input").is_some() => Some(body),
+            _ => provider_request_body.as_deref(),
+        };
+        inbound.synthesize_missing_root(content, original_headers);
+    }
     let store = CodexRuntimeIdentityStore::new(runtime);
     match resolve_outbound_codex_runtime_identity(&store, &scope, &inbound, None, SystemTime::now())
         .await
@@ -392,7 +411,6 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
             apply_outbound_codex_runtime_identity(
                 provider_request_headers,
                 provider_request_body,
-                Some(original_headers),
                 &inbound,
                 &outbound,
                 surface,

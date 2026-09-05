@@ -169,6 +169,28 @@ const HEADER_STRIP_KEYS: &[&str] = &[
 /// Official Codex HTTP clients never send them.
 const SHORT_HEADERS: &[&str] = &["session_id", "conversation_id"];
 
+// Synthetic root for HTTP `/responses` requests without any official Codex
+// identity (typically a downstream relay that strips `x-codex-*`, `session-id`
+// and `thread-id` from a real client). Upstream would otherwise see a Codex
+// user-agent / originator with no thread at all — a shape codex-rs never
+// produces. The request carries no ids, so the thread is anchored on what a
+// real client keeps constant across a conversation (the first real user
+// prompt, `store:false` history is replayed verbatim) and the turn on what a
+// real client keeps constant across the requests of one turn (the latest user
+// prompt; tool-call follow-ups only append items after it).
+const SYNTHETIC_ROOT_DOMAIN: &[u8] = b"aether:codex:rid:synthetic-root:v1";
+const SYNTHETIC_TURN_DOMAIN: &[u8] = b"aether:codex:rid:synthetic-turn:v1";
+const DOWNSTREAM_FP_DOMAIN: &[u8] = b"aether:codex:rid:downstream:v1";
+/// Headers that tell downstream callers apart (relay user id first, then the
+/// credential). Only a domain-separated hash of them is ever used or kept.
+const DOWNSTREAM_IDENTITY_HEADERS: &[&str] = &["cafecode-uid", "authorization", "x-api-key"];
+/// codex-rs `prompts/templates/compact/summary_prefix.md`: compaction
+/// summaries are re-injected as user messages starting with this text.
+const COMPACT_SUMMARY_PREFIX: &str = "Another language model started to solve this problem";
+const X_CODEX_INSTALLATION_ID: &str = "x-codex-installation-id";
+const USER_AGENT_HEADER: &str = "user-agent";
+const REQUEST_KIND_TURN: &str = "turn";
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -422,6 +444,18 @@ pub(crate) struct InboundCodexRuntimeIdentity {
     /// `prompt_cache_key`. Aether fillers may have inserted a UUIDv5 since.
     pub(crate) prompt_cache_key_present: bool,
     pub(crate) previous_response_id_present: bool,
+    /// Root / turn derived from the request content when it carries no
+    /// official identity (see `synthesize_missing_root`).
+    pub(crate) synthetic: Option<SyntheticCodexIdentity>,
+}
+
+/// Content-derived identity of a request without official Codex ids. Both
+/// values are 16-byte domain-separated hashes; neither the prompt text nor the
+/// downstream credential is kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SyntheticCodexIdentity {
+    root: String,
+    turn_key: String,
 }
 
 impl InboundCodexRuntimeIdentity {
@@ -514,22 +548,118 @@ impl InboundCodexRuntimeIdentity {
 
     /// Official root: `session_id` when present, otherwise `thread_id`.
     /// Same rule as `CodexSessionIdentity::root_session`.
-    pub(crate) fn root(&self) -> Option<&str> {
+    fn official_root(&self) -> Option<&str> {
         self.session_id.as_deref().or(self.thread_id.as_deref())
     }
 
+    /// Root the outbound thread is bound to: the official root, otherwise the
+    /// synthetic root when one was derived.
+    pub(crate) fn root(&self) -> Option<&str> {
+        self.official_root()
+            .or_else(|| self.synthetic.as_ref().map(|synthetic| synthetic.root.as_str()))
+    }
+
     /// Official `turn_id`, otherwise `root || thread || window` so a turn-less
-    /// client still maps every request of one thread/window to one slot.
+    /// client still maps every request of one thread/window to one slot;
+    /// synthetic requests use the turn key derived from the latest prompt.
     pub(crate) fn turn_key(&self) -> Option<String> {
         if let Some(turn_id) = self.turn_id.as_deref() {
             return Some(turn_id.to_string());
         }
-        let root = self.root()?;
-        Some(format!(
-            "{root}\0{}\0{}",
-            self.thread_id.as_deref().unwrap_or(""),
-            self.window_id.as_deref().unwrap_or("")
-        ))
+        if let Some(root) = self.official_root() {
+            return Some(format!(
+                "{root}\0{}\0{}",
+                self.thread_id.as_deref().unwrap_or(""),
+                self.window_id.as_deref().unwrap_or("")
+            ));
+        }
+        self.synthetic
+            .as_ref()
+            .map(|synthetic| synthetic.turn_key.clone())
+    }
+
+    /// The request carried no official identity and its root was derived from
+    /// the content: every outbound projection has to be materialized.
+    pub(crate) fn is_synthetic(&self) -> bool {
+        self.official_root().is_none() && self.synthetic.is_some()
+    }
+
+    /// Derives a synthetic root / turn key for an HTTP `/responses` request
+    /// that carries no official Codex identity. Returns `false` (and changes
+    /// nothing) when an official root exists or the body has no `input`.
+    ///
+    /// * root = H(downstream caller, first real user prompt): a real client
+    ///   replays its `store:false` history verbatim, so the first prompt is
+    ///   constant for the whole conversation.
+    /// * turn = H(root, index and text of the latest real user prompt): the
+    ///   requests of one turn (retries, tool-call follow-ups) share it; the
+    ///   next prompt starts a new turn.
+    /// * without a usable prompt, or with a `previous_response_id` chain
+    ///   (history lives upstream, no prompt is stable): one thread per
+    ///   downstream caller, one turn per input shape.
+    ///
+    /// Injected wrapper messages (`<user_instructions>`,
+    /// `<environment_context>`, …) and compaction summaries are not prompts.
+    pub(crate) fn synthesize_missing_root(
+        &mut self,
+        body: Option<&Value>,
+        headers: &HeaderMap,
+    ) -> bool {
+        if self.official_root().is_some() || self.synthetic.is_some() {
+            return false;
+        }
+        let Some(input) = body.and_then(|body| body.get("input")) else {
+            return false;
+        };
+        let downstream = downstream_fingerprint(headers);
+        let prompts = real_user_prompts(input);
+        let (root, turn_key) = match (prompts.first(), prompts.last()) {
+            (Some((_, first)), Some((last_index, last)))
+                if !self.previous_response_id_present =>
+            {
+                let root = hex_lower(
+                    &sha256(&[
+                        SYNTHETIC_ROOT_DOMAIN,
+                        downstream.as_bytes(),
+                        SEP,
+                        first.as_bytes(),
+                    ])[..16],
+                );
+                let turn_key = hex_lower(
+                    &sha256(&[
+                        SYNTHETIC_TURN_DOMAIN,
+                        root.as_bytes(),
+                        SEP,
+                        last_index.to_string().as_bytes(),
+                        SEP,
+                        last.as_bytes(),
+                    ])[..16],
+                );
+                (root, turn_key)
+            }
+            _ => {
+                let root = hex_lower(
+                    &sha256(&[
+                        SYNTHETIC_ROOT_DOMAIN,
+                        downstream.as_bytes(),
+                        SEP,
+                        b"no-prompt",
+                    ])[..16],
+                );
+                let input_len = input.as_array().map_or(1, Vec::len);
+                let turn_key = hex_lower(
+                    &sha256(&[
+                        SYNTHETIC_TURN_DOMAIN,
+                        root.as_bytes(),
+                        SEP,
+                        input_len.to_string().as_bytes(),
+                    ])[..16],
+                );
+                (root, turn_key)
+            }
+        };
+        self.synthetic = Some(SyntheticCodexIdentity { root, turn_key });
+        true
     }
 
     pub(crate) fn is_memory(&self) -> bool {
@@ -895,7 +1025,8 @@ async fn resolve_inner(
                 .await?
             }
         };
-        let window = resolve_window(store, scope, &snapshot.thread_id, compaction, ttl, now).await?;
+        let window =
+            resolve_window(store, scope, &snapshot.thread_id, compaction, ttl, now).await?;
         return Ok(OutboundCodexRuntimeIdentity {
             session_id: snapshot.session_id.clone(),
             thread_id: snapshot.thread_id.clone(),
@@ -1119,8 +1250,11 @@ async fn resolve_turn(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexRuntimeIdentitySurface {
-    /// HTTP Responses (incl. compact): headers + body.
+    /// HTTP `/responses`: headers + body. The only surface that materializes
+    /// a synthetic identity and inserts the official headers when missing.
     HttpResponses,
+    /// HTTP `/responses/compact`: headers + body, rewrite only.
+    HttpCompact,
     /// Search / chat / family / image on a Codex provider: headers only.
     Headers,
     /// WebSocket `response.create` step: body only (handshake headers are
@@ -1132,20 +1266,29 @@ pub(crate) enum CodexRuntimeIdentitySurface {
 /// and the `x-codex-turn-metadata` blob agree on the synthetic identity.
 ///
 /// Only existing keys are rewritten; missing keys are never added (the
-/// official blob shape depends on `request_kind`). Inbound-tree keys
+/// official blob shape depends on `request_kind`), except the headers an
+/// official HTTP `/responses` client sends unconditionally. Inbound-tree keys
 /// (parent / fork / subagent) are removed, `agent_name` / `thread_source` /
 /// `root_turn_id` are normalized to the root user-thread shape, and any key
 /// outside the per-surface whitelist is removed and reported.
+///
+/// A synthetic inbound (no official identity) has nothing to rewrite: the
+/// HTTP `/responses` surface materializes the full official shape instead.
 pub(crate) fn apply_outbound_codex_runtime_identity(
     headers: &mut BTreeMap<String, String>,
     body: Option<&mut Value>,
-    original_headers: Option<&HeaderMap>,
     inbound: &InboundCodexRuntimeIdentity,
     outbound: &OutboundCodexRuntimeIdentity,
     surface: CodexRuntimeIdentitySurface,
 ) {
+    if inbound.is_synthetic() {
+        if surface == CodexRuntimeIdentitySurface::HttpResponses {
+            materialize_http_responses(headers, body, outbound);
+        }
+        return;
+    }
     if surface != CodexRuntimeIdentitySurface::WsStepBody {
-        rewrite_headers(headers, original_headers, inbound, outbound);
+        rewrite_headers(headers, inbound, outbound, surface);
     }
     if surface != CodexRuntimeIdentitySurface::Headers {
         if let Some(body) = body {
@@ -1156,35 +1299,49 @@ pub(crate) fn apply_outbound_codex_runtime_identity(
 
 fn rewrite_headers(
     headers: &mut BTreeMap<String, String>,
-    original_headers: Option<&HeaderMap>,
     inbound: &InboundCodexRuntimeIdentity,
     outbound: &OutboundCodexRuntimeIdentity,
+    surface: CodexRuntimeIdentitySurface,
 ) {
-    rewrite_header_if(
+    // Official HTTP `/responses` clients send session-id, thread-id,
+    // x-codex-window-id and x-client-request-id unconditionally (codex-api
+    // `build_session_headers`, `endpoint/responses.rs`,
+    // `compatibility_headers`). A relay that strips them in front of a real
+    // client (prod v0.7.104: the dominant downstream) leaves a shape no client
+    // produces, so on that surface missing ones are inserted; every other
+    // surface only rewrites what is present.
+    let insert_missing = surface == CodexRuntimeIdentitySurface::HttpResponses;
+    project_header(
         headers,
         SESSION_ID_HEADER,
         |value| inbound.matches_session(value),
         &outbound.session_id,
+        insert_missing,
     );
-    rewrite_header_if(
+    project_header(
         headers,
         THREAD_ID_HEADER,
         |value| inbound.matches_session(value),
         &outbound.thread_id,
+        insert_missing,
     );
-    rewrite_header_if(
+    project_header(
         headers,
         X_CODEX_WINDOW_ID,
         |value| inbound.matches_window(value),
         &outbound.window_id,
+        insert_missing,
     );
-    // Official clients set x-client-request-id = thread_id. Aether trace ids
-    // and other explicit values stay untouched.
-    rewrite_header_if(
+    // Official HTTP and WS clients always send x-client-request-id = thread_id
+    // (codex-api endpoint/responses.rs, core client.rs). Anything else here is
+    // the Aether request id or a relay trace id: a per-request random value no
+    // real client produces (prod v0.7.104: 188/188 requests).
+    project_header(
         headers,
         X_CLIENT_REQUEST_ID,
-        |value| inbound.matches_session(value),
+        |_| true,
         &outbound.thread_id,
+        insert_missing,
     );
     if let Some((name, raw)) = header_entry(headers, X_CODEX_TURN_METADATA) {
         if let Some(rewritten) = rewrite_codex_turn_metadata_string(&raw, outbound) {
@@ -1195,15 +1352,12 @@ fn rewrite_headers(
         remove_header(headers, X_CODEX_TURN_STATE);
     }
     retain_known_headers(headers);
-    // Aether-derived short headers would be a 16-hex fingerprint of the real
-    // session. Official HTTP clients never send them; explicit inbound values
-    // are the client's own business and stay.
+    // Official HTTP clients never send the short headers. Aether derives them
+    // as a 16-hex fingerprint of the real session, and relays in front of real
+    // clients forward `session_id` = the real thread id (prod v0.7.104), so an
+    // explicit inbound value leaks just the same: strip both regardless of origin.
     for short in SHORT_HEADERS {
-        let explicit =
-            original_headers.is_some_and(|original| header_str(original, short).is_some());
-        if !explicit {
-            remove_header(headers, short);
-        }
+        remove_header(headers, short);
     }
 }
 
@@ -1348,6 +1502,265 @@ fn rewrite_codex_turn_metadata_object(
         object.remove(*key);
     }
     retain_known_keys(object, "turn_metadata", blob_key_known);
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic identity (requests without official identity)
+// ---------------------------------------------------------------------------
+
+const SEP: &[u8] = b"\0";
+
+/// `hex(SHA256(domain, name, value, …)[0..16])` over the downstream identity
+/// headers present on the request; raw values are never stored or logged.
+fn downstream_fingerprint(headers: &HeaderMap) -> String {
+    let mut parts: Vec<&[u8]> = vec![DOWNSTREAM_FP_DOMAIN];
+    for name in DOWNSTREAM_IDENTITY_HEADERS {
+        if let Some(value) = header_str(headers, name) {
+            parts.extend([SEP, name.as_bytes(), SEP, value.as_bytes()]);
+        }
+    }
+    hex_lower(&sha256(&parts)[..16])
+}
+
+/// `(index, text)` of every real user prompt in `input`, in order.
+fn real_user_prompts(input: &Value) -> Vec<(usize, String)> {
+    match input {
+        Value::String(text) => prompt_text(text)
+            .map(|text| vec![(0, text)])
+            .unwrap_or_default(),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let item = item.as_object()?;
+                let is_message = match item.get("type") {
+                    None => true,
+                    Some(kind) => kind.as_str() == Some("message"),
+                };
+                if !is_message || non_empty_str(item.get("role")) != Some("user") {
+                    return None;
+                }
+                prompt_text(&message_text(item.get("content")?)?).map(|text| (index, text))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Text of a Responses input message: a string or its text parts joined.
+fn message_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let texts = parts
+                .iter()
+                .filter(|part| {
+                    matches!(
+                        non_empty_str(part.get("type")),
+                        Some("input_text") | Some("text") | None
+                    )
+                })
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            (!texts.is_empty()).then(|| texts.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+/// A real prompt: non-empty, not a wrapper the client injects around
+/// instructions / environment / skills (`<tag>` first), not a compaction
+/// summary.
+fn prompt_text(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty()
+        || text.starts_with(COMPACT_SUMMARY_PREFIX)
+        || starts_with_wrapper_tag(text)
+    {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+fn starts_with_wrapper_tag(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix('<') else {
+        return false;
+    };
+    let Some(end) = rest.find('>') else {
+        return false;
+    };
+    let tag = &rest[..end];
+    !tag.is_empty()
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+}
+
+/// Blob of a synthetic request, in `CodexTurnMetadataPayload` field order
+/// (codex-rs `core/src/responses_metadata.rs`; serde skips `None`). Fields a
+/// real client only sets in some environments (`workspaces`, `turn_trigger`,
+/// `tool_namespaces_info`) are omitted.
+#[derive(Serialize)]
+struct SyntheticTurnMetadata<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installation_id: Option<&'a str>,
+    session_id: &'a str,
+    thread_id: &'a str,
+    agent_name: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_id: Option<&'a str>,
+    window_id: &'a str,
+    window_number: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_window_id: Option<&'a str>,
+    request_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_turn_id: Option<&'a str>,
+    thread_source: &'static str,
+    sandbox: &'static str,
+    sandbox_mode: &'static str,
+    auto_review_enabled: bool,
+    node_repl_auto_review_required: bool,
+    node_repl_disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_started_at_unix_ms: Option<u64>,
+}
+
+/// `sandbox` / `sandbox_mode` a default-configured client reports on the OS
+/// of the outbound user-agent (codex-rs `core/src/sandbox_tags.rs`,
+/// `sandboxing/src/manager.rs`): seatbelt on macOS, the elevated Windows
+/// sandbox on Windows, seccomp elsewhere, all in the default workspace-write
+/// policy.
+fn sandbox_tags_for_user_agent(user_agent: Option<&str>) -> (&'static str, &'static str) {
+    match user_agent {
+        Some(agent) if agent.contains("Mac OS") => ("seatbelt", "workspace-write"),
+        Some(agent) if agent.contains("Windows") => ("windows_elevated", "workspace-write"),
+        _ => ("seccomp", "workspace-write"),
+    }
+}
+
+fn synthetic_turn_metadata_json(
+    outbound: &OutboundCodexRuntimeIdentity,
+    installation_id: Option<&str>,
+    user_agent: Option<&str>,
+) -> Option<String> {
+    let (sandbox, sandbox_mode) = sandbox_tags_for_user_agent(user_agent);
+    let payload = SyntheticTurnMetadata {
+        installation_id,
+        session_id: &outbound.session_id,
+        thread_id: &outbound.thread_id,
+        agent_name: ROOT_AGENT_NAME,
+        turn_id: outbound.turn_id.as_deref(),
+        window_id: &outbound.window_id,
+        window_number: outbound.window_number,
+        context_window_id: outbound.context_window_id.as_deref(),
+        request_kind: REQUEST_KIND_TURN,
+        root_turn_id: outbound.turn_id.as_deref(),
+        thread_source: USER_THREAD_SOURCE,
+        sandbox,
+        sandbox_mode,
+        auto_review_enabled: false,
+        node_repl_auto_review_required: false,
+        node_repl_disabled: false,
+        // A real client stamps the turn start; the outbound turn UUIDv7 was
+        // minted at exactly that moment.
+        turn_started_at_unix_ms: outbound
+            .turn_id
+            .as_deref()
+            .and_then(uuid_v7_unix_millis),
+    };
+    serialize_ascii_json(&serde_json::to_value(payload).ok()?)
+}
+
+/// Materializes the full official HTTP `/responses` shape on a request that
+/// carried no identity: dash headers, `x-client-request-id = thread`,
+/// `x-codex-window-id`, the turn-metadata header, `prompt_cache_key =
+/// session`, and a flat `client_metadata` in `client_metadata()` key order.
+/// The account profile pass already set user-agent / originator /
+/// installation id; Aether's short headers are removed like on every
+/// synthetic request.
+fn materialize_http_responses(
+    headers: &mut BTreeMap<String, String>,
+    body: Option<&mut Value>,
+    outbound: &OutboundCodexRuntimeIdentity,
+) {
+    let installation_id = header_entry(headers, X_CODEX_INSTALLATION_ID).map(|(_, value)| value);
+    let user_agent = header_entry(headers, USER_AGENT_HEADER).map(|(_, value)| value);
+    let blob = synthetic_turn_metadata_json(
+        outbound,
+        installation_id.as_deref(),
+        user_agent.as_deref(),
+    );
+
+    set_header(headers, SESSION_ID_HEADER, &outbound.session_id);
+    set_header(headers, THREAD_ID_HEADER, &outbound.thread_id);
+    set_header(headers, X_CODEX_WINDOW_ID, &outbound.window_id);
+    set_header(headers, X_CLIENT_REQUEST_ID, &outbound.thread_id);
+    match blob.as_deref() {
+        Some(blob) => set_header(headers, X_CODEX_TURN_METADATA, blob),
+        None => remove_header(headers, X_CODEX_TURN_METADATA),
+    }
+    remove_header(headers, X_CODEX_TURN_STATE);
+    retain_known_headers(headers);
+    for short in SHORT_HEADERS {
+        remove_header(headers, short);
+    }
+
+    let Some(object) = body.and_then(Value::as_object_mut) else {
+        return;
+    };
+    object.insert(
+        "prompt_cache_key".to_string(),
+        Value::String(outbound.session_id.clone()),
+    );
+    let previous = match object.remove("client_metadata") {
+        Some(Value::Object(map)) => map,
+        _ => Map::new(),
+    };
+    let mut client_metadata = Map::new();
+    if let Some(installation_id) = installation_id {
+        client_metadata.insert(
+            X_CODEX_INSTALLATION_ID.to_string(),
+            Value::String(installation_id),
+        );
+    }
+    client_metadata.insert(
+        "session_id".to_string(),
+        Value::String(outbound.session_id.clone()),
+    );
+    client_metadata.insert(
+        "thread_id".to_string(),
+        Value::String(outbound.thread_id.clone()),
+    );
+    client_metadata.insert(
+        X_CODEX_WINDOW_ID.to_string(),
+        Value::String(outbound.window_id.clone()),
+    );
+    if let Some(turn_id) = outbound.turn_id.as_deref() {
+        client_metadata.insert("turn_id".to_string(), Value::String(turn_id.to_string()));
+        client_metadata.insert(
+            "root_turn_id".to_string(),
+            Value::String(turn_id.to_string()),
+        );
+    }
+    if let Some(blob) = blob {
+        client_metadata.insert(X_CODEX_TURN_METADATA.to_string(), Value::String(blob));
+    }
+    // Non-identity keys the request already had (guardian receipts, Aether
+    // step control) stay; identity keys were rebuilt above.
+    for (key, value) in previous {
+        if !FLAT_IDENTITY_KEYS.contains(&key.as_str()) && !client_metadata.contains_key(&key) {
+            client_metadata.insert(key, value);
+        }
+    }
+    for key in FLAT_LEAK_KEYS {
+        client_metadata.remove(*key);
+    }
+    retain_known_keys(&mut client_metadata, "client_metadata", flat_key_known);
+    object.insert(
+        "client_metadata".to_string(),
+        Value::Object(client_metadata),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1554,17 +1967,44 @@ fn remove_header(headers: &mut BTreeMap<String, String>, target: &str) {
     }
 }
 
-fn rewrite_header_if(
+/// Sets `target` (case-insensitively replacing any existing spelling).
+fn set_header(headers: &mut BTreeMap<String, String>, target: &str, value: &str) {
+    remove_header(headers, target);
+    headers.insert(target.to_string(), value.to_string());
+}
+
+/// Rewrites `target` when present and `predicate` accepts its current value;
+/// inserts it when absent only if `insert_missing`.
+fn project_header(
     headers: &mut BTreeMap<String, String>,
     target: &str,
     predicate: impl Fn(&str) -> bool,
     value: &str,
+    insert_missing: bool,
 ) {
-    if let Some((name, current)) = header_entry(headers, target) {
-        if predicate(&current) {
+    match header_entry(headers, target) {
+        Some((name, current)) if predicate(&current) => {
             headers.insert(name, value.to_string());
         }
+        Some(_) => {}
+        None if insert_missing => {
+            headers.insert(target.to_string(), value.to_string());
+        }
+        None => {}
     }
+}
+
+/// Unix milliseconds encoded in the first 48 bits of a UUIDv7 string.
+fn uuid_v7_unix_millis(id: &str) -> Option<u64> {
+    let uuid = Uuid::parse_str(id).ok()?;
+    if uuid.get_version_num() != 7 {
+        return None;
+    }
+    Some(
+        uuid.as_bytes()[..6]
+            .iter()
+            .fold(0u64, |millis, byte| (millis << 8) | u64::from(*byte)),
+    )
 }
 
 fn set_if_present(object: &mut Map<String, Value>, key: &str, value: &str) {
@@ -1617,6 +2057,7 @@ mod tests {
             request_kind: Some(CodexRequestKind::Turn),
             prompt_cache_key_present: true,
             previous_response_id_present: false,
+            synthetic: None,
         }
     }
 
@@ -2246,7 +2687,6 @@ mod tests {
         apply_outbound_codex_runtime_identity(
             &mut headers,
             None,
-            Some(&HeaderMap::new()),
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::Headers,
@@ -2274,7 +2714,8 @@ mod tests {
         assert!(blob.get("parent_thread_id").is_none());
         assert!(blob.get("subagent_kind").is_none());
 
-        // Values that are not the inbound IDs stay (trace ids, foreign values).
+        // Dash / window values that are not the inbound IDs stay (foreign
+        // values); x-client-request-id is always the outbound thread.
         let mut foreign = btree(&[
             ("session-id", "someone-else"),
             ("x-client-request-id", "trace-abc"),
@@ -2283,18 +2724,17 @@ mod tests {
         apply_outbound_codex_runtime_identity(
             &mut foreign,
             None,
-            None,
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::Headers,
         );
         assert_eq!(foreign["session-id"], "someone-else");
-        assert_eq!(foreign["x-client-request-id"], "trace-abc");
+        assert_eq!(foreign["x-client-request-id"], "out-thread");
         assert_eq!(foreign["x-codex-window-id"], "foreign:1");
     }
 
     #[test]
-    fn minted_turn_strips_turn_state_and_explicit_short_headers_stay() {
+    fn minted_turn_strips_turn_state_and_short_headers() {
         let inbound = inbound("in-session", "in-thread", Some("in-turn"));
         let outbound = outbound_fixture(Some("out-turn"), OutboundTurnSource::Minted);
         let mut headers = btree(&[
@@ -2302,17 +2742,15 @@ mod tests {
             ("session_id", "client-set"),
             ("conversation_id", "derived"),
         ]);
-        let original = header_map(&[("session_id", "client-set")]);
         apply_outbound_codex_runtime_identity(
             &mut headers,
             None,
-            Some(&original),
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::Headers,
         );
         assert!(!headers.contains_key("x-codex-turn-state"));
-        assert_eq!(headers["session_id"], "client-set");
+        assert!(!headers.contains_key("session_id"));
         assert!(!headers.contains_key("conversation_id"));
     }
 
@@ -2351,7 +2789,6 @@ mod tests {
         apply_outbound_codex_runtime_identity(
             &mut headers,
             Some(&mut body),
-            None,
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::WsStepBody,
@@ -2366,7 +2803,10 @@ mod tests {
         for key in FLAT_LEAK_KEYS {
             assert!(!meta.contains_key(*key), "{key} leaked");
         }
-        assert_eq!(meta["root_turn_id"], "out-turn", "root turn is its own root");
+        assert_eq!(
+            meta["root_turn_id"], "out-turn",
+            "root turn is its own root"
+        );
         assert!(!meta.contains_key("x-codex-turn-state"));
         let raw = meta["x-codex-turn-metadata"].as_str().unwrap();
         assert!(raw.is_ascii(), "{raw}");
@@ -2378,7 +2818,10 @@ mod tests {
         assert_eq!(blob["window_id"], "out-thread:0");
         assert_eq!(blob["sandbox"], "workspace-write");
         assert_eq!(blob["workspaces"][0], "/tmp/项目");
-        assert_eq!(blob["thread_source"], "user", "folded thread presents as user");
+        assert_eq!(
+            blob["thread_source"], "user",
+            "folded thread presents as user"
+        );
         for key in BLOB_LEAK_KEYS {
             assert!(blob.get(*key).is_none(), "{key} leaked");
         }
@@ -2402,7 +2845,6 @@ mod tests {
         apply_outbound_codex_runtime_identity(
             &mut BTreeMap::new(),
             Some(&mut body),
-            None,
             &missing,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
@@ -2414,7 +2856,6 @@ mod tests {
         apply_outbound_codex_runtime_identity(
             &mut BTreeMap::new(),
             Some(&mut body),
-            None,
             &present,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
@@ -2425,7 +2866,6 @@ mod tests {
         apply_outbound_codex_runtime_identity(
             &mut BTreeMap::new(),
             Some(&mut body),
-            None,
             &present,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
@@ -2436,7 +2876,6 @@ mod tests {
         apply_outbound_codex_runtime_identity(
             &mut BTreeMap::new(),
             Some(&mut body),
-            None,
             &present,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
@@ -2480,7 +2919,6 @@ mod tests {
         apply_outbound_codex_runtime_identity(
             &mut headers,
             Some(&mut body),
-            None,
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
@@ -2532,7 +2970,6 @@ mod tests {
         apply_outbound_codex_runtime_identity(
             &mut BTreeMap::new(),
             Some(&mut body),
-            None,
             &inbound("in", "in", Some("u")),
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
@@ -2563,11 +3000,17 @@ mod tests {
         assert_eq!(blob["agent_name"], "/root");
         assert_eq!(blob["thread_source"], "user");
         assert_eq!(blob["root_turn_id"], "out-turn");
-        assert!(blob.get("forked_from_ordinal_exclusive").is_none(), "fork leaked");
+        assert!(
+            blob.get("forked_from_ordinal_exclusive").is_none(),
+            "fork leaked"
+        );
         assert_eq!(blob["workspace_kind"], "project", "known extra kept");
         assert_eq!(blob["compaction"]["phase"], "mid_turn");
         assert!(blob.get("model").is_none(), "unknown key must be stripped");
-        assert!(!rewritten.contains("01a06ee4"), "real context window leaked");
+        assert!(
+            !rewritten.contains("01a06ee4"),
+            "real context window leaked"
+        );
 
         // Store outage on a fresh thread: no context id → key removed, not leaked.
         outbound.context_window_id = None;
@@ -2633,7 +3076,6 @@ mod tests {
         apply_outbound_codex_runtime_identity(
             &mut headers,
             Some(&mut body),
-            None,
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
@@ -2648,7 +3090,10 @@ mod tests {
         assert!(!meta.contains_key("x-codex-brand-new-flat-key"));
         let blob: Value =
             serde_json::from_str(meta["x-codex-turn-metadata"].as_str().unwrap()).unwrap();
-        assert_eq!(blob, json!({ "thread_id": "out-thread", "request_kind": "turn" }));
+        assert_eq!(
+            blob,
+            json!({ "thread_id": "out-thread", "request_kind": "turn" })
+        );
         assert_eq!(headers["x-codex-beta-features"], "a,b");
         assert_eq!(headers["x-codex-routing-hint"], "model=gpt-5;tier=x");
         assert_eq!(headers["x-openai-internal-codex-responses-lite"], "true");
@@ -2657,6 +3102,350 @@ mod tests {
         assert!(!headers.contains_key("X-Codex-Brand-New-Header"));
         assert!(!headers.contains_key("x-oai-attestation"));
         assert!(!body.to_string().contains("leak"));
+    }
+
+    // ----- synthetic identity (no official ids) ------------------------------
+
+    /// A relay-shaped `/responses` body: wrapper messages first, then the real
+    /// prompts (assistant replies between them), then `tail` items.
+    fn synthetic_body(prompts: &[&str], tail: &[Value]) -> Value {
+        let mut input = vec![
+            json!({"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/w</cwd>\n</environment_context>"}]}),
+            json!({"type":"message","role":"user","content":[{"type":"input_text","text":"<user_instructions>\nbe brief\n</user_instructions>"}]}),
+        ];
+        for (index, prompt) in prompts.iter().enumerate() {
+            input.push(json!({"type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}));
+            if index + 1 < prompts.len() {
+                input.push(json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}));
+            }
+        }
+        input.extend(tail.iter().cloned());
+        json!({
+            "model": "gpt-5.3-codex",
+            "instructions": "You are Codex",
+            "input": input,
+            "store": false,
+            "stream": true,
+            "prompt_cache_key": "5f2c7e1a-9b3d-5c4e-8a1f-000000000001"
+        })
+    }
+
+    fn synthesized(body: &Value, headers: &HeaderMap) -> InboundCodexRuntimeIdentity {
+        let mut inbound = InboundCodexRuntimeIdentity::from_request(Some(body), Some(headers));
+        assert!(inbound.synthesize_missing_root(Some(body), headers));
+        inbound
+    }
+
+    #[test]
+    fn synthetic_root_follows_first_prompt_and_turn_follows_latest_prompt() {
+        let relay = header_map(&[("cafecode-uid", "u1"), ("authorization", "Bearer sk-relay")]);
+        let turn1 = synthesized(&synthetic_body(&["fix the tests"], &[]), &relay);
+        let turn1_followup = synthesized(
+            &synthetic_body(
+                &["fix the tests"],
+                &[
+                    json!({"type":"function_call","name":"shell","arguments":"{}","call_id":"c1"}),
+                    json!({"type":"function_call_output","call_id":"c1","output":"ok"}),
+                ],
+            ),
+            &relay,
+        );
+        let turn2 = synthesized(&synthetic_body(&["fix the tests", "now the docs"], &[]), &relay);
+        assert!(turn1.is_synthetic());
+        assert!(turn1.root().is_some() && turn1.turn_key().is_some());
+        assert_eq!(turn1.root(), turn1_followup.root());
+        assert_eq!(turn1.turn_key(), turn1_followup.turn_key(), "tool follow-up is the same turn");
+        assert_eq!(turn1.root(), turn2.root(), "same conversation keeps the thread");
+        assert_ne!(turn1.turn_key(), turn2.turn_key(), "a new prompt is a new turn");
+        assert_eq!(turn1.root().map(str::len), Some(32), "16-byte hex, no prompt text");
+
+        // Another downstream user with the same prompt is another thread.
+        let other = synthesized(
+            &synthetic_body(&["fix the tests"], &[]),
+            &header_map(&[("cafecode-uid", "u2"), ("authorization", "Bearer sk-relay")]),
+        );
+        assert_ne!(other.root(), turn1.root());
+
+        // Wrapper-only input (or a compaction summary) has no prompt: one
+        // thread per downstream caller, still synthetic.
+        let wrapper_only = synthesized(&synthetic_body(&[], &[]), &relay);
+        assert!(wrapper_only.is_synthetic());
+        assert_ne!(wrapper_only.root(), turn1.root());
+        let summary = format!("{COMPACT_SUMMARY_PREFIX}. Summary: …");
+        let summary_only = synthesized(&synthetic_body(&[summary.as_str()], &[]), &relay);
+        assert_eq!(summary_only.root(), wrapper_only.root());
+
+        // A chained request has no stable history: same fallback.
+        let mut chained_body = synthetic_body(&["fix the tests"], &[]);
+        chained_body["previous_response_id"] = json!("resp_1");
+        let chained = synthesized(&chained_body, &relay);
+        assert_eq!(chained.root(), wrapper_only.root());
+
+        // Official identity present: nothing synthesized, official root wins.
+        let mut official = inbound("in-session", "in-thread", Some("in-turn"));
+        assert!(!official.synthesize_missing_root(Some(&synthetic_body(&["x"], &[])), &relay));
+        assert_eq!(official.root(), Some("in-session"));
+        assert!(!official.is_synthetic());
+
+        // No `input`: no synthesis, still passthrough.
+        let mut none = InboundCodexRuntimeIdentity::default();
+        assert!(!none.synthesize_missing_root(Some(&json!({"model":"m"})), &relay));
+        assert!(none.root().is_none());
+    }
+
+    #[tokio::test]
+    async fn synthetic_request_materializes_official_http_shape() {
+        let state = memory_state();
+        let store = CodexRuntimeIdentityStore::new(&state);
+        let relay = header_map(&[("cafecode-uid", "u1")]);
+        let mut body = synthetic_body(&["fix the tests"], &[]);
+        let inbound = synthesized(&body, &relay);
+        let outbound = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &scope(4, 8),
+                &inbound,
+                None,
+                at(1_756_857_600),
+            )
+            .await,
+        );
+        assert!(is_uuid_v7(&outbound.thread_id));
+        assert_eq!(outbound.session_id, outbound.thread_id);
+        assert_eq!(outbound.turn_source, OutboundTurnSource::Minted);
+        let turn_id = outbound.turn_id.clone().expect("turn minted");
+
+        let mut headers = btree(&[
+            (
+                "user-agent",
+                "codex-tui/0.150.1 (Mac OS 26.2.0; arm64) Orca/1.4.185 (codex-tui; 0.150.1)",
+            ),
+            ("originator", "codex-tui"),
+            ("x-codex-installation-id", "inst"),
+            ("x-client-request-id", "3f1c9a2e-0b7d-4c1a-9e2f-aaaaaaaaaaaa"),
+            ("session_id", "5f2c7e1a9b3d5c4e"),
+            ("conversation_id", "5f2c7e1a9b3d5c4e"),
+            ("x-codex-turn-state", "stale"),
+        ]);
+        apply_outbound_codex_runtime_identity(
+            &mut headers,
+            Some(&mut body),
+            &inbound,
+            &outbound,
+            CodexRuntimeIdentitySurface::HttpResponses,
+        );
+        assert_eq!(headers["session-id"], outbound.thread_id);
+        assert_eq!(headers["thread-id"], outbound.thread_id);
+        assert_eq!(headers["x-client-request-id"], outbound.thread_id);
+        assert_eq!(headers["x-codex-window-id"], format!("{}:0", outbound.thread_id));
+        assert_eq!(headers["x-codex-installation-id"], "inst");
+        assert!(!headers.contains_key("session_id"));
+        assert!(!headers.contains_key("conversation_id"));
+        assert!(!headers.contains_key("x-codex-turn-state"));
+        assert!(!headers.contains_key("x-codex-beta-features"));
+
+        let header_blob: Value = serde_json::from_str(&headers["x-codex-turn-metadata"]).unwrap();
+        let keys = header_blob.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "installation_id",
+                "session_id",
+                "thread_id",
+                "agent_name",
+                "turn_id",
+                "window_id",
+                "window_number",
+                "context_window_id",
+                "request_kind",
+                "root_turn_id",
+                "thread_source",
+                "sandbox",
+                "sandbox_mode",
+                "auto_review_enabled",
+                "node_repl_auto_review_required",
+                "node_repl_disabled",
+                "turn_started_at_unix_ms",
+            ]
+        );
+        assert_eq!(header_blob["installation_id"], "inst");
+        assert_eq!(header_blob["session_id"], outbound.thread_id);
+        assert_eq!(header_blob["thread_id"], outbound.thread_id);
+        assert_eq!(header_blob["agent_name"], "/root");
+        assert_eq!(header_blob["turn_id"], turn_id);
+        assert_eq!(header_blob["window_id"], format!("{}:0", outbound.thread_id));
+        assert_eq!(header_blob["window_number"], 0);
+        assert!(is_uuid_v7(header_blob["context_window_id"].as_str().unwrap()));
+        assert_eq!(header_blob["request_kind"], "turn");
+        assert_eq!(header_blob["root_turn_id"], turn_id);
+        assert_eq!(header_blob["thread_source"], "user");
+        assert_eq!(header_blob["sandbox"], "seatbelt");
+        assert_eq!(header_blob["sandbox_mode"], "workspace-write");
+        assert_eq!(header_blob["auto_review_enabled"], false);
+        assert_eq!(header_blob["node_repl_auto_review_required"], false);
+        assert_eq!(header_blob["node_repl_disabled"], false);
+        assert_eq!(header_blob["turn_started_at_unix_ms"], v7_millis(&turn_id));
+
+        // Body: prompt_cache_key = session; flat metadata in official
+        // `client_metadata()` key order; blob identical to the header.
+        assert_eq!(body["prompt_cache_key"], outbound.thread_id);
+        let meta = body["client_metadata"].as_object().unwrap();
+        assert_eq!(
+            meta.keys().cloned().collect::<Vec<_>>(),
+            [
+                "x-codex-installation-id",
+                "session_id",
+                "thread_id",
+                "x-codex-window-id",
+                "turn_id",
+                "root_turn_id",
+                "x-codex-turn-metadata",
+            ]
+        );
+        assert_eq!(meta["x-codex-installation-id"], "inst");
+        assert_eq!(meta["turn_id"], turn_id);
+        assert_eq!(meta["root_turn_id"], turn_id);
+        assert_eq!(meta["x-codex-turn-metadata"], headers["x-codex-turn-metadata"]);
+        assert_eq!(body["input"].as_array().map(Vec::len), Some(3), "input untouched");
+
+        // Nothing of the relay's or Aether's markers survives.
+        let serialized = format!("{headers:?}{body}");
+        assert!(!serialized.contains("5f2c7e1a"));
+        assert!(!serialized.contains("aaaaaaaaaaaa"));
+
+        // Retry of the same turn: identical identity from the store.
+        let again = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &scope(4, 8),
+                &inbound,
+                None,
+                at(1_756_857_700),
+            )
+            .await,
+        );
+        assert_eq!(again.thread_id, outbound.thread_id);
+        assert_eq!(again.turn_id, outbound.turn_id);
+
+        // Linux / Windows user-agents report their own sandbox.
+        let mut linux = btree(&[("user-agent", "codex-tui/0.150.1 (Ubuntu 22.4.0; x86_64)")]);
+        apply_outbound_codex_runtime_identity(
+            &mut linux,
+            None,
+            &inbound,
+            &outbound,
+            CodexRuntimeIdentitySurface::HttpResponses,
+        );
+        let linux_blob: Value = serde_json::from_str(&linux["x-codex-turn-metadata"]).unwrap();
+        assert_eq!(linux_blob["sandbox"], "seccomp");
+        assert!(linux_blob.get("installation_id").is_none(), "no header, no key");
+        let mut windows = btree(&[(
+            "user-agent",
+            "Codex Desktop/0.150.0 (Windows 10.0.26200; x86_64)",
+        )]);
+        apply_outbound_codex_runtime_identity(
+            &mut windows,
+            None,
+            &inbound,
+            &outbound,
+            CodexRuntimeIdentitySurface::HttpResponses,
+        );
+        let windows_blob: Value = serde_json::from_str(&windows["x-codex-turn-metadata"]).unwrap();
+        assert_eq!(windows_blob["sandbox"], "windows_elevated");
+
+        // Compact / header-only surfaces never materialize a synthetic identity.
+        for surface in [
+            CodexRuntimeIdentitySurface::HttpCompact,
+            CodexRuntimeIdentitySurface::Headers,
+            CodexRuntimeIdentitySurface::WsStepBody,
+        ] {
+            let mut untouched = btree(&[("session_id", "5f2c7e1a9b3d5c4e")]);
+            let mut untouched_body = json!({"prompt_cache_key": "keep"});
+            apply_outbound_codex_runtime_identity(
+                &mut untouched,
+                Some(&mut untouched_body),
+                &inbound,
+                &outbound,
+                surface,
+            );
+            assert_eq!(untouched["session_id"], "5f2c7e1a9b3d5c4e", "{surface:?}");
+            assert_eq!(untouched_body["prompt_cache_key"], "keep", "{surface:?}");
+        }
+    }
+
+    #[test]
+    fn http_rewrite_inserts_missing_official_headers_only_on_responses_surface() {
+        let inbound = inbound("in-session", "in-thread", Some("in-turn"));
+        let outbound = outbound_fixture(Some("out-turn"), OutboundTurnSource::Frozen);
+        // A relay stripped session-id / thread-id / x-client-request-id /
+        // window in front of a real client but kept the blob.
+        let blob = r#"{"session_id":"in-session","thread_id":"in-thread","turn_id":"in-turn","window_id":"in-thread:3","request_kind":"turn"}"#;
+        let mut headers = btree(&[("x-codex-turn-metadata", blob)]);
+        apply_outbound_codex_runtime_identity(
+            &mut headers,
+            None,
+            &inbound,
+            &outbound,
+            CodexRuntimeIdentitySurface::HttpResponses,
+        );
+        assert_eq!(headers["session-id"], "out-thread");
+        assert_eq!(headers["thread-id"], "out-thread");
+        assert_eq!(headers["x-client-request-id"], "out-thread");
+        assert_eq!(headers["x-codex-window-id"], "out-thread:0");
+
+        // Header-only surfaces (search / chat / image) and compact keep
+        // rewrite-only semantics.
+        let mut search = btree(&[("x-codex-turn-metadata", blob)]);
+        apply_outbound_codex_runtime_identity(
+            &mut search,
+            None,
+            &inbound,
+            &outbound,
+            CodexRuntimeIdentitySurface::Headers,
+        );
+        assert!(!search.contains_key("session-id"));
+        assert!(!search.contains_key("x-client-request-id"));
+        let mut compact = btree(&[("thread-id", "in-thread")]);
+        apply_outbound_codex_runtime_identity(
+            &mut compact,
+            None,
+            &inbound,
+            &outbound,
+            CodexRuntimeIdentitySurface::HttpCompact,
+        );
+        assert_eq!(compact["thread-id"], "out-thread");
+        assert!(!compact.contains_key("session-id"));
+        assert!(!compact.contains_key("x-client-request-id"));
+    }
+
+    #[test]
+    fn synthetic_prompt_extraction_skips_wrappers_and_reads_string_forms() {
+        let prompts = real_user_prompts(&json!([
+            {"role":"user","content":"<user_instructions>\nx\n</user_instructions>"},
+            {"type":"message","role":"developer","content":"not a user"},
+            {"type":"message","role":"user","content":"  plain string prompt  "},
+            {"type":"function_call_output","call_id":"c","output":"ignored"},
+            {"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:"},{"type":"input_text","text":"with image"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":""}]},
+            {"type":"message","role":"user","content":"<turn_aborted>\nstop\n</turn_aborted>"},
+            {"type":"message","role":"user","content":"<not-a-wrapper> because of the dash"}
+        ]));
+        assert_eq!(
+            prompts,
+            vec![
+                (2, "plain string prompt".to_string()),
+                (4, "with image".to_string()),
+                (7, "<not-a-wrapper> because of the dash".to_string()),
+            ]
+        );
+        assert_eq!(real_user_prompts(&json!("hi")), vec![(0, "hi".to_string())]);
+        assert!(real_user_prompts(&json!(42)).is_empty());
+        assert_eq!(uuid_v7_unix_millis("not-a-uuid"), None);
+        assert_eq!(
+            uuid_v7_unix_millis("3f1c9a2e-0b7d-4c1a-9e2f-aaaaaaaaaaaa"),
+            None,
+            "v4 has no timestamp"
+        );
     }
 
     #[tokio::test]
@@ -2704,15 +3493,27 @@ mod tests {
         let mut compaction = inbound("s", "t", Some("u3"));
         compaction.request_kind = Some(CodexRequestKind::Compaction);
         let during = rewrite(
-            resolve_outbound_codex_runtime_identity(&store, &s, &compaction, None, at(1_756_857_700))
-                .await,
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &compaction,
+                None,
+                at(1_756_857_700),
+            )
+            .await,
         );
         assert_eq!(during.window_number, 0);
         assert_eq!(during.window_id, format!("{thread}:0"));
         assert_eq!(during.context_window_id.as_deref(), Some(ctx0.as_str()));
         // ... and leaves the thread on window 1 without a context id yet.
         let stored = state.kv_get(&s.window_key(&thread)).await.unwrap().unwrap();
-        assert_eq!(ThreadWindow::parse(&stored).unwrap(), ThreadWindow { number: 1, context_window_id: None });
+        assert_eq!(
+            ThreadWindow::parse(&stored).unwrap(),
+            ThreadWindow {
+                number: 1,
+                context_window_id: None
+            }
+        );
 
         // Next request on the thread: window 1, new context id timestamped now.
         let after = rewrite(
@@ -2798,7 +3599,6 @@ mod tests {
         apply_outbound_codex_runtime_identity(
             &mut headers,
             Some(&mut body),
-            None,
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::Headers,
@@ -2811,7 +3611,6 @@ mod tests {
         apply_outbound_codex_runtime_identity(
             &mut headers,
             Some(&mut body),
-            None,
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::WsStepBody,
