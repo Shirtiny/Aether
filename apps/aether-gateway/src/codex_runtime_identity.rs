@@ -1303,14 +1303,25 @@ fn rewrite_headers(
     outbound: &OutboundCodexRuntimeIdentity,
     surface: CodexRuntimeIdentitySurface,
 ) {
-    // Official HTTP `/responses` clients send session-id, thread-id,
-    // x-codex-window-id and x-client-request-id unconditionally (codex-api
-    // `build_session_headers`, `endpoint/responses.rs`,
-    // `compatibility_headers`). A relay that strips them in front of a real
+    // Official HTTP `/responses` and `/responses/compact` requests both carry
+    // session-id, thread-id and x-codex-window-id unconditionally (codex-api
+    // `build_session_headers`, `endpoint/responses.rs`; core client.rs
+    // `compact_conversation_history` extends the same `build_session_headers`
+    // + `compatibility_headers`). A relay that strips them in front of a real
     // client (prod v0.7.104: the dominant downstream) leaves a shape no client
-    // produces, so on that surface missing ones are inserted; every other
-    // surface only rewrites what is present.
-    let insert_missing = surface == CodexRuntimeIdentitySurface::HttpResponses;
+    // produces, so on those surfaces missing ones are inserted; header-only
+    // surfaces (search / chat / image) only rewrite what is present.
+    //
+    // The dash `session-id` header is also what the ChatGPT Codex backend pins
+    // prompt-cache routing on: prod v0.7.104 rewrote requests whose only
+    // affinity header was the legacy `session_id` short header Aether used to
+    // derive, stripped it, and cache misses went from 2% to 44% (`docs/
+    // architecture/codex-pool-runtime-identity-synthesis-plan-2026-09-03.md`
+    // §18.14.7).
+    let insert_missing = matches!(
+        surface,
+        CodexRuntimeIdentitySurface::HttpResponses | CodexRuntimeIdentitySurface::HttpCompact
+    );
     project_header(
         headers,
         SESSION_ID_HEADER,
@@ -1332,17 +1343,26 @@ fn rewrite_headers(
         &outbound.window_id,
         insert_missing,
     );
-    // Official HTTP and WS clients always send x-client-request-id = thread_id
-    // (codex-api endpoint/responses.rs, core client.rs). Anything else here is
-    // the Aether request id or a relay trace id: a per-request random value no
-    // real client produces (prod v0.7.104: 188/188 requests).
-    project_header(
-        headers,
-        X_CLIENT_REQUEST_ID,
-        |_| true,
-        &outbound.thread_id,
-        insert_missing,
-    );
+    // x-client-request-id = thread_id is set by the `/responses` stream
+    // endpoint (codex-api endpoint/responses.rs) and the WS handshake (core
+    // client.rs) only. The compact endpoint (codex-api endpoint/compact.rs)
+    // passes `extra_headers` through and `compact_conversation_history` never
+    // adds it, so a compact request carrying one (Aether's filler writes the
+    // request id) is a shape no client produces: drop it there. Anywhere else
+    // a foreign value is the Aether request id or a relay trace id, a
+    // per-request random value no real client produces (prod v0.7.104:
+    // 188/188 requests), so it is always rewritten to the outbound thread.
+    if surface == CodexRuntimeIdentitySurface::HttpCompact {
+        remove_header(headers, X_CLIENT_REQUEST_ID);
+    } else {
+        project_header(
+            headers,
+            X_CLIENT_REQUEST_ID,
+            |_| true,
+            &outbound.thread_id,
+            surface == CodexRuntimeIdentitySurface::HttpResponses,
+        );
+    }
     if let Some((name, raw)) = header_entry(headers, X_CODEX_TURN_METADATA) {
         if let Some(rewritten) = rewrite_codex_turn_metadata_string(&raw, outbound) {
             headers.insert(name, rewritten);
@@ -3374,7 +3394,7 @@ mod tests {
     }
 
     #[test]
-    fn http_rewrite_inserts_missing_official_headers_only_on_responses_surface() {
+    fn http_rewrite_inserts_missing_official_headers_on_responses_and_compact() {
         let inbound = inbound("in-session", "in-thread", Some("in-turn"));
         let outbound = outbound_fixture(Some("out-turn"), OutboundTurnSource::Frozen);
         // A relay stripped session-id / thread-id / x-client-request-id /
@@ -3393,8 +3413,8 @@ mod tests {
         assert_eq!(headers["x-client-request-id"], "out-thread");
         assert_eq!(headers["x-codex-window-id"], "out-thread:0");
 
-        // Header-only surfaces (search / chat / image) and compact keep
-        // rewrite-only semantics.
+        // Header-only surfaces (search / chat / image) keep rewrite-only
+        // semantics.
         let mut search = btree(&[("x-codex-turn-metadata", blob)]);
         apply_outbound_codex_runtime_identity(
             &mut search,
@@ -3405,7 +3425,14 @@ mod tests {
         );
         assert!(!search.contains_key("session-id"));
         assert!(!search.contains_key("x-client-request-id"));
-        let mut compact = btree(&[("thread-id", "in-thread")]);
+
+        // Official compact carries session-id / thread-id / x-codex-window-id
+        // but never x-client-request-id; Aether's filler writes the request id
+        // there, so it is dropped rather than rewritten.
+        let mut compact = btree(&[
+            ("thread-id", "in-thread"),
+            ("x-client-request-id", "3f1c9a2e-0b7d-4c1a-9e2f-bbbbbbbbbbbb"),
+        ]);
         apply_outbound_codex_runtime_identity(
             &mut compact,
             None,
@@ -3414,7 +3441,8 @@ mod tests {
             CodexRuntimeIdentitySurface::HttpCompact,
         );
         assert_eq!(compact["thread-id"], "out-thread");
-        assert!(!compact.contains_key("session-id"));
+        assert_eq!(compact["session-id"], "out-thread");
+        assert_eq!(compact["x-codex-window-id"], "out-thread:0");
         assert!(!compact.contains_key("x-client-request-id"));
     }
 

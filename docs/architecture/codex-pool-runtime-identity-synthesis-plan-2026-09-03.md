@@ -817,10 +817,11 @@ cd frontend && npm run type-check
 **18.14.3 表面拆分与官方头补齐**
 
 - `CodexRuntimeIdentitySurface` 新增 `HttpCompact`：`/responses/compact` 走「只改写、不物化」（compact 本来就剥 `client_metadata`，无 root 的 compact 保持透传）。规划器按 `openai:responses:compact` 别名选表面。
-- **改写模式下 `HttpResponses` 表面补齐缺失的四个官方头**（`session-id` / `thread-id` / `x-codex-window-id` / `x-client-request-id`）：下游中转有时只剥这四个头而保留 blob，剩下的形状真实客户端产生不了。`Headers` / `HttpCompact` / `WsStepBody` 表面维持「只改写已存在的头」。这条**取代** §18.13 中「`x-client-request-id` 不存在时不补」的说法。
+- **改写模式下 `HttpResponses` 表面补齐缺失的四个官方头**（`session-id` / `thread-id` / `x-codex-window-id` / `x-client-request-id`）：下游中转有时只剥这四个头而保留 blob，剩下的形状真实客户端产生不了。`Headers` / `WsStepBody` 表面维持「只改写已存在的头」。这条**取代** §18.13 中「`x-client-request-id` 不存在时不补」的说法。
+- **（v0.7.106）`HttpCompact` 表面同样补齐 `session-id` / `thread-id` / `x-codex-window-id`，并一律删除 `x-client-request-id`。** 依据 codex-rs @07f18d5f：`core/src/client.rs` `compact_conversation_history` 的 extra_headers 由 `build_session_headers` + `compatibility_headers` 组成（有 session-id / thread-id / x-codex-window-id / x-codex-turn-metadata），`codex-api/src/endpoint/compact.rs` 原样透传 extra_headers；`x-client-request-id = thread_id` 只在 `endpoint/responses.rs` 的流式 `/responses` 和 WS 握手（`client.rs` 1273 附近）写入。所以官方 compact 从不带 `x-client-request-id`，而 Aether 填充器（formats codex.rs `apply_codex_openai_responses_special_headers`）会给 compact 也写入 Aether request_id——.105 把它改写成出站 thread，仍是官方 compact 产生不了的形状。.105 之前 compact 被中转剥头后只剩 blob，也是同类缺陷。
 - `x-trace-id`（Aether 请求追踪头，`TRACE_ID_HEADER`）加入 `CODEX_POOL_UPSTREAM_HEADER_BLOCKLIST`：codex-rs 不发它，且同一值随一次入站请求跨账号重试，是账号间的关联标记。Aether 自身的日志 / 响应头 / 审计仍用它，只是不再送上游。
 
-**18.14.4 单测**（`codex_runtime_identity.rs`、`planner/standard/codex/tests.rs`）：`synthetic_root_follows_first_prompt_and_turn_follows_latest_prompt`（同 turn 续请求同 key、新 prompt 新 turn、不同下游不同 root、包装 / 摘要 / 链式回退、官方身份优先、无 `input` 不合成）；`synthetic_request_materializes_official_http_shape`（头 / 扁平 / blob 键序与取值、短头与 turn-state 删除、三种 UA 的 sandbox、`turn_started_at_unix_ms` = turn v7 时间戳、重试同身份、非 `HttpResponses` 表面不物化）；`http_rewrite_inserts_missing_official_headers_only_on_responses_surface`；`synthetic_prompt_extraction_skips_wrappers_and_reads_string_forms`；规划器泄漏头测试加 `x-trace-id`。
+**18.14.4 单测**（`codex_runtime_identity.rs`、`planner/standard/codex/tests.rs`）：`synthetic_root_follows_first_prompt_and_turn_follows_latest_prompt`（同 turn 续请求同 key、新 prompt 新 turn、不同下游不同 root、包装 / 摘要 / 链式回退、官方身份优先、无 `input` 不合成）；`synthetic_request_materializes_official_http_shape`（头 / 扁平 / blob 键序与取值、短头与 turn-state 删除、三种 UA 的 sandbox、`turn_started_at_unix_ms` = turn v7 时间戳、重试同身份、非 `HttpResponses` 表面不物化）；`http_rewrite_inserts_missing_official_headers_on_responses_and_compact`；`synthetic_prompt_extraction_skips_wrappers_and_reads_string_forms`；规划器泄漏头测试加 `x-trace-id`。
 
 **18.14.5 残余与刻意不做**
 
@@ -832,3 +833,25 @@ cd frontend && npm run type-check
 6. `x-trace-id` 只在 Codex 号池出站剥离，其他 provider 类型不变。
 
 **18.14.6 压缩推进复核（已完成）**：2026-09-05 12:45 CST 以 `/var/tmp/aether-rid/review.sql`（`-v since='2026-09-05 02:36:50+00'`，线上 .104，Codex Pro）复核 §18.12 的 window 模型：改写请求 1048 条，window 头与 blob 一致 1047 / 1047（另 1 条为 memory，blob 按设计不带 window），`wn_without_ctx` 0、`window_id_mismatch` 0；出站 40 条 thread 中 5 条发生过压缩：4 条压缩 1 次后 `window_number` 最大 1、`context_window_id` 2 个，1 条压缩 2 次后最大 2、3 个。CAS 推进 W+1 与下一请求懒 mint 新 C 的路径按设计工作，§18.13 遗留的这一项关闭。
+
+**18.14.7 线上缓存回退根因（v0.7.104 → v0.7.105 / .106）**
+
+.104 于 2026-09-05 02:50 UTC 在 Codex Pro 号池开启合成后，用户侧 prompt cache 命中明显回退。按 `usage_http_audits` + `usage` 复核（status 200，只统计出站头为对象的行）：
+
+| 组 | 请求数 | cache_read=0 占比 | 出站 `session_id` 短头 | 出站 `x-client-request-id` |
+|---|---|---|---|---|
+| 昨天（.103，未合成）带 blob | 1263 | 2.1% | 100%（Aether 由 prompt_cache_key 派生） | 每请求一个新值（Aether request_id） |
+| 今天改写请求，入站无短头 | 723 | **44.1%** | 0%（.104 删掉 Aether 自补的） | 每请求一个新值 |
+| 今天改写请求，入站自带短头 | 257 | 3.5% | 100%（.104 保留入站显式值） | 每请求一个新值 |
+| 今天无元数据透传请求 | 427 | 5.9% | 100% | 每请求一个新值 |
+
+两组改写请求同为 cafecode 中转、同一改写路径、出站 thread / session / turn / context_window_id 逐请求恒定，解码连续出站 body 的 `prompt_cache_key` 也恒等于出站 session（`store:false`）；唯一差别就是短头。同一 thread 内前缀单调增长而命中随机交替（间隔 10–20 s），是路由未钉住的形态，不是前缀不一致。
+
+结论：**ChatGPT Codex 后端在请求头层决定 prompt cache 路由亲和，遗留短头 `session_id` 在时用它；短头没了，剩下的 `x-client-request-id` 每请求随机、又没有 `session-id` / `thread-id` dash 头，路由就随机。** body 的 `prompt_cache_key` 恒定但不足以钉住路由。这层是服务端行为，codex-rs 源码与官方 prompt caching 文档都不涉及，只能靠线上数据。
+
+处置：
+
+- .105 在 `HttpResponses` 表面写出官方形状（`x-client-request-id` = 出站 thread，补 `session-id` / `thread-id` / `x-codex-window-id`，删短头）。当前 codex-rs（@07f18d5f，`codex-api/src/requests/headers.rs` `build_session_headers`）只发 dash 形式的 `session-id` / `thread-id`，非测试代码里已没有下划线形式的 `session_id` / `conversation_id` 头；官方客户端靠这套头正常命中，所以后端必然支持按它们路由。WS 握手 Aether 本来就写 `session-id` / `thread-id` / `x-client-request-id`（`codex_ws/runtime.rs` 1054–1056），今天 WS 请求 cached 占比 91.5%，与昨天一致，不受影响。
+- .106 把 `HttpCompact` 补齐到官方 compact 形状（§18.14.3）。
+- 上线后复核口径：改写请求 `cache_read=0` 占比应回到个位数，`sum(cache_read)/sum(input)` 回到 0.9 附近（今天无短头子组 0.46，有短头子组 0.93）。若不恢复，兜底为在 `/responses` 出站补 `session_id` = 出站 thread（旧版 codex 形状），需另行评估。
+- 不采用「保留 Aether 自补短头」：当前官方客户端不发它，与 dash 头同时出现是任何单一版本 codex 都产生不了的混合形状。
