@@ -1092,10 +1092,13 @@ impl GatewayCodexWsRuntime {
             };
             let synthesized_turn_metadata;
             let turn_metadata = if let Some(outbound) = outbound_identity {
+                // The blob must match the client the handshake user-agent names.
+                let user_agent = case_insensitive_btree_value(&candidate.headers, "user-agent");
                 synthesized_turn_metadata =
-                    rewrite_codex_turn_metadata_string(turn_metadata, outbound).ok_or_else(
-                        || PeerError("x-codex-turn-metadata is not a valid JSON object".into()),
-                    )?;
+                    rewrite_codex_turn_metadata_string(turn_metadata, outbound, user_agent)
+                        .ok_or_else(|| {
+                            PeerError("x-codex-turn-metadata is not a valid JSON object".into())
+                        })?;
                 synthesized_turn_metadata.as_str()
             } else {
                 turn_metadata
@@ -3169,12 +3172,23 @@ fn materialize_codex_ws_step_body(
     // profile normalization and the prompt_cache_key filler above are already
     // in their final shape. Handshake headers are composed by the runtime.
     if let Some(identity) = runtime_identity {
+        // The step body carries no headers; its blob must match the client
+        // the handshake user-agent names (the account profile's, else the
+        // client's own).
+        let user_agent = account_profile
+            .map(|profile| profile.user_agent.as_str())
+            .or_else(|| {
+                request_headers
+                    .get(http::header::USER_AGENT)
+                    .and_then(|value| value.to_str().ok())
+            });
         apply_outbound_codex_runtime_identity(
             &mut BTreeMap::new(),
             Some(&mut body),
             &identity.inbound,
             &identity.outbound,
             CodexRuntimeIdentitySurface::WsStepBody,
+            user_agent,
         );
     }
     let body_text = serde_json::to_string(&body)

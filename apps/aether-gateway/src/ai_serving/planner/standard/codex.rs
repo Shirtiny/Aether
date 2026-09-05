@@ -420,6 +420,7 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
                 &inbound,
                 &outbound,
                 surface,
+                None,
             );
             Some(outbound)
         }

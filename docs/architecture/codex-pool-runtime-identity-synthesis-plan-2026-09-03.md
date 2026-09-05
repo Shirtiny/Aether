@@ -1,6 +1,6 @@
 # Codex 号池出站 Session / Thread / Turn 合成与复用计划
 
-> Status: **Implemented（第四稿）— 已在 `custom` 分支落地，随 `backend-v0.7.101` 交付；`backend-v0.7.102` 为其 code-review 缺陷修复（UUIDv7 ContextV7 缺口 + chat/family 跨格式 `prompt_cache_key` 泄漏，见 §18.11）；`backend-v0.7.104` 把 window 改为按合成 thread 跟踪压缩次数（`window_number` / `context_window_id` / `window_id` 随压缩推进）并加入出站字段白名单（见 §7.3、§9.2、§18.12）。操作员已于 2026-09-05 自行把线上更新到 `backend-v0.7.103` 并在 Codex Pro 号池打开开关（32 thread / 256 turn），线上验证见 §18.12；`backend-v0.7.105` 依 .104 上线后的风控复核修订短头与 `x-client-request-id` 规则（§9.1、§18.13），并对不带任何 codex 元数据的 `/responses` 请求按内容合成 root / turn 并物化官方形状、补齐被中转剥掉的官方头、剥离 `x-trace-id`（§18.14）；`backend-v0.7.106` 让 `HttpCompact` 表面补齐官方头并删 `x-client-request-id`（§18.14.3）。**线上现为 `backend-v0.7.106`（2026-09-05 06:40 UTC），.104 引入的缓存回退已由 .105 修复并验证（§18.14.7、§18.14.9）**。`backend-v0.7.107`（候选，未单独发版）把每日 thread / turn 槽数从固定值改为天花板，实际槽数按账号、按天在 `[ceil(N/2), N]` 内确定性抖动（§7.0、§18.15），同 release 顺带把内置 Codex UA 字典换成 0.153.x、`version` 头随出站 UA；`backend-v0.7.108` 包含 .107 全部内容，并把 thread 分配从哈希分槽改为按到达顺序 mint、当天名册满后复用最久没有新 turn 的 thread（§7.1、§8、§18.16）。
+> Status: **Implemented（第四稿）— 已在 `custom` 分支落地，随 `backend-v0.7.101` 交付；`backend-v0.7.102` 为其 code-review 缺陷修复（UUIDv7 ContextV7 缺口 + chat/family 跨格式 `prompt_cache_key` 泄漏，见 §18.11）；`backend-v0.7.104` 把 window 改为按合成 thread 跟踪压缩次数（`window_number` / `context_window_id` / `window_id` 随压缩推进）并加入出站字段白名单（见 §7.3、§9.2、§18.12）。操作员已于 2026-09-05 自行把线上更新到 `backend-v0.7.103` 并在 Codex Pro 号池打开开关（32 thread / 256 turn），线上验证见 §18.12；`backend-v0.7.105` 依 .104 上线后的风控复核修订短头与 `x-client-request-id` 规则（§9.1、§18.13），并对不带任何 codex 元数据的 `/responses` 请求按内容合成 root / turn 并物化官方形状、补齐被中转剥掉的官方头、剥离 `x-trace-id`（§18.14）；`backend-v0.7.106` 让 `HttpCompact` 表面补齐官方头并删 `x-client-request-id`（§18.14.3）。**线上现为 `backend-v0.7.108`（2026-09-05 10:27 UTC），.104 引入的缓存回退已由 .105 修复并验证（§18.14.7、§18.14.9）**。`backend-v0.7.107`（候选，未单独发版）把每日 thread / turn 槽数从固定值改为天花板，实际槽数按账号、按天在 `[ceil(N/2), N]` 内确定性抖动（§7.0、§18.15），同 release 顺带把内置 Codex UA 字典换成 0.153.x、`version` 头随出站 UA；`backend-v0.7.108` 包含 .107 全部内容，并把 thread 分配从哈希分槽改为按到达顺序 mint、当天名册满后复用最久没有新 turn 的 thread（§7.1、§8、§18.16）；`backend-v0.7.109`（已提交到 `custom`，未发版）把 turn / compaction / prewarm 的出站 blob 改为按当前（0.153.x）客户端形状重建，并让 `sandbox` 跟随出站 UA 的操作系统（§9、§9.2、§18.17）。
 > Date: 2026-09-03
 > Scope: Codex OAuth 号池在选号之后，按账号、按日合成并复用上游可见的 `session_id` / `thread_id` / `turn_id` / `window_id`
 > Production changes: 每个 tag 只触发 CI 构建镜像；线上更新一律由操作员另行授权后按 `docs/operations/release-and-container-update-spec.md` 执行（`.env` 钉 digest、只重建 `app`）。已上线：.103（操作员自行，2026-09-05 之前）→ .104（2026-09-05 02:36 UTC）→ .105（06:05 UTC）→ .106（06:40 UTC）。功能缺省关闭，当前只在 Codex Pro 号池打开（32 / 256）
@@ -12,11 +12,11 @@
 
 | 项 | 现状 |
 |---|---|
-| 线上版本 | `backend-v0.7.106`（2026-09-05 06:40 UTC）；Codex Pro 号池开着 32 thread/天、256 turn/天 + body capture；其他号池关闭 |
+| 线上版本 | `backend-v0.7.108`（2026-09-05 10:27 UTC，含 .107 内容）；Codex Pro 号池开着 32 thread/天、256 turn/天 + body capture；其他号池关闭。`.109`（§18.17）已提交到 `custom`，未发版 |
 | 代码 | `apps/aether-gateway/src/codex_runtime_identity.rs`（算法、四个表面 `HttpResponses` / `HttpCompact` / `Headers` / `WsStepBody`、三表面白名单）；挂点见 §11、§18.1、§18.5、§18.6 |
 | 不变量 | 三套身份平面不混用（§5）；只改出站副本，sticky / WS 绑定 / fence / 用量读入站（§2）；任何真实单一版本 codex-rs 产生不了的确定性形状都是缺陷，优先级高于「少泄漏」（§18.13） |
 | 官方基准 | 本地 `/opt/stacks/openai-codex`；§1–§18.12 按 `357696c5` 复核，§18.13 起按 `07f18d5f`。核对时先看 checkout 版本，不上网查 |
-| 演进 | §18.11（.102 修复）→ §18.12（.104 window / 白名单 + 线上验证）→ §18.13 / §18.14（.105 风控复核、无元数据合成、官方头补齐）→ §18.14.3（.106 compact）→ §18.14.7（缓存回退根因）→ §18.14.8 / §18.14.9（未知键原则、上线验证结果）→ §7.0 / §18.15（.107：每日槽数上限按账号按天抖动）→ §7.1 / §8 / §18.16（.108：thread 按到达顺序 mint、满员复用最久未用） |
+| 演进 | §18.11（.102 修复）→ §18.12（.104 window / 白名单 + 线上验证）→ §18.13 / §18.14（.105 风控复核、无元数据合成、官方头补齐）→ §18.14.3（.106 compact）→ §18.14.7（缓存回退根因）→ §18.14.8 / §18.14.9（未知键原则、上线验证结果）→ §7.0 / §18.15（.107：每日槽数上限按账号按天抖动）→ §7.1 / §8 / §18.16（.108：thread 按到达顺序 mint、满员复用最久未用）→ §18.17（.109：turn / compaction / prewarm blob 按当前客户端形状补齐、`sandbox` 跟随出站 UA 操作系统） |
 | 部署记录 | 仓库根 `容器更新历史.md`（操作员本地文件，未纳入 git）+ `.env.bak.<ts>_pre_vX` |
 | 残余 | §15、§18.14.5：`internal_<source>:<parent>` 形式 `prompt_cache_key` 透传；合成请求压缩探测不到；中转 65 字符 `rs_` id 400 循环另行设计 |
 
@@ -380,7 +380,7 @@ key 构造函数放在新模块 `codex_runtime_identity.rs` 内（与 sticky 的
 |---|---|
 | dash `session-id` / `thread-id` | 写成出站 UUID。HTTP planner 今天没有任何投影代码，这两个头是入站透传；改写是对透传头的新 pass（9.1 末段） |
 | `x-codex-window-id` | `{outbound_thread}:{W}`（W 为该合成 thread 的 window 状态，§7.3；memory 恒 `:0`） |
-| `x-codex-turn-metadata` | 解析后改写 `session_id`/`thread_id`/`turn_id`/`window_id`/`window_number`/`context_window_id`/`installation_id`（后者仍走 profile）；`agent_name` → `/root`、`thread_source` → `user`（memory 保持）、`root_turn_id` → 出站 turn（根 turn 的 root 就是自己，线上 1908/2032）；**只改写已存在的键，不补缺失键**（`request_kind` 缺失时官方 blob 本就没有 installation/window；memory 见 7.2）；删除 7.1 的泄漏键（含 `forked_from_ordinal_exclusive`）；其余键按 §9.2 白名单；Unicode 继续 ASCII escape，保持 HTTP 头安全 |
+| `x-codex-turn-metadata` | 解析后改写 `session_id`/`thread_id`/`turn_id`/`window_id`/`window_number`/`context_window_id`/`installation_id`（后者仍走 profile）；`agent_name` → `/root`、`thread_source` → `user`（memory 保持）、`root_turn_id` → 出站 turn（根 turn 的 root 就是自己，线上 1908/2032）、`sandbox` → 出站 UA 操作系统的平台沙箱（v0.7.109，§18.17）；**`request_kind` 为 turn / compaction / prewarm 时按当前客户端形状重建**（v0.7.109：出站 UA 是 0.153.x，这类 blob 官方恒带 `agent_name` / `window_number` / `context_window_id` / `sandbox` / `sandbox_mode` / 三个 review 标志，旧客户端没发的按默认值补齐，字段按 `CodexTurnMetadataPayload` 顺序）；**`request_kind` 缺失或未知时只改写已存在的键，不补缺失键**（官方 `request_kind=None` 的 blob 本就没有 installation/window；memory 见 7.2）；删除 7.1 的泄漏键（含 `forked_from_ordinal_exclusive`）；其余键按 §9.2 白名单；Unicode 继续 ASCII escape，保持 HTTP 头安全 |
 | 扁平 `client_metadata` | `session_id`、`thread_id`、`turn_id`、`root_turn_id`（→ 出站 turn）、`x-codex-window-id`、`x-codex-installation-id`；删除 parent/subagent/`thread_source`/`subagent_kind` 扁平键；其余键按 §9.2 白名单 |
 | `x-client-request-id` | 见 9.1 |
 | Compact `openai:responses:compact` | body `client_metadata` **继续整段剥离**；请求头仍改写，且必须走 7.5 freeze |
@@ -390,7 +390,7 @@ key 构造函数放在新模块 `codex_runtime_identity.rs` 内（与 sticky 的
 | `previous_response_id` | HTTP Codex 继续剥；WS 经 fence 后原样转发 |
 | 短头 `session_id` / `conversation_id` | 合成开启且有入站 root：一律删除，不论来源（7.4；v0.7.105） |
 
-`turn_started_at_unix_ms`、`sandbox*`、`workspaces`、`tool_namespaces_info`、`compaction`、`request_kind`：v1 原样保留（memory 的 blob 形状见 7.2）。Aether 今天不读 `request_kind`，需新增解析（11 节）。不要重写 `turn_started_at_unix_ms` 去「对齐」UUIDv7 时间戳。
+`turn_started_at_unix_ms`、`workspaces`、`tool_namespaces_info`、`compaction`、`request_kind`：原样保留（memory 的 blob 形状见 7.2）。`sandbox` 自 v0.7.109 起按出站 UA 的操作系统投影；`sandbox_mode`、三个 review 标志在 turn / compaction / prewarm 上缺失时补默认值，`turn_started_at_unix_ms` 在 turn / compaction 上缺失时补出站 turn 的 UUIDv7 时间戳（§18.17）。Aether 今天不读 `request_kind`，需新增解析（11 节）。客户端自己发的 `turn_started_at_unix_ms` 不重写去「对齐」UUIDv7 时间戳。
 
 ### 9.1 HTTP / WS `x-client-request-id`
 
@@ -412,7 +412,7 @@ HTTP planner 今天对 dash `session-id` / `thread-id` / `x-codex-window-id` 没
 
 | 表面 | 改写 | 归一化 | 删除（不上报） | 原样转发 |
 |---|---|---|---|---|
-| blob `x-codex-turn-metadata` | installation_id（profile）、session_id、thread_id、turn_id、window_id、window_number、context_window_id | agent_name → `/root`；thread_source → `user`（memory 保持）；root_turn_id → 出站 turn | forked_from_thread_id、forked_from_ordinal_exclusive、parent_thread_id、parent_turn_id、subagent_kind | request_kind、compaction、turn_trigger、sandbox、sandbox_mode、auto_review_enabled、node_repl_auto_review_required、node_repl_disabled、workspaces、workspace_kind、tool_namespaces_info、turn_started_at_unix_ms、history_ingest_requested |
+| blob `x-codex-turn-metadata` | installation_id（profile）、session_id、thread_id、turn_id、window_id、window_number、context_window_id | agent_name → `/root`；thread_source → `user`（memory 保持）；root_turn_id → 出站 turn；sandbox → 出站 UA 操作系统的平台沙箱（`none` / `external` 保持，Windows 保留 `windows_sandbox`；v0.7.109） | forked_from_thread_id、forked_from_ordinal_exclusive、parent_thread_id、parent_turn_id、subagent_kind | request_kind、compaction、turn_trigger、sandbox_mode、auto_review_enabled、node_repl_auto_review_required、node_repl_disabled、workspaces、workspace_kind、tool_namespaces_info、turn_started_at_unix_ms、history_ingest_requested（turn / compaction / prewarm 上 sandbox_mode 与三个标志缺失时补默认值，turn / compaction 上 turn_started_at_unix_ms 缺失时补出站 turn 的 v7 时间戳；§18.17） |
 | 扁平 `client_metadata` | x-codex-installation-id（profile）、session_id、thread_id、turn_id、root_turn_id、x-codex-window-id、x-codex-turn-metadata、x-codex-turn-state（按 7.6） | — | x-codex-parent-thread-id、x-openai-subagent、parent_thread_id、forked_from_thread_id、parent_turn_id、subagent_kind、thread_source | ws_request_header_x_openai_internal_codex_responses_lite、x-codex-ws-stream-request-start-ms、guardian_ticket、guardian_ticket_requested；Aether 自身的 `sub2api_*` / `aether.*` 控制键 |
 | HTTP 请求头（仅 `x-codex-` / `x-openai-` / `x-oai-` / `x-responsesapi-` 前缀） | x-codex-window-id、x-codex-turn-metadata、x-codex-turn-state（按 7.6） | — | x-codex-parent-thread-id、x-openai-subagent、x-oai-attestation | x-codex-installation-id、x-codex-beta-features、x-codex-routing-hint、x-openai-internal-codex-responses-lite、x-openai-memgen-request、x-responsesapi-include-timing-metrics |
 
@@ -761,7 +761,8 @@ cd frontend && npm run type-check
 - `backend-v0.7.105`（`fa0b3179c`，另含操作员 commit `5579355f9` Codex WS 读超时保留 sticky 账号）：短头删除、`x-client-request-id` = 出站 thread、无元数据请求合成、`HttpResponses` 补齐官方四头、`x-trace-id` 黑名单（§18.13、§18.14）。2026-09-05 06:05 UTC 上线，缓存命中恢复（§18.14.9）。
 - `backend-v0.7.106`（`bed5f7e2d`）：`HttpCompact` 表面补齐官方头并删 `x-client-request-id`（§18.14.3）。2026-09-05 06:40 UTC 上线。
 - `backend-v0.7.107`：每日槽数上限按账号、按天抖动（§7.0、§18.15）；同一 release 顺带把内置 Codex UA 字典 `resources/codex-client-header-profiles.json` 换成线上观察到的 0.153.x 形状（与本功能无关，属 `codex_client_headers`，gpt-6 需要 ≥ 0.153 客户端），并让 `version` 头随出站 UA。**未单独打 tag**：操作员决定直接连同 .108 一起发。
-- `backend-v0.7.108`：thread 按到达顺序 mint、当天名册满后复用最久没有新 turn 的 thread（§7.1、§8、§18.16），包含 .107 的全部内容。操作员授权「打 tag、提交、推送和更新最新版本」。
+- `backend-v0.7.108`：thread 按到达顺序 mint、当天名册满后复用最久没有新 turn 的 thread（§7.1、§8、§18.16），包含 .107 的全部内容。操作员授权「打 tag、提交、推送和更新最新版本」，2026-09-05 10:27 UTC 上线。
+- `backend-v0.7.109`：turn / compaction / prewarm 的出站 blob 按当前客户端形状重建，`sandbox` 跟随出站 UA 的操作系统（§18.17）。已提交到 `custom`；打 tag / 发版 / 上线均需操作员另行授权。
 - 每次上线均按 `docs/operations/release-and-container-update-spec.md`：`.env` 钉 amd64 digest、备份 `.env.bak.<ts>_pre_vX`、只重建 `app`、核对 `_sqlx_migrations` / `schema_backfills` 不变；逐次记录在仓库根 `容器更新历史.md`（未纳入 git）。之后仍由操作员按 §17 门禁决定是否更新与打开。
 
 ### 18.11 v0.7.102 缺陷修复（code-review）
@@ -942,3 +943,24 @@ cd frontend && npm run type-check
 **测试**（`codex_runtime_identity::tests`）：`threads_mint_by_arrival_then_reuse_least_recent_and_stay_stable`（前 `N_day` 个 root 各 mint 新 thread 且 UUIDv7 时间戳 = 到达时刻，之后轮到最久未用；同入站再来仍 Frozen 不变）、`new_turn_protects_its_thread_from_reuse`（新 turn 刷活跃度、frozen 回放不刷）、`roster_starts_fresh_each_day_and_carried_threads_count_against_it`（跨日名册清零；续上的旧 thread 进入今天名册并占名额，满员后它作为最久未用被复用）、`concurrent_new_roots_never_mint_past_the_daily_bound`（多线程 24 个新 root 同时到达，distinct thread ≤ `N_day` 且每个 root 稳定）；既有 `concurrent_mints_converge_on_one_identity`（同 root 并发收敛到一条）与 turn / window / 跨日 freeze 测试不改。
 
 **不做**：turn 侧不改（线上 turn/thread 中位数 1、最大 20，远低于上限，且真实 turn 从不复用，M 上限本来就几乎不绑）；不引入 LRU 之外的「按对话相似度归并」；不做 Lua / 计数键；不对旧哈希 thread 做迁移。
+
+### 18.17 v0.7.109 turn / compaction / prewarm 的 blob 按当前客户端形状重建，`sandbox` 跟随出站 UA 的操作系统
+
+**起因**：.108 上线后复核 Q2 `window_id_mismatch` 22/154，全部来自 codex-tui 0.146.0 / 0.147.0 的入站请求：两侧都没有 `window_number` 键、头与 blob 一致，按 .104 的「只改写已存在的键，不补缺失键」是预期行为。操作员指出：出站 UA 已经是 0.153.x 并且还会继续升，一个 0.153 客户端发出的 turn blob 不带 `window_number` 是它产生不了的形状。同一口径再查 `sandbox`：3 天 Codex Pro 改写请求里 171 条出站 UA 是 Mac OS / Ubuntu 而 blob `sandbox` 是 `windows_sandbox` / `windows_elevated`，同样是不可能的组合。两条都是 §18.13 标准下的缺陷（确定性形状，真实 codex-rs 产生不了）。
+
+**依据（codex-rs 07f18d5f，本地 checkout）**：
+
+- `core/src/turn_metadata.rs` `mcp_metadata_template()`：`agent_name` / `auto_review_enabled` / `node_repl_auto_review_required` / `node_repl_disabled` 恒为 `Some`，`sandbox_tags.record_metadata` 恒写 `sandbox` + `sandbox_mode`；`Session::responses_metadata`（`core/src/session/session.rs`）恒写 `window_number` / `context_window_id`。`core/src/responses_metadata.rs` `turn_metadata_payload()`：`request_kind` 为 turn / compaction / prewarm（非 memory）时 blob 带完整身份（installation / session / thread / agent_name / turn / window_id / window_number / context_window_id）；`request_kind=None` 只带 session / thread / agent_name / turn；memory 不带身份。
+- `turn_started_at_unix_ms` 由 `Session::start_task`（`core/src/tasks/mod.rs`）在任务开始时打点，普通 turn 与 compact 任务都经过它；启动 prewarm（`core/src/session_startup_prewarm.rs`）在任何任务之前发出，blob 没有这个键。
+- `core/src/sandbox_tags.rs` + `sandboxing/src/manager.rs`：`sandbox` 取值 `none`（Disabled 或无平台沙箱）、`external`、`seatbelt`（macOS）、`seccomp`（Linux）、`windows_sandbox` / `windows_elevated`（Windows）；`sandbox_mode` 是策略标签 `danger-full-access` / `external-sandbox` / `read-only` / `workspace-write`，两个维度独立。
+- 线上 0.152+ 入站（3 天，turn）：`sandbox=none` ⇔ `sandbox_mode=danger-full-access` 100%；Mac 只有 seatbelt（workspace-write 189 / read-only 58）；Windows none 2711、windows_sandbox 1049、windows_elevated 1121；Linux none 234、seccomp 4；三个标志组合 false/false/false 3507、false/false/true 1348、true/false/false 622、true/false/true 60。compaction 的必带键集与 turn 相同再加 `compaction`。旧客户端：0.144–0.147 缺 agent_name / window_number / context_window_id / sandbox_mode / 标志，0.148 缺 agent_name / window_number / context_window_id，0.150.0 缺 window_number。
+
+**修法**（`codex_runtime_identity.rs`，只动 blob 改写；头、扁平、短头、freeze、名册不动）：
+
+1. `rewrite_codex_turn_metadata_object` 先照旧删泄漏键、过白名单，再按 `request_kind` 分三路：memory 照旧删身份；**turn / compaction / prewarm 交给新的 `request_identity_blob` 整体重建**——按 `CodexTurnMetadataPayload` 字段顺序（仓库开着 serde_json `preserve_order`，顺序落到线上）写出 installation_id（沿用 profile pass 的值）、session_id、thread_id、`agent_name=/root`、turn_id、window_id、window_number、context_window_id、request_kind；`root_turn_id`（→ 出站 turn）与 `thread_source`（→ `user`）只在入站有时保留；`turn_trigger` / `workspaces` / `tool_namespaces_info` / `history_ingest_requested` / `compaction` / `workspace_kind` 等按白名单原样搬；`sandbox` 按第 2 条投影；`sandbox_mode` 缺失时 `none → danger-full-access`、其余 `workspace-write`；三个 review 标志缺失时 `false`（线上最常见组合）；`turn_started_at_unix_ms` 缺失时用出站 turn UUIDv7 的毫秒时间戳补，prewarm 不补。**`request_kind` 缺失 / 未知**：保持 .104 的「只改写已存在键」（官方 None 形状本就没有 window 键）。
+2. `sandbox` 在所有非 memory 形状上按出站 UA 的操作系统投影（`OutboundClientOs::project_sandbox`）：`none` / `external` 与平台无关，保持；Windows UA 下 `windows_sandbox` / `windows_elevated` 都是真实取值，保持；其余一律换成出站平台沙箱（Mac → `seatbelt`，Windows → `windows_elevated`，其它 → `seccomp`）。.105 合成请求的 `sandbox_tags_for_user_agent` 并入同一实现。
+3. 出站 UA 的来源：HTTP 表面从改写时手头的 headers 读（profile pass 已把 UA 换成池档位）；WS 握手从 `candidate.headers` 读；WS step body 没有头，由 `materialize_codex_ws_step_body` 传入账号 profile 的 UA（无 profile 时用客户端自己的）。`apply_outbound_codex_runtime_identity` / `rewrite_codex_turn_metadata_string` 各多一个 `user_agent: Option<&str>` 参数。
+
+**不做**：不按入站 `sandbox_mode` 去猜 `sandbox`（策略与后端是两个维度）；不重写客户端自己发的 `turn_started_at_unix_ms` / 标志 / 策略；不改 memory 与 None 形状；不给合成请求补 `workspaces` 等可选键；UA 之外不做别的指纹推断。
+
+**测试**：新增 `request_identity_blob_matches_current_client_shape_and_outbound_os`（0.147 形状 turn blob 重建后的完整键序与取值、缺 stamp 时从 v7 turn 补、prewarm 不补 stamp、compaction 保留 `compaction` / `workspace_kind` 位置与已发的 `read-only` / `true`、`project_sandbox` 投影表、None 形状只投影 sandbox 不补键、Headers 表面从头里读 UA）；`body_rewrite_keeps_flat_and_blob_consistent` 改为 Windows UA 下 `seatbelt → windows_elevated` 并断言补齐键；`whitelist_strips_unknown_keys_on_every_surface` 改为按键断言。线上复核见 runbook §3.5 Q11 / Q12。

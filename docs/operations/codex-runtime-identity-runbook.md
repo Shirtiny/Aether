@@ -2,7 +2,7 @@
 
 > 对象：接手维护 `pool_advanced.codex_runtime_identity` 的人或 AI。设计与算法在
 > `docs/architecture/codex-pool-runtime-identity-synthesis-plan-2026-09-03.md`（下称「设计文档」），本文只讲线上怎么看、怎么判、怎么退。
-> 最后更新：2026-09-05（线上 `backend-v0.7.106`；`.108`（含 `.107` 候选内容）在 `custom` 分支发版中）。
+> 最后更新：2026-09-05（线上 `backend-v0.7.108`，10:27 UTC，含 `.107` 内容；`.109` 已提交到 `custom`，未发版）。
 
 ## 1. 现状速览
 
@@ -10,14 +10,14 @@
 |---|---|
 | 功能 | Codex OAuth 号池选号之后，把上游可见的 `session_id` / `thread_id` / `turn_id` / `window_id` 改写成「每账号每日少量 thread / turn」的合成身份；入站官方 ID 一律不动（sticky、WS 绑定、fence、用量都读入站） |
 | 开关 | 号池高级设置 →「会话身份合成」卡片；JSON 为 `pool_advanced.codex_runtime_identity {enabled, expected_threads_per_day 1..=64, expected_turns_per_day 1..=512}`；缺省关闭。两个数字是 **每日上限**：.107 起当天实际额度按账号、按天（turn 再按 thread）在 `[⌈N/2⌉, N]` / `[⌈M/2⌉, M]` 内确定性抖动，.106 及之前是固定模数；.108 起新对话按到达顺序各开一条 thread，当天额度用满后复用最久没有新 turn 的那条（.107 及之前按哈希分槽）。一个人日常用 codex 大约几条到十几条 thread，上限建议 8–16；Codex Pro 现填 32 偏高 |
-| 线上 | `backend-v0.7.106`（2026-09-05 06:40 UTC）；Codex Pro 号池开着 32 thread/天、256 turn/天 + 请求体/响应体捕获。.104 于 02:36 UTC、.105 于 06:05 UTC 同日上线 |
+| 线上 | `backend-v0.7.108`（2026-09-05 10:27 UTC）；Codex Pro 号池开着 32 thread/天、256 turn/天 + 请求体/响应体捕获。.104 于 02:36 UTC、.105 于 06:05 UTC、.106 于 06:40 UTC 同日上线 |
 | 代码 | `apps/aether-gateway/src/codex_runtime_identity.rs`（算法、白名单、四个表面）；HTTP 挂点 `ai_serving/planner/standard/openai/responses/decision/request.rs`、`ai_serving/planner/standard/codex.rs`；WS 挂点 `codex_ws/runtime.rs`；配置校验 `handlers/admin/provider/write/normalize.rs`；前端号池高级设置卡片 |
 | 状态存储 | Redis `ap:{provider_id}:codex_rid:{selection_fp}:...`（thread 到达序号、当天 thread 名册 ZSET（.108）、turn 槽、root/turn freeze、window），全部带 TTL；进程内还有 WS 候选快照 |
 | 观测 | 日志事件 `codex_rid_config_invalid` / `codex_rid_store_unavailable` / `codex_rid_chain_freeze_miss` / `codex_rid_unknown_metadata_key` / `codex_rid_thread_reused`（§4） |
 | 部署记录 | 仓库根 `容器更新历史.md`（操作员本地文件，未纳入 git）+ `.env.bak.<ts>_pre_vX`；更新流程见 `docs/operations/release-and-container-update-spec.md` |
 | 官方源码基准 | 本地 checkout `/opt/stacks/openai-codex`（codex-rs），**不要上网查**；核对前先 `git -C /opt/stacks/openai-codex log -1 --format='%h %cd'` 记下版本 |
 
-版本演进（详见设计文档 §18.10–§18.14）：
+版本演进（详见设计文档 §18.10–§18.17）：
 
 | tag | 内容 | 线上 |
 |---|---|---|
@@ -26,7 +26,8 @@
 | .105 | 删 Aether 自补短头、`x-client-request-id` = 出站 thread、无元数据请求合成、`HttpResponses` 补齐官方四头、`x-trace-id` 黑名单 | 2026-09-05 06:05 UTC，缓存恢复 |
 | .106 | `HttpCompact` 表面补齐 `session-id` / `thread-id` / `x-codex-window-id`，删 `x-client-request-id` | 2026-09-05 06:40 UTC |
 | .107（候选，未单独发版） | 每日 thread / turn 槽数上限按账号、按天抖动（设计文档 §7.0、§18.15）；内置 Codex UA 字典换成 23 组线上观察到的 0.153.x（gpt-6 要求 ≥ 0.153 客户端）；`version` 头随出站 UA 改写（此前透传入站值、中转无此头、Search 遇 `Codex Desktop` UA 会删掉） | 并入 .108 |
-| .108 | 含 .107 全部内容；thread 改为按到达顺序 mint、当天名册满后复用最久没有新 turn 的 thread（设计文档 §7.1、§8、§18.16）；新事件 `codex_rid_thread_reused` | 发版中；Redis 新增 `…:{day}:threads` ZSET，无需迁移，切换当天账号 thread 数可能一次性略超上限 |
+| .108 | 含 .107 全部内容；thread 改为按到达顺序 mint、当天名册满后复用最久没有新 turn 的 thread（设计文档 §7.1、§8、§18.16）；新事件 `codex_rid_thread_reused` | 2026-09-05 10:27 UTC；Redis 新增 `…:{day}:threads` ZSET，无需迁移，切换当天账号 thread 数可能一次性略超上限 |
+| .109 | turn / compaction / prewarm 的出站 blob 按当前（0.153.x）客户端形状重建：旧客户端（codex-tui ≤ 0.150）没发的 `agent_name` / `window_number` / `context_window_id` / `sandbox_mode` / 三个 review 标志按默认值补齐；`sandbox` 跟随出站 UA 的操作系统（Mac `seatbelt`、Windows `windows_elevated` 或保留 `windows_sandbox`、其它 `seccomp`；`none` / `external` 保持）（设计文档 §18.17） | 已提交到 `custom`，未发版；上线后用 §3.5 Q11 / Q12 复核 |
 
 ## 2. 数据源与取数规矩
 
@@ -207,9 +208,20 @@ select coalesce(api_format,'?') fmt, coalesce(request_type,'?') rtype,
 from rv where provider_name = 'Codex Pro' and not coalesce(rewritten,false) group by 1,2,3 order by 4 desc;
 \echo === Q10 synthesis pool: outbound headers on NOT-rewritten rows that still carry codex identity
 select k, count(*) from rv, jsonb_object_keys(oh) k where provider_name='Codex Pro' and not coalesce(rewritten,false) and (k like 'x-codex-%' or k like 'x-openai-%' or k in ('session-id','thread-id','session_id','conversation_id')) group by k order by 2 desc;
+\echo === Q11 sandbox tag vs outbound user-agent OS (rewritten, non-memory)  [.109]
+select case when oh->>'user-agent' like '%Mac OS%' then 'mac' when oh->>'user-agent' like '%Windows%' then 'windows' else 'other' end ua_os,
+ coalesce(ob->>'sandbox','<absent>') sandbox, coalesce(ob->>'sandbox_mode','<absent>') sandbox_mode, count(*)
+from rv where rewritten and coalesce(ob->>'request_kind','') <> 'memory' group by 1,2,3 order by 1,4 desc;
+\echo === Q12 current-client key completeness on turn / compaction / prewarm (rewritten only)  [.109]
+select ob->>'request_kind' kind, count(*) n,
+ count(*) filter (where ob ?& array['agent_name','window_number','context_window_id','sandbox','sandbox_mode','auto_review_enabled','node_repl_auto_review_required','node_repl_disabled']) complete,
+ count(*) filter (where ob ? 'turn_started_at_unix_ms') stamped
+from rv where rewritten and ob->>'request_kind' in ('turn','compaction','prewarm') group by 1 order by 2 desc;
 ```
 
 期望：Q2 里 `wn_without_ctx`、`window_id_mismatch`、`header_vs_blob_window_mismatch` 为 0；Q3 无 `leak:*` 行、`session!=thread` 为 0；Q4 无 `session_id` / `conversation_id` / `x-codex-parent-thread-id` / `x-openai-subagent` / `x-trace-id`；Q6 两列都等于 `threads`；Q8 每个 provider 的 `out_threads` 不超过 `expected_threads_per_day`×账号数量级。.105 起 Q9 中 Codex Pro 应几乎没有「no blob either side」行（无元数据请求已合成）。
+
+.109 起：Q11 每个 `ua_os` 只能出现自己平台的 `sandbox`（mac：`seatbelt` / `none` / `external`；windows：`windows_sandbox` / `windows_elevated` / `none` / `external`；other：`seccomp` / `none` / `external`），`sandbox=none` 的行 `sandbox_mode` 只能是 `danger-full-access`，非 memory 行不得出现 `<absent>`（.108 时段 3 天有 171 条 Mac / Ubuntu UA 配 Windows 沙箱标签）；Q12 每行 `complete` = `n`，turn / compaction 行 `stamped` = `n`（prewarm 官方就没有 `turn_started_at_unix_ms`，不要求）。Q2 的 `window_id_mismatch` 在 turn / compaction / prewarm 形状上必须为 0——.108 时的 22/154 全部是 codex-tui 0.146 / 0.147 入站没带 `window_number`，.109 按出站 0.153 客户端补齐；只有 `request_kind` 缺失的行（官方该形状本就没有 `window_number`，线上 3 天 10 条）仍会计入。
 
 按账号看每日出站 thread 数（.107 的抖动是否生效、忙账号是否天天停在同一个数）：
 

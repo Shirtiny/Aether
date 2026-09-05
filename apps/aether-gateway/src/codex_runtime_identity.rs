@@ -90,8 +90,9 @@ const BLOB_IDENTITY_KEYS: &[&str] = &[
 ];
 /// Blob keys normalized instead of removed: `agent_name` → `/root`,
 /// `thread_source` → `user` (memory keeps `memory_consolidation`),
-/// `root_turn_id` → the outbound turn (root turns are their own root).
-const BLOB_NORMALIZED_KEYS: &[&str] = &["agent_name", "thread_source", "root_turn_id"];
+/// `root_turn_id` → the outbound turn (root turns are their own root),
+/// `sandbox` → the platform sandbox of the outbound user-agent's OS.
+const BLOB_NORMALIZED_KEYS: &[&str] = &["agent_name", "thread_source", "root_turn_id", "sandbox"];
 /// Blob keys that only exist on forked / child threads; a root thread never
 /// carries them.
 const BLOB_LEAK_KEYS: &[&str] = &[
@@ -102,12 +103,14 @@ const BLOB_LEAK_KEYS: &[&str] = &[
     "subagent_kind",
 ];
 /// Blob keys forwarded verbatim (`CodexResponsesMetadata` fields plus the
-/// Desktop `workspace_kind` extra observed in production).
+/// Desktop `workspace_kind` extra observed in production). On request kinds
+/// that carry the request identity the ones a current client always sends
+/// are filled with the default-configuration value when an older inbound
+/// client omitted them (`request_identity_blob`).
 const BLOB_PASS_KEYS: &[&str] = &[
     "request_kind",
     "compaction",
     "turn_trigger",
-    "sandbox",
     "sandbox_mode",
     "auto_review_enabled",
     "node_repl_auto_review_required",
@@ -589,8 +592,11 @@ impl InboundCodexRuntimeIdentity {
     /// Root the outbound thread is bound to: the official root, otherwise the
     /// synthetic root when one was derived.
     pub(crate) fn root(&self) -> Option<&str> {
-        self.official_root()
-            .or_else(|| self.synthetic.as_ref().map(|synthetic| synthetic.root.as_str()))
+        self.official_root().or_else(|| {
+            self.synthetic
+                .as_ref()
+                .map(|synthetic| synthetic.root.as_str())
+        })
     }
 
     /// Official `turn_id`, otherwise `root || thread || window` so a turn-less
@@ -648,9 +654,7 @@ impl InboundCodexRuntimeIdentity {
         let downstream = downstream_fingerprint(headers);
         let prompts = real_user_prompts(input);
         let (root, turn_key) = match (prompts.first(), prompts.last()) {
-            (Some((_, first)), Some((last_index, last)))
-                if !self.previous_response_id_present =>
-            {
+            (Some((_, first)), Some((last_index, last))) if !self.previous_response_id_present => {
                 let root = hex_lower(
                     &sha256(&[
                         SYNTHETIC_ROOT_DOMAIN,
@@ -1242,7 +1246,9 @@ async fn assign_thread(
     }
     match store.roster_oldest(&roster_key).await? {
         Some(thread_id) => {
-            store.roster_touch(&roster_key, &thread_id, score, ttl).await?;
+            store
+                .roster_touch(&roster_key, &thread_id, score, ttl)
+                .await?;
             debug!(
                 event_name = "codex_rid_thread_reused",
                 log_type = "event",
@@ -1424,12 +1430,22 @@ pub(crate) enum CodexRuntimeIdentitySurface {
 /// Rewrites every outbound projection so dash headers, flat `client_metadata`
 /// and the `x-codex-turn-metadata` blob agree on the synthetic identity.
 ///
-/// Only existing keys are rewritten; missing keys are never added (the
-/// official blob shape depends on `request_kind`), except the headers an
-/// official HTTP `/responses` client sends unconditionally. Inbound-tree keys
-/// (parent / fork / subagent) are removed, `agent_name` / `thread_source` /
-/// `root_turn_id` are normalized to the root user-thread shape, and any key
-/// outside the per-surface whitelist is removed and reported.
+/// The request must look like it came from the client the outbound user-agent
+/// names (a current codex-rs build), not from the inbound client. On
+/// `request_kind` turn / compaction / prewarm the turn-metadata blob is rebuilt
+/// in the official field order with every key such a client always sends
+/// (older inbound clients omit `window_number`, `context_window_id`,
+/// `agent_name`, `sandbox_mode` and the review flags), `sandbox` follows the
+/// outbound OS, and the headers an official HTTP `/responses` client sends
+/// unconditionally are inserted. Blobs without a request kind keep their key
+/// set (official `request_kind=None` blobs carry no installation / window
+/// keys). Inbound-tree keys (parent / fork / subagent) are removed,
+/// `agent_name` / `thread_source` / `root_turn_id` are normalized to the root
+/// user-thread shape, and any key outside the per-surface whitelist is removed
+/// and reported.
+///
+/// `user_agent` is the outbound user-agent for the surface whose headers are
+/// not at hand (the WebSocket step body); elsewhere it is read from `headers`.
 ///
 /// A synthetic inbound (no official identity) has nothing to rewrite: the
 /// HTTP `/responses` surface materializes the full official shape instead.
@@ -1439,19 +1455,22 @@ pub(crate) fn apply_outbound_codex_runtime_identity(
     inbound: &InboundCodexRuntimeIdentity,
     outbound: &OutboundCodexRuntimeIdentity,
     surface: CodexRuntimeIdentitySurface,
+    user_agent: Option<&str>,
 ) {
+    let header_user_agent = header_entry(headers, USER_AGENT_HEADER).map(|(_, value)| value);
+    let os = OutboundClientOs::from_user_agent(user_agent.or(header_user_agent.as_deref()));
     if inbound.is_synthetic() {
         if surface == CodexRuntimeIdentitySurface::HttpResponses {
-            materialize_http_responses(headers, body, outbound);
+            materialize_http_responses(headers, body, outbound, os);
         }
         return;
     }
     if surface != CodexRuntimeIdentitySurface::WsStepBody {
-        rewrite_headers(headers, inbound, outbound, surface);
+        rewrite_headers(headers, inbound, outbound, surface, os);
     }
     if surface != CodexRuntimeIdentitySurface::Headers {
         if let Some(body) = body {
-            rewrite_body(body, inbound, outbound);
+            rewrite_body(body, inbound, outbound, os);
         }
     }
 }
@@ -1461,6 +1480,7 @@ fn rewrite_headers(
     inbound: &InboundCodexRuntimeIdentity,
     outbound: &OutboundCodexRuntimeIdentity,
     surface: CodexRuntimeIdentitySurface,
+    os: OutboundClientOs,
 ) {
     // Official HTTP `/responses` and `/responses/compact` requests both carry
     // session-id, thread-id and x-codex-window-id unconditionally (codex-api
@@ -1523,7 +1543,7 @@ fn rewrite_headers(
         );
     }
     if let Some((name, raw)) = header_entry(headers, X_CODEX_TURN_METADATA) {
-        if let Some(rewritten) = rewrite_codex_turn_metadata_string(&raw, outbound) {
+        if let Some(rewritten) = rewrite_turn_metadata_blob_string(&raw, outbound, os) {
             headers.insert(name, rewritten);
         }
     }
@@ -1544,6 +1564,7 @@ fn rewrite_body(
     body: &mut Value,
     inbound: &InboundCodexRuntimeIdentity,
     outbound: &OutboundCodexRuntimeIdentity,
+    os: OutboundClientOs,
 ) {
     let Some(object) = body.as_object_mut() else {
         return;
@@ -1588,7 +1609,7 @@ fn rewrite_body(
         client_metadata.remove(*key);
     }
     if let Some(blob) = client_metadata.get_mut(X_CODEX_TURN_METADATA) {
-        rewrite_codex_turn_metadata_value(blob, outbound);
+        rewrite_codex_turn_metadata_value(blob, outbound, os);
     }
     if !outbound.forwards_turn_state() {
         client_metadata.remove(X_CODEX_TURN_STATE);
@@ -1597,26 +1618,40 @@ fn rewrite_body(
 }
 
 /// Rewrites a serialized `x-codex-turn-metadata` blob (header or
-/// `client_metadata` string). Returns `None` when it is not a JSON object.
+/// `client_metadata` string) for the client the outbound `user_agent` names.
+/// Returns `None` when it is not a JSON object.
 pub(crate) fn rewrite_codex_turn_metadata_string(
     raw: &str,
     outbound: &OutboundCodexRuntimeIdentity,
+    user_agent: Option<&str>,
+) -> Option<String> {
+    rewrite_turn_metadata_blob_string(raw, outbound, OutboundClientOs::from_user_agent(user_agent))
+}
+
+fn rewrite_turn_metadata_blob_string(
+    raw: &str,
+    outbound: &OutboundCodexRuntimeIdentity,
+    os: OutboundClientOs,
 ) -> Option<String> {
     let mut parsed = serde_json::from_str::<Value>(raw).ok()?;
     let object = parsed.as_object_mut()?;
-    rewrite_codex_turn_metadata_object(object, outbound);
+    rewrite_codex_turn_metadata_object(object, outbound, os);
     // Embedded in an HTTP header: keep every byte ASCII.
     serialize_ascii_json(&parsed)
 }
 
-fn rewrite_codex_turn_metadata_value(blob: &mut Value, outbound: &OutboundCodexRuntimeIdentity) {
+fn rewrite_codex_turn_metadata_value(
+    blob: &mut Value,
+    outbound: &OutboundCodexRuntimeIdentity,
+    os: OutboundClientOs,
+) {
     match blob {
         Value::String(raw) => {
-            if let Some(rewritten) = rewrite_codex_turn_metadata_string(raw, outbound) {
+            if let Some(rewritten) = rewrite_turn_metadata_blob_string(raw, outbound, os) {
                 *raw = rewritten;
             }
         }
-        Value::Object(object) => rewrite_codex_turn_metadata_object(object, outbound),
+        Value::Object(object) => rewrite_codex_turn_metadata_object(object, outbound, os),
         _ => {}
     }
 }
@@ -1624,63 +1659,179 @@ fn rewrite_codex_turn_metadata_value(blob: &mut Value, outbound: &OutboundCodexR
 fn rewrite_codex_turn_metadata_object(
     object: &mut Map<String, Value>,
     outbound: &OutboundCodexRuntimeIdentity,
+    os: OutboundClientOs,
 ) {
-    let memory = non_empty_str(object.get("request_kind")).map(CodexRequestKind::parse)
-        == Some(CodexRequestKind::Memory);
-    if memory {
-        // Official memory blobs carry no installation/session/thread/turn/
-        // root_turn/window/window_number/context_window_id.
-        for key in BLOB_IDENTITY_KEYS {
-            object.remove(*key);
-        }
-        object.remove("root_turn_id");
-    } else {
-        set_if_present(object, "session_id", &outbound.session_id);
-        set_if_present(object, "thread_id", &outbound.thread_id);
-        set_if_present(object, "window_id", &outbound.window_id);
-        // codex-tui >= 0.153: `window_id == "{thread}:{window_number}"` and one
-        // `context_window_id` per (thread, window). Both follow the synthetic
-        // thread's own window state; the inbound values never pass through.
-        if object.contains_key("window_number") {
-            object.insert(
-                "window_number".to_string(),
-                Value::from(outbound.window_number),
-            );
-        }
-        if object.contains_key("context_window_id") {
-            match outbound.context_window_id.as_deref() {
-                Some(context_window_id) => {
-                    object.insert(
-                        "context_window_id".to_string(),
-                        Value::String(context_window_id.to_string()),
-                    );
-                }
-                None => {
-                    object.remove("context_window_id");
-                }
-            }
-        }
-        match outbound.turn_id.as_deref() {
-            Some(turn_id) => set_if_present(object, "turn_id", turn_id),
-            None => {
-                object.remove("turn_id");
-            }
-        }
-        // Folded subagent / feature threads present as the root user thread,
-        // whose root turn is the turn itself.
-        set_if_present(object, "agent_name", ROOT_AGENT_NAME);
-        set_if_present(object, "thread_source", USER_THREAD_SOURCE);
-        match outbound.turn_id.as_deref() {
-            Some(turn_id) => set_if_present(object, "root_turn_id", turn_id),
-            None => {
-                object.remove("root_turn_id");
-            }
-        }
-    }
+    // Inbound-tree markers and unknown keys go first, so the rebuilt blob
+    // below only ever copies whitelisted pass-through keys.
     for key in BLOB_LEAK_KEYS {
         object.remove(*key);
     }
     retain_known_keys(object, "turn_metadata", blob_key_known);
+    // `sandbox` names the platform sandbox of the client's OS (codex-rs
+    // `core/src/sandbox_tags.rs`); a Windows tag under a macOS user-agent is a
+    // shape no client produces, so it follows the outbound OS wherever it is.
+    if let Some(sandbox) = non_empty_str(object.get("sandbox")) {
+        let projected = os.project_sandbox(Some(sandbox));
+        object.insert("sandbox".to_string(), Value::String(projected.to_string()));
+    }
+    match non_empty_str(object.get("request_kind")).map(CodexRequestKind::parse) {
+        Some(CodexRequestKind::Memory) => {
+            // Official memory blobs carry no installation/session/thread/turn/
+            // root_turn/window/window_number/context_window_id.
+            for key in BLOB_IDENTITY_KEYS {
+                object.remove(*key);
+            }
+            object.remove("root_turn_id");
+        }
+        Some(
+            kind @ (CodexRequestKind::Turn
+            | CodexRequestKind::Compaction
+            | CodexRequestKind::Prewarm),
+        ) => {
+            // `has_request_identity` in codex-rs `turn_metadata_payload()`:
+            // the blob carries the whole identity, and a current client
+            // always sends every key `request_identity_blob` fills in.
+            *object = request_identity_blob(object, outbound, kind, os);
+        }
+        None | Some(CodexRequestKind::Other) => {
+            // `request_kind=None` blobs (`has_turn_identity` only) carry no
+            // installation / window keys: rewrite what is present, add nothing.
+            set_if_present(object, "session_id", &outbound.session_id);
+            set_if_present(object, "thread_id", &outbound.thread_id);
+            set_if_present(object, "window_id", &outbound.window_id);
+            if object.contains_key("window_number") {
+                object.insert(
+                    "window_number".to_string(),
+                    Value::from(outbound.window_number),
+                );
+            }
+            if object.contains_key("context_window_id") {
+                match outbound.context_window_id.as_deref() {
+                    Some(context_window_id) => {
+                        object.insert(
+                            "context_window_id".to_string(),
+                            Value::String(context_window_id.to_string()),
+                        );
+                    }
+                    None => {
+                        object.remove("context_window_id");
+                    }
+                }
+            }
+            // Folded subagent / feature threads present as the root user
+            // thread, whose root turn is the turn itself.
+            set_if_present(object, "agent_name", ROOT_AGENT_NAME);
+            set_if_present(object, "thread_source", USER_THREAD_SOURCE);
+            match outbound.turn_id.as_deref() {
+                Some(turn_id) => {
+                    set_if_present(object, "turn_id", turn_id);
+                    set_if_present(object, "root_turn_id", turn_id);
+                }
+                None => {
+                    object.remove("turn_id");
+                    object.remove("root_turn_id");
+                }
+            }
+        }
+    }
+}
+
+/// The blob a current client sends on a request kind that carries the request
+/// identity (turn / compaction / prewarm), rebuilt from the whitelisted
+/// `source` in `CodexTurnMetadataPayload` field order: identity keys follow
+/// the synthetic thread and its window; keys such a client always sends are
+/// filled with the default-configuration value when the inbound client omitted
+/// them (codex-tui ≤ 0.150 has no `window_number` / `context_window_id` /
+/// `agent_name`, ≤ 0.147 no `sandbox_mode` or review flags); optional keys
+/// (`root_turn_id`, `thread_source`, `turn_trigger`, `workspaces`, …) are kept
+/// only when present. `installation_id` stays as the profile pass left it.
+fn request_identity_blob(
+    source: &Map<String, Value>,
+    outbound: &OutboundCodexRuntimeIdentity,
+    kind: CodexRequestKind,
+    os: OutboundClientOs,
+) -> Map<String, Value> {
+    fn copy_key(source: &Map<String, Value>, blob: &mut Map<String, Value>, key: &str) {
+        if let Some(value) = source.get(key) {
+            blob.insert(key.to_string(), value.clone());
+        }
+    }
+    fn set_str(blob: &mut Map<String, Value>, key: &str, value: &str) {
+        blob.insert(key.to_string(), Value::String(value.to_string()));
+    }
+
+    let mut blob = Map::new();
+    copy_key(source, &mut blob, "installation_id");
+    set_str(&mut blob, "session_id", &outbound.session_id);
+    set_str(&mut blob, "thread_id", &outbound.thread_id);
+    set_str(&mut blob, "agent_name", ROOT_AGENT_NAME);
+    if let Some(turn_id) = outbound.turn_id.as_deref() {
+        set_str(&mut blob, "turn_id", turn_id);
+    }
+    set_str(&mut blob, "window_id", &outbound.window_id);
+    blob.insert(
+        "window_number".to_string(),
+        Value::from(outbound.window_number),
+    );
+    if let Some(context_window_id) = outbound.context_window_id.as_deref() {
+        set_str(&mut blob, "context_window_id", context_window_id);
+    }
+    copy_key(source, &mut blob, "request_kind");
+    // A root turn is its own root; both keys are optional for a current client.
+    if source.contains_key("root_turn_id") {
+        if let Some(turn_id) = outbound.turn_id.as_deref() {
+            set_str(&mut blob, "root_turn_id", turn_id);
+        }
+    }
+    if source.contains_key("thread_source") {
+        set_str(&mut blob, "thread_source", USER_THREAD_SOURCE);
+    }
+    copy_key(source, &mut blob, "turn_trigger");
+    let sandbox = os.project_sandbox(non_empty_str(source.get("sandbox")));
+    set_str(&mut blob, "sandbox", sandbox);
+    match source.get("sandbox_mode") {
+        Some(sandbox_mode) => {
+            blob.insert("sandbox_mode".to_string(), sandbox_mode.clone());
+        }
+        None => set_str(&mut blob, "sandbox_mode", default_sandbox_mode(sandbox)),
+    }
+    for flag in [
+        "auto_review_enabled",
+        "node_repl_auto_review_required",
+        "node_repl_disabled",
+    ] {
+        blob.insert(
+            flag.to_string(),
+            source.get(flag).cloned().unwrap_or(Value::Bool(false)),
+        );
+    }
+    copy_key(source, &mut blob, "workspaces");
+    copy_key(source, &mut blob, "tool_namespaces_info");
+    match source.get("turn_started_at_unix_ms") {
+        Some(started_at) => {
+            blob.insert("turn_started_at_unix_ms".to_string(), started_at.clone());
+        }
+        // A real client stamps the turn start when its task starts (codex-rs
+        // `Session::start_task`), and the outbound turn UUIDv7 was minted at
+        // exactly that moment. The startup prewarm is sent before any task, so
+        // a real prewarm blob carries no stamp.
+        None if kind != CodexRequestKind::Prewarm => {
+            if let Some(unix_ms) = outbound.turn_id.as_deref().and_then(uuid_v7_unix_millis) {
+                blob.insert("turn_started_at_unix_ms".to_string(), Value::from(unix_ms));
+            }
+        }
+        None => {}
+    }
+    copy_key(source, &mut blob, "history_ingest_requested");
+    copy_key(source, &mut blob, "compaction");
+    // Flattened `extra` entries (the Desktop `workspace_kind`) and any other
+    // pass-through key serialize after the struct fields.
+    for (key, value) in source {
+        if !blob.contains_key(key) && BLOB_PASS_KEYS.contains(&key.as_str()) {
+            blob.insert(key.clone(), value.clone());
+        }
+    }
+    blob
 }
 
 // ---------------------------------------------------------------------------
@@ -1752,9 +1903,7 @@ fn message_text(content: &Value) -> Option<String> {
 /// summary.
 fn prompt_text(text: &str) -> Option<String> {
     let text = text.trim();
-    if text.is_empty()
-        || text.starts_with(COMPACT_SUMMARY_PREFIX)
-        || starts_with_wrapper_tag(text)
+    if text.is_empty() || text.starts_with(COMPACT_SUMMARY_PREFIX) || starts_with_wrapper_tag(text)
     {
         return None;
     }
@@ -1805,25 +1954,70 @@ struct SyntheticTurnMetadata<'a> {
     turn_started_at_unix_ms: Option<u64>,
 }
 
-/// `sandbox` / `sandbox_mode` a default-configured client reports on the OS
-/// of the outbound user-agent (codex-rs `core/src/sandbox_tags.rs`,
-/// `sandboxing/src/manager.rs`): seatbelt on macOS, the elevated Windows
-/// sandbox on Windows, seccomp elsewhere, all in the default workspace-write
-/// policy.
-fn sandbox_tags_for_user_agent(user_agent: Option<&str>) -> (&'static str, &'static str) {
-    match user_agent {
-        Some(agent) if agent.contains("Mac OS") => ("seatbelt", "workspace-write"),
-        Some(agent) if agent.contains("Windows") => ("windows_elevated", "workspace-write"),
-        _ => ("seccomp", "workspace-write"),
+/// Operating system the outbound user-agent names — the only client-side fact
+/// the `sandbox` tag depends on (codex-rs `core/src/sandbox_tags.rs`,
+/// `sandboxing/src/manager.rs`). A default-configured client reports seatbelt
+/// on macOS, the elevated Windows sandbox on Windows and seccomp elsewhere;
+/// `none` when its policy needs no platform sandbox (`danger-full-access`) and
+/// `external` with an external sandbox, on every OS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundClientOs {
+    MacOs,
+    Windows,
+    Other,
+}
+
+impl OutboundClientOs {
+    fn from_user_agent(user_agent: Option<&str>) -> Self {
+        match user_agent {
+            Some(agent) if agent.contains("Mac OS") => Self::MacOs,
+            Some(agent) if agent.contains("Windows") => Self::Windows,
+            _ => Self::Other,
+        }
+    }
+
+    /// Platform sandbox a default-configured client reports on this OS.
+    fn platform_sandbox(self) -> &'static str {
+        match self {
+            Self::MacOs => "seatbelt",
+            Self::Windows => "windows_elevated",
+            Self::Other => "seccomp",
+        }
+    }
+
+    /// The `sandbox` tag an inbound client's tag translates to on this OS: the
+    /// OS-independent tags stay, a Windows client keeps its choice between the
+    /// restricted-token and the elevated sandbox, and every other platform tag
+    /// (or an unknown one) becomes this OS's platform sandbox.
+    fn project_sandbox(self, inbound: Option<&str>) -> &'static str {
+        match (self, inbound) {
+            (_, Some("none")) => "none",
+            (_, Some("external")) => "external",
+            (Self::Windows, Some("windows_sandbox")) => "windows_sandbox",
+            _ => self.platform_sandbox(),
+        }
+    }
+}
+
+/// `sandbox_mode` a client pairs with `sandbox` when the inbound blob has none:
+/// `none` only arises from a policy without platform sandbox (prod, every
+/// 0.150+ `none` row: `danger-full-access`); a platform sandbox runs the
+/// default `workspace-write` policy.
+fn default_sandbox_mode(sandbox: &str) -> &'static str {
+    if sandbox == "none" {
+        "danger-full-access"
+    } else {
+        "workspace-write"
     }
 }
 
 fn synthetic_turn_metadata_json(
     outbound: &OutboundCodexRuntimeIdentity,
     installation_id: Option<&str>,
-    user_agent: Option<&str>,
+    os: OutboundClientOs,
 ) -> Option<String> {
-    let (sandbox, sandbox_mode) = sandbox_tags_for_user_agent(user_agent);
+    let sandbox = os.platform_sandbox();
+    let sandbox_mode = default_sandbox_mode(sandbox);
     let payload = SyntheticTurnMetadata {
         installation_id,
         session_id: &outbound.session_id,
@@ -1843,10 +2037,7 @@ fn synthetic_turn_metadata_json(
         node_repl_disabled: false,
         // A real client stamps the turn start; the outbound turn UUIDv7 was
         // minted at exactly that moment.
-        turn_started_at_unix_ms: outbound
-            .turn_id
-            .as_deref()
-            .and_then(uuid_v7_unix_millis),
+        turn_started_at_unix_ms: outbound.turn_id.as_deref().and_then(uuid_v7_unix_millis),
     };
     serialize_ascii_json(&serde_json::to_value(payload).ok()?)
 }
@@ -1862,14 +2053,10 @@ fn materialize_http_responses(
     headers: &mut BTreeMap<String, String>,
     body: Option<&mut Value>,
     outbound: &OutboundCodexRuntimeIdentity,
+    os: OutboundClientOs,
 ) {
     let installation_id = header_entry(headers, X_CODEX_INSTALLATION_ID).map(|(_, value)| value);
-    let user_agent = header_entry(headers, USER_AGENT_HEADER).map(|(_, value)| value);
-    let blob = synthetic_turn_metadata_json(
-        outbound,
-        installation_id.as_deref(),
-        user_agent.as_deref(),
-    );
+    let blob = synthetic_turn_metadata_json(outbound, installation_id.as_deref(), os);
 
     set_header(headers, SESSION_ID_HEADER, &outbound.session_id);
     set_header(headers, THREAD_ID_HEADER, &outbound.thread_id);
@@ -2212,6 +2399,10 @@ mod tests {
     const PROVIDER: &str = "prov-1";
     const SELECTION: &str = "codex:account:acc-a";
     const FIXTURE_CONTEXT_WINDOW: &str = "0199094e-7b2b-7000-8000-0123456789ab";
+    const MAC_UA: &str =
+        "codex-tui/0.153.4 (Mac OS 26.2.0; arm64) Orca/1.4.185 (codex-tui; 0.153.4)";
+    const WINDOWS_UA: &str = "codex_cli_rs/0.153.4 (Windows 10.0.26100; x86_64) WindowsTerminal";
+    const LINUX_UA: &str = "codex_cli_rs/0.153.4 (Ubuntu 24.4.0; x86_64) unknown";
 
     fn v7_millis(id: &str) -> u64 {
         u64::from_str_radix(&id.replace('-', "")[..12], 16).unwrap()
@@ -2474,9 +2665,18 @@ mod tests {
             a_turn_bounds.insert(ua);
             differs_from_b |= ta != b.thread_bound(day);
         }
-        assert!(a_thread_bounds.len() > 1, "thread bound never varied across days");
-        assert!(a_turn_bounds.len() > 1, "turn bound never varied across days");
-        assert!(differs_from_b, "two accounts never disagreed on a daily bound");
+        assert!(
+            a_thread_bounds.len() > 1,
+            "thread bound never varied across days"
+        );
+        assert!(
+            a_turn_bounds.len() > 1,
+            "turn bound never varied across days"
+        );
+        assert!(
+            differs_from_b,
+            "two accounts never disagreed on a daily bound"
+        );
         // Sibling threads of one account draw their own turn ceiling.
         let mut sibling_bounds = HashSet::new();
         for i in 0..32 {
@@ -2616,7 +2816,8 @@ mod tests {
                 // Full: the least recently active thread is reused, round robin
                 // here because every root is used exactly once.
                 assert_eq!(
-                    out.thread_id, first[i - bound].thread_id,
+                    out.thread_id,
+                    first[i - bound].thread_id,
                     "root {i} should reuse the least recently active thread"
                 );
             }
@@ -2765,8 +2966,14 @@ mod tests {
                 )
                 .await,
             );
-            assert!(!day0_threads.contains(&out.thread_id), "day 1 reused a day 0 thread");
-            assert_eq!(v7_millis(&out.thread_id), unix_millis(day1 + Duration::from_secs(1 + i as u64)));
+            assert!(
+                !day0_threads.contains(&out.thread_id),
+                "day 1 reused a day 0 thread"
+            );
+            assert_eq!(
+                v7_millis(&out.thread_id),
+                unix_millis(day1 + Duration::from_secs(1 + i as u64))
+            );
             day1_new.insert(out.thread_id);
         }
         assert_eq!(day1_new.len(), bound1 - 1);
@@ -2798,8 +3005,7 @@ mod tests {
                 let store = CodexRuntimeIdentityStore::new(&state);
                 let inbound = inbound(&format!("s{i}"), &format!("t{i}"), Some("u1"));
                 let out = rewrite(
-                    resolve_outbound_codex_runtime_identity(&store, &s, &inbound, None, now)
-                        .await,
+                    resolve_outbound_codex_runtime_identity(&store, &s, &inbound, None, now).await,
                 );
                 (i, out.thread_id)
             }));
@@ -2810,7 +3016,11 @@ mod tests {
             by_root.insert(i, thread);
         }
         let threads: HashSet<&String> = by_root.values().collect();
-        assert!(threads.len() <= bound, "{} threads for bound {bound}", threads.len());
+        assert!(
+            threads.len() <= bound,
+            "{} threads for bound {bound}",
+            threads.len()
+        );
         assert!(threads.len() > 1);
         // Every root keeps the thread it was assigned.
         let store = CodexRuntimeIdentityStore::new(&state);
@@ -3123,6 +3333,7 @@ mod tests {
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::Headers,
+            None,
         );
         assert_eq!(headers["session-id"], "out-thread");
         assert_eq!(headers["thread-id"], "out-thread");
@@ -3160,6 +3371,7 @@ mod tests {
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::Headers,
+            None,
         );
         assert_eq!(foreign["session-id"], "someone-else");
         assert_eq!(foreign["x-client-request-id"], "out-thread");
@@ -3181,6 +3393,7 @@ mod tests {
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::Headers,
+            None,
         );
         assert!(!headers.contains_key("x-codex-turn-state"));
         assert!(!headers.contains_key("session_id"));
@@ -3213,7 +3426,7 @@ mod tests {
                     "request_kind": "turn",
                     "forked_from_thread_id": "fork",
                     "thread_source": "subagent",
-                    "sandbox": "workspace-write",
+                    "sandbox": "seatbelt",
                     "workspaces": ["/tmp/项目"]
                 }).to_string()
             }
@@ -3225,6 +3438,7 @@ mod tests {
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::WsStepBody,
+            Some(WINDOWS_UA),
         );
         assert_eq!(body["prompt_cache_key"], "out-thread");
         let meta = body["client_metadata"].as_object().unwrap();
@@ -3249,7 +3463,15 @@ mod tests {
         assert_eq!(blob["thread_id"], "out-thread");
         assert_eq!(blob["turn_id"], "out-turn");
         assert_eq!(blob["window_id"], "out-thread:0");
-        assert_eq!(blob["sandbox"], "workspace-write");
+        // The blob is what the client named by the (Windows) handshake
+        // user-agent sends: its sandbox tag, and every key a current client
+        // always carries.
+        assert_eq!(blob["sandbox"], "windows_elevated");
+        assert_eq!(blob["sandbox_mode"], "workspace-write");
+        assert_eq!(blob["agent_name"], "/root");
+        assert_eq!(blob["window_number"], 0);
+        assert_eq!(blob["context_window_id"], FIXTURE_CONTEXT_WINDOW);
+        assert_eq!(blob["auto_review_enabled"], false);
         assert_eq!(blob["workspaces"][0], "/tmp/项目");
         assert_eq!(
             blob["thread_source"], "user",
@@ -3281,6 +3503,7 @@ mod tests {
             &missing,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
+            None,
         );
         assert_eq!(body["prompt_cache_key"], "out-thread");
         // Explicit foreign value stays.
@@ -3292,6 +3515,7 @@ mod tests {
             &present,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
+            None,
         );
         assert_eq!(body["prompt_cache_key"], "my-own-key");
         // guardian: prefix is an Aether-derived session key.
@@ -3302,6 +3526,7 @@ mod tests {
             &present,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
+            None,
         );
         assert_eq!(body["prompt_cache_key"], "out-thread");
         // Equal to inbound thread → outbound session.
@@ -3312,6 +3537,7 @@ mod tests {
             &present,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
+            None,
         );
         assert_eq!(body["prompt_cache_key"], "out-thread");
     }
@@ -3355,6 +3581,7 @@ mod tests {
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
+            None,
         );
         assert_eq!(headers["session-id"], "out-thread");
         assert_eq!(headers["thread-id"], "out-thread");
@@ -3382,6 +3609,7 @@ mod tests {
         let rewritten = rewrite_codex_turn_metadata_string(
             r#"{"session_id":"a","thread_id":"b","turn_id":"c"}"#,
             &outbound,
+            None,
         )
         .unwrap();
         let blob: Value = serde_json::from_str(&rewritten).unwrap();
@@ -3390,10 +3618,13 @@ mod tests {
             json!({ "session_id": "out-thread", "thread_id": "out-thread", "turn_id": "out-turn" })
         );
         assert_eq!(
-            rewrite_codex_turn_metadata_string("not json", &outbound),
+            rewrite_codex_turn_metadata_string("not json", &outbound, None),
             None
         );
-        assert_eq!(rewrite_codex_turn_metadata_string("[1]", &outbound), None);
+        assert_eq!(
+            rewrite_codex_turn_metadata_string("[1]", &outbound, None),
+            None
+        );
         // Object form in the body is rewritten in place.
         let mut body = json!({
             "client_metadata": {
@@ -3406,6 +3637,7 @@ mod tests {
             &inbound("in", "in", Some("u")),
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
+            None,
         );
         assert_eq!(
             body["client_metadata"]["x-codex-turn-metadata"],
@@ -3424,6 +3656,7 @@ mod tests {
         let rewritten = rewrite_codex_turn_metadata_string(
             r#"{"session_id":"in","thread_id":"in","turn_id":"t","window_id":"in:71","window_number":71,"context_window_id":"01a06ee4-8a47-79a0-b871-dfca8c798e84","request_kind":"turn","agent_name":"/root/final_check","thread_source":"subagent","root_turn_id":"other","forked_from_ordinal_exclusive":4,"workspace_kind":"project","model":"gpt-5","compaction":{"phase":"mid_turn"}}"#,
             &outbound,
+            None,
         )
         .unwrap();
         let blob: Value = serde_json::from_str(&rewritten).unwrap();
@@ -3450,16 +3683,18 @@ mod tests {
         let degraded = rewrite_codex_turn_metadata_string(
             r#"{"thread_id":"in","window_number":2,"context_window_id":"x","request_kind":"turn"}"#,
             &outbound,
+            None,
         )
         .unwrap();
         let degraded: Value = serde_json::from_str(&degraded).unwrap();
         assert_eq!(degraded["window_number"], 3);
         assert!(degraded.get("context_window_id").is_none());
 
-        // Never added when absent (older clients).
+        // No request kind: official blobs carry no window keys, none are added.
         let older = rewrite_codex_turn_metadata_string(
             r#"{"session_id":"in","thread_id":"in","window_id":"in:2"}"#,
             &outbound,
+            None,
         )
         .unwrap();
         let older: Value = serde_json::from_str(&older).unwrap();
@@ -3471,10 +3706,208 @@ mod tests {
         let memory = rewrite_codex_turn_metadata_string(
             r#"{"request_kind":"memory","thread_id":"in","window_number":5,"context_window_id":"x","root_turn_id":"r"}"#,
             &outbound,
+            None,
         )
         .unwrap();
         let memory: Value = serde_json::from_str(&memory).unwrap();
         assert_eq!(memory, json!({ "request_kind": "memory" }));
+    }
+
+    #[test]
+    fn request_identity_blob_matches_current_client_shape_and_outbound_os() {
+        // codex-tui 0.147 turn blob: no agent_name / window_number /
+        // context_window_id / sandbox_mode / review flags. The outbound
+        // user-agent is a 0.153 build, whose blob always has them, in
+        // `CodexTurnMetadataPayload` field order.
+        let mut outbound = outbound_fixture(Some("out-turn"), OutboundTurnSource::Frozen);
+        outbound.window_number = 2;
+        outbound.window_id = "out-thread:2".to_string();
+        let older = r#"{"installation_id":"inst","session_id":"in","thread_id":"in","turn_id":"t","window_id":"in:3","request_kind":"turn","thread_source":"user","sandbox":"none","workspaces":{"/w":{}},"turn_started_at_unix_ms":1756857600123}"#;
+        let rewritten = rewrite_codex_turn_metadata_string(older, &outbound, Some(MAC_UA)).unwrap();
+        let blob: Value = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(
+            blob.as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                "installation_id",
+                "session_id",
+                "thread_id",
+                "agent_name",
+                "turn_id",
+                "window_id",
+                "window_number",
+                "context_window_id",
+                "request_kind",
+                "thread_source",
+                "sandbox",
+                "sandbox_mode",
+                "auto_review_enabled",
+                "node_repl_auto_review_required",
+                "node_repl_disabled",
+                "workspaces",
+                "turn_started_at_unix_ms",
+            ]
+        );
+        assert_eq!(blob["installation_id"], "inst", "profile pass owns it");
+        assert_eq!(blob["session_id"], "out-thread");
+        assert_eq!(blob["turn_id"], "out-turn");
+        assert_eq!(blob["agent_name"], "/root");
+        assert_eq!(blob["window_id"], "out-thread:2");
+        assert_eq!(
+            blob["window_number"], 2,
+            "inbound `:3` suffix never survives"
+        );
+        assert_eq!(blob["context_window_id"], FIXTURE_CONTEXT_WINDOW);
+        assert_eq!(blob["thread_source"], "user");
+        assert_eq!(blob["sandbox"], "none", "OS-independent tag stays");
+        assert_eq!(
+            blob["sandbox_mode"], "danger-full-access",
+            "the only policy a real client pairs with `none`"
+        );
+        assert_eq!(blob["auto_review_enabled"], false);
+        assert_eq!(blob["node_repl_auto_review_required"], false);
+        assert_eq!(blob["node_repl_disabled"], false);
+        assert_eq!(blob["workspaces"]["/w"], json!({}));
+        assert_eq!(
+            blob["turn_started_at_unix_ms"], 1_756_857_600_123u64,
+            "client's own stamp kept"
+        );
+        assert!(
+            blob.get("root_turn_id").is_none(),
+            "optional key not invented"
+        );
+        assert!(!rewritten.contains("in:3"));
+
+        // No turn stamp inbound: a real client stamps the turn start, which is
+        // the outbound turn's own UUIDv7 timestamp.
+        let v7_turn = uuid_v7_at(1_756_857_600_000);
+        let mut stamped = outbound.clone();
+        stamped.turn_id = Some(v7_turn.clone());
+        let filled = rewrite_codex_turn_metadata_string(
+            r#"{"thread_id":"in","request_kind":"turn","sandbox":"seccomp"}"#,
+            &stamped,
+            Some(MAC_UA),
+        )
+        .unwrap();
+        let filled: Value = serde_json::from_str(&filled).unwrap();
+        assert_eq!(filled["turn_id"], v7_turn);
+        assert_eq!(filled["turn_started_at_unix_ms"], 1_756_857_600_000u64);
+        assert_eq!(
+            filled["sandbox"], "seatbelt",
+            "Linux tag under a macOS user-agent"
+        );
+        assert_eq!(filled["sandbox_mode"], "workspace-write");
+
+        // The startup prewarm is sent before any task stamps the turn start
+        // (codex-rs `Session::start_task`): a real prewarm blob has every
+        // other current-client key but no `turn_started_at_unix_ms`.
+        let prewarm = rewrite_codex_turn_metadata_string(
+            r#"{"session_id":"in","thread_id":"in","turn_id":"t","window_id":"in:0","request_kind":"prewarm"}"#,
+            &stamped,
+            Some(LINUX_UA),
+        )
+        .unwrap();
+        let prewarm: Value = serde_json::from_str(&prewarm).unwrap();
+        assert_eq!(prewarm["window_number"], 2);
+        assert_eq!(prewarm["agent_name"], "/root");
+        assert_eq!(prewarm["sandbox"], "seccomp");
+        assert_eq!(prewarm["sandbox_mode"], "workspace-write");
+        assert_eq!(prewarm["node_repl_disabled"], false);
+        assert!(
+            prewarm.get("turn_started_at_unix_ms").is_none(),
+            "prewarm precedes the task stamp"
+        );
+
+        // Compaction carries the same identity set; `compaction` and the
+        // Desktop `workspace_kind` extra keep their official positions, and
+        // values the client did send (policy, flags) are kept.
+        let compaction = rewrite_codex_turn_metadata_string(
+            r#"{"session_id":"in","thread_id":"in","turn_id":"t","window_id":"in:0","request_kind":"compaction","workspace_kind":"project","sandbox":"windows_elevated","sandbox_mode":"read-only","auto_review_enabled":true,"compaction":{"phase":"mid_turn"}}"#,
+            &outbound,
+            Some(LINUX_UA),
+        )
+        .unwrap();
+        let compaction: Value = serde_json::from_str(&compaction).unwrap();
+        let keys = compaction
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(keys[keys.len() - 2..], ["compaction", "workspace_kind"]);
+        assert_eq!(compaction["window_number"], 2);
+        assert_eq!(compaction["agent_name"], "/root");
+        assert_eq!(
+            compaction["sandbox"], "seccomp",
+            "Windows tag under a Linux user-agent"
+        );
+        assert_eq!(compaction["sandbox_mode"], "read-only");
+        assert_eq!(compaction["auto_review_enabled"], true);
+        assert_eq!(compaction["node_repl_disabled"], false);
+        assert_eq!(compaction["compaction"]["phase"], "mid_turn");
+
+        // Sandbox projection: OS-independent tags stay, Windows keeps its own
+        // two tags, everything else becomes the outbound OS's platform sandbox.
+        for (user_agent, inbound, expected) in [
+            (Some(MAC_UA), Some("seccomp"), "seatbelt"),
+            (Some(MAC_UA), Some("windows_sandbox"), "seatbelt"),
+            (Some(WINDOWS_UA), Some("seatbelt"), "windows_elevated"),
+            (Some(WINDOWS_UA), Some("windows_sandbox"), "windows_sandbox"),
+            (
+                Some(WINDOWS_UA),
+                Some("windows_elevated"),
+                "windows_elevated",
+            ),
+            (Some(LINUX_UA), Some("windows_elevated"), "seccomp"),
+            (Some(LINUX_UA), Some("bubblewrap"), "seccomp"),
+            (Some(WINDOWS_UA), Some("none"), "none"),
+            (Some(LINUX_UA), Some("external"), "external"),
+            (None, None, "seccomp"),
+            (Some(MAC_UA), None, "seatbelt"),
+        ] {
+            let os = OutboundClientOs::from_user_agent(user_agent);
+            assert_eq!(
+                os.project_sandbox(inbound),
+                expected,
+                "{user_agent:?} {inbound:?}"
+            );
+        }
+
+        // No request kind: `sandbox` still follows the OS, the key set stays
+        // the client's own (official `request_kind=None` blobs have no window).
+        let no_kind = rewrite_codex_turn_metadata_string(
+            r#"{"session_id":"in","thread_id":"in","turn_id":"t","sandbox":"seatbelt","sandbox_mode":"workspace-write"}"#,
+            &outbound,
+            Some(WINDOWS_UA),
+        )
+        .unwrap();
+        let no_kind: Value = serde_json::from_str(&no_kind).unwrap();
+        assert_eq!(no_kind["sandbox"], "windows_elevated");
+        assert!(no_kind.get("window_number").is_none());
+        assert!(no_kind.get("agent_name").is_none());
+
+        // Header surface reads the user-agent from the headers themselves.
+        let mut headers = btree(&[
+            ("user-agent", WINDOWS_UA),
+            (
+                "x-codex-turn-metadata",
+                r#"{"session_id":"in","thread_id":"in","turn_id":"t","window_id":"in:0","request_kind":"turn","sandbox":"seatbelt"}"#,
+            ),
+        ]);
+        apply_outbound_codex_runtime_identity(
+            &mut headers,
+            None,
+            &inbound("in", "in", Some("t")),
+            &outbound,
+            CodexRuntimeIdentitySurface::Headers,
+            None,
+        );
+        let header_blob: Value = serde_json::from_str(&headers["x-codex-turn-metadata"]).unwrap();
+        assert_eq!(header_blob["sandbox"], "windows_elevated");
+        assert_eq!(header_blob["window_number"], 2);
     }
 
     #[test]
@@ -3512,6 +3945,7 @@ mod tests {
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
+            None,
         );
         let meta = body["client_metadata"].as_object().unwrap();
         assert_eq!(meta["guardian_ticket_requested"], "true");
@@ -3523,10 +3957,13 @@ mod tests {
         assert!(!meta.contains_key("x-codex-brand-new-flat-key"));
         let blob: Value =
             serde_json::from_str(meta["x-codex-turn-metadata"].as_str().unwrap()).unwrap();
-        assert_eq!(
-            blob,
-            json!({ "thread_id": "out-thread", "request_kind": "turn" })
+        assert_eq!(blob["thread_id"], "out-thread");
+        assert_eq!(blob["request_kind"], "turn");
+        assert!(
+            blob.get("reasoning_effort").is_none(),
+            "unknown key must be stripped"
         );
+        assert_eq!(blob["window_number"], 0, "turn blob is a current client's");
         assert_eq!(headers["x-codex-beta-features"], "a,b");
         assert_eq!(headers["x-codex-routing-hint"], "model=gpt-5;tier=x");
         assert_eq!(headers["x-openai-internal-codex-responses-lite"], "true");
@@ -3583,14 +4020,33 @@ mod tests {
             ),
             &relay,
         );
-        let turn2 = synthesized(&synthetic_body(&["fix the tests", "now the docs"], &[]), &relay);
+        let turn2 = synthesized(
+            &synthetic_body(&["fix the tests", "now the docs"], &[]),
+            &relay,
+        );
         assert!(turn1.is_synthetic());
         assert!(turn1.root().is_some() && turn1.turn_key().is_some());
         assert_eq!(turn1.root(), turn1_followup.root());
-        assert_eq!(turn1.turn_key(), turn1_followup.turn_key(), "tool follow-up is the same turn");
-        assert_eq!(turn1.root(), turn2.root(), "same conversation keeps the thread");
-        assert_ne!(turn1.turn_key(), turn2.turn_key(), "a new prompt is a new turn");
-        assert_eq!(turn1.root().map(str::len), Some(32), "16-byte hex, no prompt text");
+        assert_eq!(
+            turn1.turn_key(),
+            turn1_followup.turn_key(),
+            "tool follow-up is the same turn"
+        );
+        assert_eq!(
+            turn1.root(),
+            turn2.root(),
+            "same conversation keeps the thread"
+        );
+        assert_ne!(
+            turn1.turn_key(),
+            turn2.turn_key(),
+            "a new prompt is a new turn"
+        );
+        assert_eq!(
+            turn1.root().map(str::len),
+            Some(32),
+            "16-byte hex, no prompt text"
+        );
 
         // Another downstream user with the same prompt is another thread.
         let other = synthesized(
@@ -3655,7 +4111,10 @@ mod tests {
             ),
             ("originator", "codex-tui"),
             ("x-codex-installation-id", "inst"),
-            ("x-client-request-id", "3f1c9a2e-0b7d-4c1a-9e2f-aaaaaaaaaaaa"),
+            (
+                "x-client-request-id",
+                "3f1c9a2e-0b7d-4c1a-9e2f-aaaaaaaaaaaa",
+            ),
             ("session_id", "5f2c7e1a9b3d5c4e"),
             ("conversation_id", "5f2c7e1a9b3d5c4e"),
             ("x-codex-turn-state", "stale"),
@@ -3666,11 +4125,15 @@ mod tests {
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
+            None,
         );
         assert_eq!(headers["session-id"], outbound.thread_id);
         assert_eq!(headers["thread-id"], outbound.thread_id);
         assert_eq!(headers["x-client-request-id"], outbound.thread_id);
-        assert_eq!(headers["x-codex-window-id"], format!("{}:0", outbound.thread_id));
+        assert_eq!(
+            headers["x-codex-window-id"],
+            format!("{}:0", outbound.thread_id)
+        );
         assert_eq!(headers["x-codex-installation-id"], "inst");
         assert!(!headers.contains_key("session_id"));
         assert!(!headers.contains_key("conversation_id"));
@@ -3678,7 +4141,12 @@ mod tests {
         assert!(!headers.contains_key("x-codex-beta-features"));
 
         let header_blob: Value = serde_json::from_str(&headers["x-codex-turn-metadata"]).unwrap();
-        let keys = header_blob.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        let keys = header_blob
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         assert_eq!(
             keys,
             [
@@ -3706,9 +4174,14 @@ mod tests {
         assert_eq!(header_blob["thread_id"], outbound.thread_id);
         assert_eq!(header_blob["agent_name"], "/root");
         assert_eq!(header_blob["turn_id"], turn_id);
-        assert_eq!(header_blob["window_id"], format!("{}:0", outbound.thread_id));
+        assert_eq!(
+            header_blob["window_id"],
+            format!("{}:0", outbound.thread_id)
+        );
         assert_eq!(header_blob["window_number"], 0);
-        assert!(is_uuid_v7(header_blob["context_window_id"].as_str().unwrap()));
+        assert!(is_uuid_v7(
+            header_blob["context_window_id"].as_str().unwrap()
+        ));
         assert_eq!(header_blob["request_kind"], "turn");
         assert_eq!(header_blob["root_turn_id"], turn_id);
         assert_eq!(header_blob["thread_source"], "user");
@@ -3738,8 +4211,15 @@ mod tests {
         assert_eq!(meta["x-codex-installation-id"], "inst");
         assert_eq!(meta["turn_id"], turn_id);
         assert_eq!(meta["root_turn_id"], turn_id);
-        assert_eq!(meta["x-codex-turn-metadata"], headers["x-codex-turn-metadata"]);
-        assert_eq!(body["input"].as_array().map(Vec::len), Some(3), "input untouched");
+        assert_eq!(
+            meta["x-codex-turn-metadata"],
+            headers["x-codex-turn-metadata"]
+        );
+        assert_eq!(
+            body["input"].as_array().map(Vec::len),
+            Some(3),
+            "input untouched"
+        );
 
         // Nothing of the relay's or Aether's markers survives.
         let serialized = format!("{headers:?}{body}");
@@ -3768,10 +4248,14 @@ mod tests {
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
+            None,
         );
         let linux_blob: Value = serde_json::from_str(&linux["x-codex-turn-metadata"]).unwrap();
         assert_eq!(linux_blob["sandbox"], "seccomp");
-        assert!(linux_blob.get("installation_id").is_none(), "no header, no key");
+        assert!(
+            linux_blob.get("installation_id").is_none(),
+            "no header, no key"
+        );
         let mut windows = btree(&[(
             "user-agent",
             "Codex Desktop/0.150.0 (Windows 10.0.26200; x86_64)",
@@ -3782,6 +4266,7 @@ mod tests {
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
+            None,
         );
         let windows_blob: Value = serde_json::from_str(&windows["x-codex-turn-metadata"]).unwrap();
         assert_eq!(windows_blob["sandbox"], "windows_elevated");
@@ -3800,6 +4285,7 @@ mod tests {
                 &inbound,
                 &outbound,
                 surface,
+                None,
             );
             assert_eq!(untouched["session_id"], "5f2c7e1a9b3d5c4e", "{surface:?}");
             assert_eq!(untouched_body["prompt_cache_key"], "keep", "{surface:?}");
@@ -3820,6 +4306,7 @@ mod tests {
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::HttpResponses,
+            None,
         );
         assert_eq!(headers["session-id"], "out-thread");
         assert_eq!(headers["thread-id"], "out-thread");
@@ -3835,6 +4322,7 @@ mod tests {
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::Headers,
+            None,
         );
         assert!(!search.contains_key("session-id"));
         assert!(!search.contains_key("x-client-request-id"));
@@ -3844,7 +4332,10 @@ mod tests {
         // there, so it is dropped rather than rewritten.
         let mut compact = btree(&[
             ("thread-id", "in-thread"),
-            ("x-client-request-id", "3f1c9a2e-0b7d-4c1a-9e2f-bbbbbbbbbbbb"),
+            (
+                "x-client-request-id",
+                "3f1c9a2e-0b7d-4c1a-9e2f-bbbbbbbbbbbb",
+            ),
         ]);
         apply_outbound_codex_runtime_identity(
             &mut compact,
@@ -3852,6 +4343,7 @@ mod tests {
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::HttpCompact,
+            None,
         );
         assert_eq!(compact["thread-id"], "out-thread");
         assert_eq!(compact["session-id"], "out-thread");
@@ -4043,6 +4535,7 @@ mod tests {
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::Headers,
+            None,
         );
         assert_eq!(body["prompt_cache_key"], "in-session");
         assert_eq!(headers["session-id"], "out-thread");
@@ -4055,6 +4548,7 @@ mod tests {
             &inbound,
             &outbound,
             CodexRuntimeIdentitySurface::WsStepBody,
+            None,
         );
         assert_eq!(body["prompt_cache_key"], "out-thread");
         assert_eq!(headers["session-id"], "in-session");
