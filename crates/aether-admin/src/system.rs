@@ -22,6 +22,8 @@ use serde::{de, de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 
+mod model_test_templates;
+
 #[derive(Debug, Clone)]
 pub struct AdminSystemSettingsUpdate {
     pub default_provider: Option<Option<String>>,
@@ -1951,6 +1953,7 @@ pub fn is_sensitive_admin_system_config_key(key: &str) -> bool {
 
 pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value> {
     match key {
+        "model_test_request_templates" => Some(json!({ "headers": [], "body": [] })),
         "site_name" => Some(json!("Aether")),
         "site_subtitle" => Some(json!("AI Gateway")),
         "default_user_initial_gift_usd" => Some(json!(10.0)),
@@ -2677,6 +2680,11 @@ pub fn parse_admin_system_config_update(
     }
 
     match normalized_key.as_str() {
+        "model_test_request_templates" => {
+            value = model_test_templates::normalize_templates(value).map_err(|detail| {
+                (http::StatusCode::BAD_REQUEST, json!({ "detail": detail }))
+            })?;
+        }
         "module.important_notification.enabled"
         | "module.important_notification.email_enabled"
         | "module.local_probe_intercept.enabled"

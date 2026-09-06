@@ -126,6 +126,17 @@
         />
       </div>
 
+      <ModelTestRequestPresets
+        :api-format="selectedEndpoint?.api_format"
+        :model-name="selectedModelMapping || requestedModelName || selectingModelName || ''"
+        :request-headers-draft="requestHeadersDraft"
+        :request-body-draft="requestBodyDraft"
+        :request-headers-reset-value="requestHeadersResetValue ?? '{}'"
+        :request-body-reset-value="requestBodyResetValue ?? ''"
+        @update:request-headers-draft="emit('update:requestHeadersDraft', $event)"
+        @update:request-body-draft="emit('update:requestBodyDraft', $event)"
+      />
+
       <div class="grid gap-4 lg:grid-cols-2 lg:items-start">
         <div class="space-y-2">
           <div class="flex items-center justify-between gap-3">
@@ -813,6 +824,7 @@ import {
   formatModelTestDiagnostic,
 } from './model-test-request'
 import type { ModelTestImagePreview } from './model-test-request'
+import ModelTestRequestPresets from './ModelTestRequestPresets.vue'
 
 type TestEndpointOption = {
   id: string
