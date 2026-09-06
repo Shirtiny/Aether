@@ -7,19 +7,25 @@
 //! upstream is replaced, after key selection, by a per-account, per-day
 //! synthetic tree negotiated through the shared runtime state:
 //!
-//! - at most N threads per account per day window, at most M turn slots per
-//!   synthetic thread per day window (`expected_threads_per_day` /
-//!   `expected_turns_per_day`). The effective count of a given day is drawn
-//!   per account (and per thread for turns) from `[ceil(N/2), N]` /
-//!   `[ceil(M/2), M]`, so busy accounts do not all saturate at the same
-//!   configured number every day
+//! - hard account-level ceilings over a trailing 24h window: at most N
+//!   threads active and at most M turns minted (`expected_threads_per_day` /
+//!   `expected_turns_per_day`). The effective ceiling of a given day is drawn
+//!   per account from `[ceil(N/2), N]` / `[ceil(M/2), M]`, so busy accounts
+//!   do not all saturate at the same configured number every day; the
+//!   configured value is never exceeded in any 24h window
 //! - threads grow with activity: a new inbound root mints a new thread while
-//!   the account's day roster is below its bound, then reuses the least
-//!   recently active thread; turns are hashed into per-thread slots
+//!   the account's active roster is below its ceiling (and a turn is still
+//!   affordable), then reuses the least recently active thread
+//! - one open turn per synthetic thread, like a real thread: a new inbound
+//!   turn mints the next outbound turn while the account's turn budget lasts,
+//!   otherwise it continues (steers into) the thread's open turn. Turn ids on
+//!   one thread therefore never interleave or come back
 //! - the same inbound root keeps the same outbound thread across HTTP compact,
 //!   Search, WebSocket reconnects and day rollovers while its freeze is alive
-//! - the same inbound turn keeps the same outbound turn while its freeze is alive
-//! - all UUIDs are UUIDv7 minted at first binding through `SET NX`
+//! - the same inbound turn keeps its outbound turn while it is the thread's
+//!   open turn; `x-codex-turn-state` is forwarded only in that case
+//! - all UUIDs are UUIDv7 minted at first binding through `SET NX` / atomic
+//!   sliding-window admission
 //!
 //! Anything the store cannot answer falls back to passthrough. Nothing is
 //! minted in-process without the store.
@@ -47,11 +53,12 @@ const MAX_THREADS_PER_DAY: u64 = 64;
 const MIN_TURNS_PER_DAY: u64 = 1;
 const MAX_TURNS_PER_DAY: u64 = 512;
 const DAY_WINDOW_SECS: u64 = 86_400;
+/// State outlives the 24h ceiling window by this much, so an idle roster /
+/// ledger entry is still there to be counted when the window slides past it.
 const TTL_GRACE_SECS: u64 = 43_200;
 
 const SELECTION_FP_DOMAIN: &[u8] = b"aether:codex:rid:sel:v1";
 const JITTER_DOMAIN: &[u8] = b"aether:codex:rid:jitter:v1";
-const TURN_SLOT_DOMAIN: &[u8] = b"aether:codex:rid:turn:v1";
 const BOUND_DOMAIN: &[u8] = b"aether:codex:rid:bound:v1";
 
 const X_CODEX_TURN_METADATA: &str = "x-codex-turn-metadata";
@@ -106,7 +113,8 @@ const BLOB_LEAK_KEYS: &[&str] = &[
 /// Desktop `workspace_kind` extra observed in production). On request kinds
 /// that carry the request identity the ones a current client always sends
 /// are filled with the default-configuration value when an older inbound
-/// client omitted them (`request_identity_blob`).
+/// client omitted them (`request_identity_blob`); `BLOB_APP_SERVER_KEYS` are
+/// kept only under an app-server user-agent.
 const BLOB_PASS_KEYS: &[&str] = &[
     "request_kind",
     "compaction",
@@ -121,6 +129,15 @@ const BLOB_PASS_KEYS: &[&str] = &[
     "turn_started_at_unix_ms",
     "history_ingest_requested",
 ];
+/// Blob keys only an app-server host (Desktop, VS Code, `codex_app`) ever
+/// sets: `turn_trigger` comes from `app-server/src/turn_processor.rs` and
+/// `workspace_kind` from its `responsesapi_client_metadata`; the TUI, `codex
+/// exec` and `codex_cli_rs` pass both as `None`. Under a terminal user-agent
+/// they are a shape no real client produces, so they are dropped there.
+const BLOB_APP_SERVER_KEYS: &[&str] = &["turn_trigger", "workspace_kind"];
+/// Originators of the terminal clients (`codex-rs` `tui`, `exec`, `cli`
+/// default), as they lead the official user-agent.
+const TERMINAL_ORIGINATOR_PREFIXES: &[&str] = &["codex-tui/", "codex_exec/", "codex_cli_rs/"];
 /// Flat `client_metadata` keys rewritten to the synthetic identity (the
 /// installation id by the profile pass, the blob by the blob pass).
 const FLAT_IDENTITY_KEYS: &[&str] = &[
@@ -351,16 +368,18 @@ impl CodexRuntimeIdentityScope {
         self.shifted_secs(now) / DAY_WINDOW_SECS
     }
 
-    /// Remaining seconds in the jittered day window plus a 12h grace.
-    pub(crate) fn ttl(&self, now: SystemTime) -> Duration {
-        let remaining = DAY_WINDOW_SECS - (self.shifted_secs(now) % DAY_WINDOW_SECS);
-        Duration::from_secs(remaining + TTL_GRACE_SECS)
+    /// Lifetime of every state key: the 24h ceiling window plus a 12h grace,
+    /// slid on activity. Constant, so a roster or ledger entry is always still
+    /// present while it can count against a window.
+    pub(crate) fn ttl(&self) -> Duration {
+        Duration::from_secs(DAY_WINDOW_SECS + TTL_GRACE_SECS)
     }
 
-    /// Number of threads this account may show on `day_id`: a deterministic
-    /// draw from `[ceil(N/2), N]`. The configured value is the ceiling; the
-    /// per-day draw keeps busy accounts from all showing exactly N new
-    /// threads every day, which no population of real codex users produces.
+    /// Number of threads this account may have active in the trailing 24h on
+    /// `day_id`: a deterministic draw from `[ceil(N/2), N]`. The configured
+    /// value is the ceiling; the per-day draw keeps busy accounts from all
+    /// showing exactly N threads every day, which no population of real codex
+    /// users produces.
     fn thread_bound(&self, day_id: u64) -> u64 {
         let digest = sha256(&[
             BOUND_DOMAIN,
@@ -372,59 +391,43 @@ impl CodexRuntimeIdentityScope {
         jittered_bound(self.config.expected_threads_per_day, &digest)
     }
 
-    /// Number of turn slots `outbound_thread_id` has on `day_id`: a
-    /// deterministic draw from `[ceil(M/2), M]`, keyed by the thread so
-    /// sibling threads of one account do not share a ceiling either.
-    fn turn_bound(&self, day_id: u64, outbound_thread_id: &str) -> u64 {
+    /// Number of turns this account may mint in the trailing 24h on `day_id`:
+    /// a deterministic draw from `[ceil(M/2), M]`. Account-level, not per
+    /// thread: the official per-account turn count is what risk control sees.
+    fn turn_bound(&self, day_id: u64) -> u64 {
         let digest = sha256(&[
             BOUND_DOMAIN,
             b"\0turn\0",
             self.selection_key.as_bytes(),
             b"\0",
             day_id.to_string().as_bytes(),
-            b"\0",
-            outbound_thread_id.as_bytes(),
         ]);
         jittered_bound(self.config.expected_turns_per_day, &digest)
-    }
-
-    fn turn_slot(&self, day_id: u64, outbound_thread_id: &str, inbound_turn_key: &str) -> u64 {
-        let digest = sha256(&[
-            TURN_SLOT_DOMAIN,
-            b"\0",
-            self.selection_key.as_bytes(),
-            b"\0",
-            day_id.to_string().as_bytes(),
-            b"\0",
-            outbound_thread_id.as_bytes(),
-            b"\0",
-            inbound_turn_key.as_bytes(),
-        ]);
-        u64_prefix(&digest) % self.turn_bound(day_id, outbound_thread_id)
     }
 
     fn key_prefix(&self) -> String {
         format!("ap:{}:codex_rid:{}", self.provider_id, self.selection_fp)
     }
 
-    /// The `index`-th thread minted on `day_id`; indexes are claimed in
-    /// arrival order with `SET NX`, which is what bounds new threads per day.
-    fn thread_slot_key(&self, day_id: u64, index: u64) -> String {
-        format!("{}:{day_id}:thread:{index}", self.key_prefix())
+    /// The account's threads: a sorted set of outbound thread ids scored by
+    /// last activity (unix seconds). Members active in the trailing 24h count
+    /// against `thread_bound`; the least recently active one is reused once
+    /// the ceiling is reached.
+    fn thread_roster_key(&self) -> String {
+        format!("{}:threads", self.key_prefix())
     }
 
-    /// The account's active threads of one day window: a sorted set of
-    /// outbound thread ids scored by last activity (unix seconds), read for
-    /// least-recently-active reuse once the day is full.
-    fn thread_roster_key(&self, day_id: u64) -> String {
-        format!("{}:{day_id}:threads", self.key_prefix())
+    /// The account's minted turns: a sorted set of outbound turn ids scored by
+    /// mint time (unix seconds). Members minted in the trailing 24h count
+    /// against `turn_bound`.
+    fn turn_ledger_key(&self) -> String {
+        format!("{}:turns", self.key_prefix())
     }
 
-    fn turn_slot_key(&self, day_id: u64, outbound_thread_id: &str, slot: u64) -> String {
-        format!(
-            "{}:{day_id}:turn:{outbound_thread_id}:{slot}",
-            self.key_prefix()
-        )
+    /// The open turn of one synthetic thread (`OpenTurn`): the turn every
+    /// request on the thread continues until the next one is minted.
+    fn open_turn_key(&self, outbound_thread_id: &str) -> String {
+        format!("{}:open:{outbound_thread_id}", self.key_prefix())
     }
 
     fn freeze_key(&self, inbound_root_hash: &str) -> String {
@@ -739,10 +742,15 @@ impl InboundCodexRuntimeIdentity {
 pub(crate) enum OutboundTurnSource {
     /// Same inbound turn as the WebSocket candidate snapshot.
     Snapshot,
-    /// Read from the per-turn freeze (or written by a concurrent peer).
+    /// The thread's open turn, already bound to this inbound turn (per-turn
+    /// freeze, or opened for it by a concurrent peer).
     Frozen,
-    /// Freshly bound to a turn slot by this request.
+    /// Freshly minted by this request against the account's turn budget.
     Minted,
+    /// The thread's open turn was opened for a different inbound turn and
+    /// this request continues it: the budget was spent, the request chains
+    /// onto a previous response, or its own earlier turn was superseded.
+    Steered,
     /// No turn on this request (`request_kind=memory`).
     None,
 }
@@ -767,10 +775,14 @@ pub(crate) struct OutboundCodexRuntimeIdentity {
 
 impl OutboundCodexRuntimeIdentity {
     /// `x-codex-turn-state` was issued by upstream for the outbound turn of an
-    /// earlier request. Forward it only when this request's outbound turn is
-    /// the same one; never attach it to a freshly minted turn.
+    /// earlier request of the same inbound turn. Forward it only when this
+    /// request's outbound turn is that same turn; never attach it to a freshly
+    /// minted turn or to another inbound turn's open turn.
     pub(crate) fn forwards_turn_state(&self) -> bool {
-        !matches!(self.turn_source, OutboundTurnSource::Minted)
+        matches!(
+            self.turn_source,
+            OutboundTurnSource::Snapshot | OutboundTurnSource::Frozen | OutboundTurnSource::None
+        )
     }
 }
 
@@ -787,10 +799,6 @@ struct RootFreeze {
     /// Legacy (`{thread}:0`); the live window is read from `window_key`.
     window_id: String,
     day_id: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_turn_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_inbound_turn_hash: Option<String>,
 }
 
 impl RootFreeze {
@@ -803,6 +811,35 @@ impl RootFreeze {
     fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
+}
+
+/// The open turn of one synthetic thread. A real thread runs one turn at a
+/// time, so every request on the thread presents this turn until a new inbound
+/// turn mints the next one (budget permitting); turn ids on one thread then
+/// never interleave or come back. `inbound_turn` names the inbound turn the
+/// outbound turn was opened for (`inbound_turn_ref`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct OpenTurn {
+    turn_id: String,
+    inbound_turn: String,
+}
+
+impl OpenTurn {
+    fn parse(raw: &str) -> Option<Self> {
+        serde_json::from_str::<Self>(raw)
+            .ok()
+            .filter(|open| !open.turn_id.is_empty())
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+/// `{root_hash}:{turn_hash}`: one inbound turn of one inbound root, the same
+/// pair the per-turn freeze key is built from. Raw ids are never stored.
+fn inbound_turn_ref(root_hash: &str, turn_hash: &str) -> String {
+    format!("{root_hash}:{turn_hash}")
 }
 
 /// Per-thread context window, mirroring codex-rs `AutoCompactWindowIds`: the
@@ -881,6 +918,23 @@ impl<'a> CodexRuntimeIdentityStore<'a> {
             .map_err(|error| error.to_string())
     }
 
+    async fn set(&self, key: &str, value: &str, ttl: Duration) -> Result<(), String> {
+        self.check()?;
+        self.runtime
+            .kv_set(key, value, Some(ttl))
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), String> {
+        self.check()?;
+        self.runtime
+            .kv_delete(key)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     async fn set_if_absent(&self, key: &str, value: &str, ttl: Duration) -> Result<bool, String> {
         self.check()?;
         self.runtime
@@ -916,27 +970,31 @@ impl<'a> CodexRuntimeIdentityStore<'a> {
             .map_err(|error| error.to_string())
     }
 
-    /// Single-key `SET NX`; the loser reads the winner's value back.
-    async fn get_or_mint(
+    /// Atomic sliding-window admission: drops members scored before
+    /// `window_start`, then adds `member` at `score` only while fewer than
+    /// `max_count` members remain in the window. This is what makes the
+    /// thread and turn ceilings hard under concurrency.
+    async fn admit(
         &self,
         key: &str,
+        member: &str,
+        score: f64,
+        window_start: f64,
+        max_count: u64,
         ttl: Duration,
-        now: SystemTime,
-    ) -> Result<String, String> {
-        if let Some(existing) = self.get(key).await? {
-            return Ok(existing);
-        }
-        let minted = uuid_v7_at(unix_millis(now));
-        if self.set_if_absent(key, &minted, ttl).await? {
-            return Ok(minted);
-        }
-        Ok(self.get(key).await?.unwrap_or(minted))
-    }
-
-    async fn roster_len(&self, key: &str) -> Result<usize, String> {
+    ) -> Result<bool, String> {
         self.check()?;
+        let max_count = usize::try_from(max_count).unwrap_or(usize::MAX);
         self.runtime
-            .score_len(key)
+            .score_add_if_count_below(
+                key,
+                member,
+                score,
+                window_start,
+                window_start,
+                max_count,
+                ttl,
+            )
             .await
             .map_err(|error| error.to_string())
     }
@@ -1084,29 +1142,33 @@ async fn resolve_inner(
         compaction,
     } = *request;
     let day_id = scope.day_id(now);
-    let ttl = scope.ttl(now);
+    let ttl = scope.ttl();
     let root_hash = hash16(root);
 
     if let Some(snapshot) = snapshot {
         let (turn_id, turn_source) = match turn_key {
             None => (None, OutboundTurnSource::None),
-            Some(key)
-                if snapshot.turn_id.is_some()
-                    && snapshot.inbound_turn_key.as_deref() == Some(key) =>
-            {
-                (snapshot.turn_id.clone(), OutboundTurnSource::Snapshot)
-            }
             Some(key) => {
+                // The snapshot's own turn is authoritative for the same inbound
+                // turn only while it is still the thread's open turn; a folded
+                // sibling may have moved the thread on in the meantime.
+                let snapshot_turn = snapshot
+                    .turn_id
+                    .as_deref()
+                    .filter(|_| snapshot.inbound_turn_key.as_deref() == Some(key));
                 resolve_turn(
                     store,
                     scope,
                     &root_hash,
                     &snapshot.thread_id,
                     key,
-                    day_id,
-                    ttl,
-                    now,
-                    None,
+                    TurnContext {
+                        day_id,
+                        ttl,
+                        now,
+                        chained,
+                        snapshot_turn,
+                    },
                 )
                 .await?
             }
@@ -1128,13 +1190,18 @@ async fn resolve_inner(
 
     let freeze_key = scope.freeze_key(&root_hash);
     let mut frozen = match store.get(&freeze_key).await? {
-        Some(raw) => RootFreeze::parse(&raw).map(|freeze| (raw, freeze)),
+        Some(raw) => {
+            let freeze = RootFreeze::parse(&raw);
+            if freeze.is_some() {
+                // Sliding TTL: an active session never changes thread mid-flight.
+                let _ = store.expire_if_value(&freeze_key, &raw, ttl).await?;
+            }
+            freeze
+        }
         None => None,
     };
-    if let Some((raw, _)) = frozen.as_ref() {
-        // Sliding TTL: an active session never changes thread mid-flight.
-        let _ = store.expire_if_value(&freeze_key, raw, ttl).await?;
-    }
+    // A turn minted together with a fresh thread by this request.
+    let mut minted_turn: Option<String> = None;
     if frozen.is_none() {
         if chained {
             debug!(
@@ -1146,56 +1213,79 @@ async fn resolve_inner(
                 "chained request has no root freeze; assigning a thread"
             );
         }
-        let (thread_id, fresh_mint) = assign_thread(store, scope, day_id, ttl, now).await?;
+        let inbound_turn = turn_key.map(|key| inbound_turn_ref(&root_hash, &hash16(key)));
+        let mut assigned =
+            assign_thread(store, scope, day_id, ttl, now, inbound_turn.as_deref()).await?;
         let fresh = RootFreeze {
-            session_id: thread_id.clone(),
-            thread_id: thread_id.clone(),
-            window_id: format!("{thread_id}:0"),
+            session_id: assigned.thread_id.clone(),
+            thread_id: assigned.thread_id.clone(),
+            window_id: format!("{}:0", assigned.thread_id),
             day_id,
-            last_turn_id: None,
-            last_inbound_turn_hash: None,
         };
-        let raw = fresh.to_json();
-        frozen = if store.set_if_absent(&freeze_key, &raw, ttl).await? {
-            Some((raw, fresh))
+        frozen = if store
+            .set_if_absent(&freeze_key, &fresh.to_json(), ttl)
+            .await?
+        {
+            minted_turn = assigned.reserved_turn.take();
+            Some(fresh)
         } else {
-            let winner = match store.get(&freeze_key).await? {
-                Some(existing) => RootFreeze::parse(&existing).map(|freeze| (existing, freeze)),
-                None => None,
-            };
-            match winner {
-                Some(winner) => {
-                    if fresh_mint && winner.1.thread_id != thread_id {
-                        // Lost the freeze race for this root: the thread minted
-                        // here never served a request, so it leaves the roster.
-                        let _ = store
-                            .roster_remove(&scope.thread_roster_key(day_id), &thread_id)
-                            .await?;
+            match store.get(&freeze_key).await? {
+                Some(existing) => match RootFreeze::parse(&existing) {
+                    Some(winner) => {
+                        if assigned.fresh && winner.thread_id != assigned.thread_id {
+                            // Lost the freeze race for this root: the thread
+                            // (and turn) minted here never served a request.
+                            withdraw_thread(store, scope, &assigned).await?;
+                        }
+                        Some(winner)
                     }
-                    Some(winner)
+                    None => {
+                        minted_turn = assigned.reserved_turn.take();
+                        Some(fresh)
+                    }
+                },
+                None => {
+                    minted_turn = assigned.reserved_turn.take();
+                    Some(fresh)
                 }
-                None => Some((raw, fresh)),
             }
         };
     }
-    let (raw_freeze, freeze) = frozen.expect("root freeze resolved above");
+    let freeze = frozen.expect("root freeze resolved above");
 
     let (turn_id, turn_source) = match turn_key {
         None => (None, OutboundTurnSource::None),
-        Some(key) => {
-            resolve_turn(
-                store,
-                scope,
-                &root_hash,
-                &freeze.thread_id,
-                key,
-                day_id,
-                ttl,
-                now,
-                Some((&freeze_key, &raw_freeze, &freeze, chained)),
-            )
-            .await?
-        }
+        Some(key) => match minted_turn {
+            Some(turn_id) => {
+                // Opened on the fresh thread by `assign_thread`; only the
+                // per-turn freeze is still missing.
+                store
+                    .set(
+                        &scope.turn_freeze_key(&root_hash, &hash16(key)),
+                        &turn_id,
+                        ttl,
+                    )
+                    .await?;
+                (Some(turn_id), OutboundTurnSource::Minted)
+            }
+            None => {
+                resolve_turn(
+                    store,
+                    scope,
+                    &root_hash,
+                    &freeze.thread_id,
+                    key,
+                    TurnContext {
+                        day_id,
+                        ttl,
+                        now,
+                        chained,
+                        snapshot_turn: None,
+                    },
+                )
+                .await?
+            }
+        },
     };
 
     let window = resolve_window(store, scope, &freeze.thread_id, compaction, ttl, now).await?;
@@ -1212,40 +1302,72 @@ async fn resolve_inner(
     })
 }
 
+/// Outcome of `assign_thread` for an inbound root without a freeze.
+#[derive(Debug)]
+struct AssignedThread {
+    thread_id: String,
+    /// Turn minted against the account's budget and opened on the fresh
+    /// thread; `None` on reuse or for a memory request.
+    reserved_turn: Option<String>,
+    /// Minted by this request (a lost freeze race withdraws it again).
+    fresh: bool,
+}
+
 /// Picks the outbound thread for an inbound root that has no freeze yet.
 ///
 /// Threads grow with activity, the way a person opens conversations: while
-/// the account's roster for `day_id` holds fewer threads than its daily bound,
-/// a fresh UUIDv7 is minted and claims the next arrival index (`SET NX`, so
-/// concurrent new roots never mint past the bound); once the roster is full,
-/// the least recently active thread is reused. Returns the thread and whether
-/// it was minted here, so a lost freeze race can withdraw it from the roster.
+/// fewer than the account's thread ceiling are active in the trailing 24h a
+/// fresh UUIDv7 is admitted to the roster (atomically, so concurrent new roots
+/// never mint past the ceiling); once the ceiling is reached the least
+/// recently active thread is reused. A new thread always starts with a new
+/// turn, so the turn budget is reserved first: a spent budget, or a request
+/// without a turn (memory), folds the root onto an existing thread instead of
+/// opening one that could only steer. An empty roster always mints.
 async fn assign_thread(
     store: &CodexRuntimeIdentityStore<'_>,
     scope: &CodexRuntimeIdentityScope,
     day_id: u64,
     ttl: Duration,
     now: SystemTime,
-) -> Result<(String, bool), String> {
-    let roster_key = scope.thread_roster_key(day_id);
+    inbound_turn: Option<&str>,
+) -> Result<AssignedThread, String> {
+    let roster_key = scope.thread_roster_key();
     let bound = scope.thread_bound(day_id);
     let score = unix_secs(now) as f64;
-    // Every roster member either claimed an index or carried over from an
-    // earlier day (and then counts against today's bound without claiming
-    // one), so the first free index is at or after the current size.
-    let active = u64::try_from(store.roster_len(&roster_key).await?).unwrap_or(u64::MAX);
-    for index in active..bound {
+    let window_start = score - DAY_WINDOW_SECS as f64;
+
+    let mut reserved_turn = match inbound_turn {
+        Some(_) => reserve_turn(store, scope, day_id, ttl, now).await?,
+        None => None,
+    };
+    if reserved_turn.is_some() {
         let minted = uuid_v7_at(unix_millis(now));
         if store
-            .set_if_absent(&scope.thread_slot_key(day_id, index), &minted, ttl)
+            .admit(&roster_key, &minted, score, window_start, bound, ttl)
             .await?
         {
-            store.roster_touch(&roster_key, &minted, score, ttl).await?;
-            return Ok((minted, true));
+            open_reserved_turn(
+                store,
+                scope,
+                &minted,
+                reserved_turn.as_deref(),
+                inbound_turn,
+                ttl,
+            )
+            .await?;
+            return Ok(AssignedThread {
+                thread_id: minted,
+                reserved_turn,
+                fresh: true,
+            });
         }
     }
     match store.roster_oldest(&roster_key).await? {
         Some(thread_id) => {
+            let turn_budget_spent = inbound_turn.is_some() && reserved_turn.is_none();
+            if let Some(turn_id) = reserved_turn.take() {
+                release_turn(store, scope, &turn_id).await?;
+            }
             store
                 .roster_touch(&roster_key, &thread_id, score, ttl)
                 .await?;
@@ -1256,31 +1378,165 @@ async fn assign_thread(
                 selection_fp = %scope.selection_fp,
                 day_id,
                 bound,
-                "thread roster full; reusing least recently active thread"
+                turn_budget_spent,
+                "thread ceiling reached or turn budget spent; reusing least recently active thread"
             );
-            Ok((thread_id, false))
+            Ok(AssignedThread {
+                thread_id,
+                reserved_turn: None,
+                fresh: false,
+            })
         }
         None => {
-            // Roster gone while its arrival indexes survive (eviction, or a
-            // whole day of lost freeze races): start the day over.
+            // Nothing to reuse (first activity, or the roster expired): a
+            // thread must exist, and with it a turn.
             let minted = uuid_v7_at(unix_millis(now));
             store.roster_touch(&roster_key, &minted, score, ttl).await?;
-            Ok((minted, true))
+            if inbound_turn.is_some() && reserved_turn.is_none() {
+                reserved_turn = Some(force_turn(store, scope, day_id, ttl, now).await?);
+            }
+            open_reserved_turn(
+                store,
+                scope,
+                &minted,
+                reserved_turn.as_deref(),
+                inbound_turn,
+                ttl,
+            )
+            .await?;
+            Ok(AssignedThread {
+                thread_id: minted,
+                reserved_turn,
+                fresh: true,
+            })
         }
     }
 }
 
-/// Reads (and lazily initializes) the synthetic thread's context window, then
-/// advances it when this request is a compaction.
-///
-/// * A window whose `context_window_id` is still unset (thread just minted, or
-///   the previous request was a compaction) mints one `now`: like the real
-///   client, the new window id is timestamped after the compaction finished,
-///   not together with the thread.
-/// * The compaction request itself still carries the current window; the
-///   advance is a compare-and-set to `number + 1` with no context id, so the
-///   next request on the thread mints it. A concurrent writer wins silently.
-/// * Sliding TTL like the root freeze; an active thread never regresses.
+/// Records the turn reserved for a fresh thread as that thread's open turn.
+async fn open_reserved_turn(
+    store: &CodexRuntimeIdentityStore<'_>,
+    scope: &CodexRuntimeIdentityScope,
+    outbound_thread_id: &str,
+    reserved_turn: Option<&str>,
+    inbound_turn: Option<&str>,
+    ttl: Duration,
+) -> Result<(), String> {
+    if let (Some(turn_id), Some(inbound_turn)) = (reserved_turn, inbound_turn) {
+        let open = OpenTurn {
+            turn_id: turn_id.to_string(),
+            inbound_turn: inbound_turn.to_string(),
+        };
+        let _ = store
+            .set_if_absent(
+                &scope.open_turn_key(outbound_thread_id),
+                &open.to_json(),
+                ttl,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// Undoes `assign_thread` for a fresh thread that lost its root's freeze race.
+async fn withdraw_thread(
+    store: &CodexRuntimeIdentityStore<'_>,
+    scope: &CodexRuntimeIdentityScope,
+    assigned: &AssignedThread,
+) -> Result<(), String> {
+    let _ = store
+        .roster_remove(&scope.thread_roster_key(), &assigned.thread_id)
+        .await?;
+    store
+        .delete(&scope.open_turn_key(&assigned.thread_id))
+        .await?;
+    if let Some(turn_id) = assigned.reserved_turn.as_deref() {
+        release_turn(store, scope, turn_id).await?;
+    }
+    Ok(())
+}
+
+/// Mints a UUIDv7 turn against the account's budget: admitted to the ledger
+/// only while fewer than `turn_bound(day_id)` turns were minted in the
+/// trailing 24h. `None` when the budget is spent.
+async fn reserve_turn(
+    store: &CodexRuntimeIdentityStore<'_>,
+    scope: &CodexRuntimeIdentityScope,
+    day_id: u64,
+    ttl: Duration,
+    now: SystemTime,
+) -> Result<Option<String>, String> {
+    let turn_id = uuid_v7_at(unix_millis(now));
+    let score = unix_secs(now) as f64;
+    let window_start = score - DAY_WINDOW_SECS as f64;
+    let admitted = store
+        .admit(
+            &scope.turn_ledger_key(),
+            &turn_id,
+            score,
+            window_start,
+            scope.turn_bound(day_id),
+            ttl,
+        )
+        .await?;
+    Ok(admitted.then_some(turn_id))
+}
+
+/// Mints a turn past the budget because a thread has nothing to continue
+/// (no open turn). Rare: it takes a thread that went idle long enough for its
+/// open turn to expire, or an evicted key. Ledgered so it still counts.
+async fn force_turn(
+    store: &CodexRuntimeIdentityStore<'_>,
+    scope: &CodexRuntimeIdentityScope,
+    day_id: u64,
+    ttl: Duration,
+    now: SystemTime,
+) -> Result<String, String> {
+    let turn_id = uuid_v7_at(unix_millis(now));
+    store
+        .roster_touch(
+            &scope.turn_ledger_key(),
+            &turn_id,
+            unix_secs(now) as f64,
+            ttl,
+        )
+        .await?;
+    debug!(
+        event_name = "codex_rid_turn_budget_exceeded",
+        log_type = "event",
+        provider_id = %scope.provider_id,
+        selection_fp = %scope.selection_fp,
+        day_id,
+        bound = scope.turn_bound(day_id),
+        "turn budget spent but the thread has no open turn; minting past the budget"
+    );
+    Ok(turn_id)
+}
+
+/// Returns an unused reservation to the budget.
+async fn release_turn(
+    store: &CodexRuntimeIdentityStore<'_>,
+    scope: &CodexRuntimeIdentityScope,
+    turn_id: &str,
+) -> Result<(), String> {
+    let _ = store
+        .roster_remove(&scope.turn_ledger_key(), turn_id)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TurnContext<'a> {
+    day_id: u64,
+    ttl: Duration,
+    now: SystemTime,
+    /// `previous_response_id` present: the request continues the thread's
+    /// open turn rather than minting.
+    chained: bool,
+    /// The WebSocket snapshot's outbound turn for this very inbound turn.
+    snapshot_turn: Option<&'a str>,
+}
+
 async fn resolve_window(
     store: &CodexRuntimeIdentityStore<'_>,
     scope: &CodexRuntimeIdentityScope,
@@ -1335,77 +1591,192 @@ async fn resolve_window(
     Ok(window)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Resolves the outbound turn of one request on `outbound_thread_id`.
+///
+/// The thread has at most one open turn (`open_turn_key`). This inbound turn
+/// keeps it when the open turn was opened for it, or when its per-turn freeze
+/// already names it (`Frozen`). A different inbound turn mints the next turn
+/// against the account budget and moves the thread's open turn to it
+/// (`Minted`), unless the budget is spent, the request is chained, or this
+/// inbound turn was already mapped to an earlier outbound turn that the thread
+/// has since left behind: then it continues the open turn (`Steered`), so a
+/// thread never revisits a turn id. The per-turn freeze always follows the
+/// turn actually sent, and every resolved turn is activity on the thread.
 async fn resolve_turn(
     store: &CodexRuntimeIdentityStore<'_>,
     scope: &CodexRuntimeIdentityScope,
     root_hash: &str,
     outbound_thread_id: &str,
     inbound_turn_key: &str,
-    day_id: u64,
-    ttl: Duration,
-    now: SystemTime,
-    root_freeze: Option<(&str, &str, &RootFreeze, bool)>,
+    context: TurnContext<'_>,
 ) -> Result<(Option<String>, OutboundTurnSource), String> {
+    let TurnContext {
+        day_id,
+        ttl,
+        now,
+        chained,
+        snapshot_turn,
+    } = context;
     let turn_hash = hash16(inbound_turn_key);
     let turn_freeze_key = scope.turn_freeze_key(root_hash, &turn_hash);
-    if let Some(existing) = store.get(&turn_freeze_key).await? {
-        let _ = store
-            .expire_if_value(&turn_freeze_key, &existing, ttl)
-            .await?;
-        return Ok((Some(existing), OutboundTurnSource::Frozen));
-    }
+    let inbound_turn = inbound_turn_ref(root_hash, &turn_hash);
+    let open_key = scope.open_turn_key(outbound_thread_id);
 
-    // A chained (`previous_response_id`) request whose per-turn freeze is gone
-    // continues the last turn recorded on its root instead of minting.
-    if let Some((_, _, freeze, true)) = root_freeze {
-        if let Some(last_turn_id) = freeze.last_turn_id.as_deref() {
-            let _ = store
-                .set_if_absent(&turn_freeze_key, last_turn_id, ttl)
-                .await?;
-            return Ok((Some(last_turn_id.to_string()), OutboundTurnSource::Frozen));
+    let open_raw = store.get(&open_key).await?;
+    let open = open_raw.as_deref().and_then(OpenTurn::parse);
+    let previous = store.get(&turn_freeze_key).await?;
+
+    let opened_for_this_turn = |open: &OpenTurn| {
+        open.inbound_turn == inbound_turn || previous.as_deref() == Some(open.turn_id.as_str())
+    };
+    let (turn_id, turn_source) = match (snapshot_turn, open) {
+        // WebSocket step of the turn the candidate was bound for. A bound
+        // connection is authoritative for its own in-flight turn on its own
+        // wire, whatever folded onto the thread since; honor it. Slide the
+        // open key when it still names this turn, reopen it when it expired,
+        // but never move a newer open turn back to it (that would make the
+        // thread revisit an id it already left behind for other traffic).
+        (Some(snapshot_turn), open) => {
+            match open.as_ref().map(|open| open.turn_id.as_str()) {
+                Some(open_turn) if open_turn == snapshot_turn => {
+                    if let Some(current) = open_raw.as_deref() {
+                        let _ = store.expire_if_value(&open_key, current, ttl).await?;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    let reopened = OpenTurn {
+                        turn_id: snapshot_turn.to_string(),
+                        inbound_turn: inbound_turn.clone(),
+                    };
+                    let _ = store
+                        .set_if_absent(&open_key, &reopened.to_json(), ttl)
+                        .await?;
+                }
+            }
+            (snapshot_turn.to_string(), OutboundTurnSource::Snapshot)
         }
-    }
-
-    let slot = scope.turn_slot(day_id, outbound_thread_id, inbound_turn_key);
-    let minted = store
-        .get_or_mint(
-            &scope.turn_slot_key(day_id, outbound_thread_id, slot),
-            ttl,
-            now,
-        )
-        .await?;
-    let (turn_id, turn_source) = if store.set_if_absent(&turn_freeze_key, &minted, ttl).await? {
-        (minted, OutboundTurnSource::Minted)
-    } else {
-        match store.get(&turn_freeze_key).await? {
-            Some(existing) => (existing, OutboundTurnSource::Frozen),
-            None => (minted, OutboundTurnSource::Minted),
+        (_, Some(open)) if opened_for_this_turn(&open) => {
+            if let Some(current) = open_raw.as_deref() {
+                let _ = store.expire_if_value(&open_key, current, ttl).await?;
+            }
+            (open.turn_id, OutboundTurnSource::Frozen)
+        }
+        (_, Some(open)) => {
+            // Another inbound turn opened the thread's turn. Mint the next one
+            // only for an inbound turn the thread has never seen, unchained,
+            // and within budget; otherwise continue the open turn.
+            let mintable = previous.is_none() && !chained;
+            let reserved = if mintable {
+                reserve_turn(store, scope, day_id, ttl, now).await?
+            } else {
+                None
+            };
+            match reserved {
+                Some(minted) => {
+                    let next = OpenTurn {
+                        turn_id: minted.clone(),
+                        inbound_turn: inbound_turn.clone(),
+                    };
+                    let current = open_raw.as_deref().unwrap_or_default();
+                    if store
+                        .set_if_value(&open_key, current, &next.to_json(), ttl)
+                        .await?
+                    {
+                        (minted, OutboundTurnSource::Minted)
+                    } else {
+                        // A concurrent request moved the thread on first.
+                        release_turn(store, scope, &minted).await?;
+                        let current = store
+                            .get(&open_key)
+                            .await?
+                            .as_deref()
+                            .and_then(OpenTurn::parse)
+                            .map(|open| open.turn_id)
+                            .unwrap_or(open.turn_id);
+                        (current, OutboundTurnSource::Steered)
+                    }
+                }
+                None => {
+                    if mintable {
+                        debug!(
+                            event_name = "codex_rid_turn_steered",
+                            log_type = "event",
+                            provider_id = %scope.provider_id,
+                            selection_fp = %scope.selection_fp,
+                            day_id,
+                            bound = scope.turn_bound(day_id),
+                            "turn budget spent; continuing the thread's open turn"
+                        );
+                    }
+                    // Steered traffic is activity on the open turn too.
+                    if let Some(current) = open_raw.as_deref() {
+                        let _ = store.expire_if_value(&open_key, current, ttl).await?;
+                    }
+                    (open.turn_id, OutboundTurnSource::Steered)
+                }
+            }
+        }
+        (_, None) => {
+            // The thread has no open turn: reopen this inbound turn's own turn
+            // when it has one, otherwise mint (past the budget if it must).
+            let (turn_id, source) = match previous.as_deref() {
+                Some(previous) => (previous.to_string(), OutboundTurnSource::Frozen),
+                None => match reserve_turn(store, scope, day_id, ttl, now).await? {
+                    Some(minted) => (minted, OutboundTurnSource::Minted),
+                    None => (
+                        force_turn(store, scope, day_id, ttl, now).await?,
+                        OutboundTurnSource::Minted,
+                    ),
+                },
+            };
+            let opened = OpenTurn {
+                turn_id: turn_id.clone(),
+                inbound_turn: inbound_turn.clone(),
+            };
+            if store
+                .set_if_absent(&open_key, &opened.to_json(), ttl)
+                .await?
+            {
+                (turn_id, source)
+            } else {
+                // A concurrent request opened the thread first: follow it.
+                if source == OutboundTurnSource::Minted {
+                    release_turn(store, scope, &turn_id).await?;
+                }
+                match store
+                    .get(&open_key)
+                    .await?
+                    .as_deref()
+                    .and_then(OpenTurn::parse)
+                {
+                    Some(open) if open.turn_id == turn_id => (turn_id, source),
+                    Some(open) => (open.turn_id, OutboundTurnSource::Steered),
+                    None => (turn_id, source),
+                }
+            }
         }
     };
 
-    if turn_source == OutboundTurnSource::Minted {
-        // A new turn is activity: the thread moves to the back of today's
-        // reuse order (and joins today's roster when it carried over).
-        store
-            .roster_touch(
-                &scope.thread_roster_key(day_id),
-                outbound_thread_id,
-                unix_secs(now) as f64,
-                ttl,
-            )
-            .await?;
-    }
-
-    if let Some((freeze_key, raw_freeze, freeze, _)) = root_freeze {
-        let mut updated = freeze.clone();
-        updated.last_turn_id = Some(turn_id.clone());
-        updated.last_inbound_turn_hash = Some(turn_hash);
-        // Best effort compare-and-set; a concurrent writer wins silently.
+    // The per-turn freeze names the outbound turn this inbound turn last used,
+    // which is what decides whether the client's turn-state is for it.
+    if previous.as_deref() == Some(turn_id.as_str()) {
         let _ = store
-            .set_if_value(freeze_key, raw_freeze, &updated.to_json(), ttl)
+            .expire_if_value(&turn_freeze_key, &turn_id, ttl)
             .await?;
+    } else {
+        store.set(&turn_freeze_key, &turn_id, ttl).await?;
     }
+    // Every request with a turn is activity: the thread moves to the back of
+    // the reuse order and stays counted in the trailing 24h.
+    store
+        .roster_touch(
+            &scope.thread_roster_key(),
+            outbound_thread_id,
+            unix_secs(now) as f64,
+            ttl,
+        )
+        .await?;
     Ok((Some(turn_id), turn_source))
 }
 
@@ -1458,19 +1829,19 @@ pub(crate) fn apply_outbound_codex_runtime_identity(
     user_agent: Option<&str>,
 ) {
     let header_user_agent = header_entry(headers, USER_AGENT_HEADER).map(|(_, value)| value);
-    let os = OutboundClientOs::from_user_agent(user_agent.or(header_user_agent.as_deref()));
+    let client = OutboundClient::from_user_agent(user_agent.or(header_user_agent.as_deref()));
     if inbound.is_synthetic() {
         if surface == CodexRuntimeIdentitySurface::HttpResponses {
-            materialize_http_responses(headers, body, outbound, os);
+            materialize_http_responses(headers, body, outbound, client);
         }
         return;
     }
     if surface != CodexRuntimeIdentitySurface::WsStepBody {
-        rewrite_headers(headers, inbound, outbound, surface, os);
+        rewrite_headers(headers, inbound, outbound, surface, client);
     }
     if surface != CodexRuntimeIdentitySurface::Headers {
         if let Some(body) = body {
-            rewrite_body(body, inbound, outbound, os);
+            rewrite_body(body, inbound, outbound, client);
         }
     }
 }
@@ -1480,7 +1851,7 @@ fn rewrite_headers(
     inbound: &InboundCodexRuntimeIdentity,
     outbound: &OutboundCodexRuntimeIdentity,
     surface: CodexRuntimeIdentitySurface,
-    os: OutboundClientOs,
+    client: OutboundClient,
 ) {
     // Official HTTP `/responses` and `/responses/compact` requests both carry
     // session-id, thread-id and x-codex-window-id unconditionally (codex-api
@@ -1543,7 +1914,7 @@ fn rewrite_headers(
         );
     }
     if let Some((name, raw)) = header_entry(headers, X_CODEX_TURN_METADATA) {
-        if let Some(rewritten) = rewrite_turn_metadata_blob_string(&raw, outbound, os) {
+        if let Some(rewritten) = rewrite_turn_metadata_blob_string(&raw, outbound, client) {
             headers.insert(name, rewritten);
         }
     }
@@ -1564,7 +1935,7 @@ fn rewrite_body(
     body: &mut Value,
     inbound: &InboundCodexRuntimeIdentity,
     outbound: &OutboundCodexRuntimeIdentity,
-    os: OutboundClientOs,
+    client: OutboundClient,
 ) {
     let Some(object) = body.as_object_mut() else {
         return;
@@ -1609,7 +1980,7 @@ fn rewrite_body(
         client_metadata.remove(*key);
     }
     if let Some(blob) = client_metadata.get_mut(X_CODEX_TURN_METADATA) {
-        rewrite_codex_turn_metadata_value(blob, outbound, os);
+        rewrite_codex_turn_metadata_value(blob, outbound, client);
     }
     if !outbound.forwards_turn_state() {
         client_metadata.remove(X_CODEX_TURN_STATE);
@@ -1625,17 +1996,17 @@ pub(crate) fn rewrite_codex_turn_metadata_string(
     outbound: &OutboundCodexRuntimeIdentity,
     user_agent: Option<&str>,
 ) -> Option<String> {
-    rewrite_turn_metadata_blob_string(raw, outbound, OutboundClientOs::from_user_agent(user_agent))
+    rewrite_turn_metadata_blob_string(raw, outbound, OutboundClient::from_user_agent(user_agent))
 }
 
 fn rewrite_turn_metadata_blob_string(
     raw: &str,
     outbound: &OutboundCodexRuntimeIdentity,
-    os: OutboundClientOs,
+    client: OutboundClient,
 ) -> Option<String> {
     let mut parsed = serde_json::from_str::<Value>(raw).ok()?;
     let object = parsed.as_object_mut()?;
-    rewrite_codex_turn_metadata_object(object, outbound, os);
+    rewrite_codex_turn_metadata_object(object, outbound, client);
     // Embedded in an HTTP header: keep every byte ASCII.
     serialize_ascii_json(&parsed)
 }
@@ -1643,15 +2014,15 @@ fn rewrite_turn_metadata_blob_string(
 fn rewrite_codex_turn_metadata_value(
     blob: &mut Value,
     outbound: &OutboundCodexRuntimeIdentity,
-    os: OutboundClientOs,
+    client: OutboundClient,
 ) {
     match blob {
         Value::String(raw) => {
-            if let Some(rewritten) = rewrite_turn_metadata_blob_string(raw, outbound, os) {
+            if let Some(rewritten) = rewrite_turn_metadata_blob_string(raw, outbound, client) {
                 *raw = rewritten;
             }
         }
-        Value::Object(object) => rewrite_codex_turn_metadata_object(object, outbound, os),
+        Value::Object(object) => rewrite_codex_turn_metadata_object(object, outbound, client),
         _ => {}
     }
 }
@@ -1659,12 +2030,19 @@ fn rewrite_codex_turn_metadata_value(
 fn rewrite_codex_turn_metadata_object(
     object: &mut Map<String, Value>,
     outbound: &OutboundCodexRuntimeIdentity,
-    os: OutboundClientOs,
+    client: OutboundClient,
 ) {
-    // Inbound-tree markers and unknown keys go first, so the rebuilt blob
-    // below only ever copies whitelisted pass-through keys.
+    let os = client.os;
+    // Inbound-tree markers, unknown keys and app-server-only keys under a
+    // terminal user-agent go first, so the rebuilt blob below only ever
+    // copies whitelisted pass-through keys.
     for key in BLOB_LEAK_KEYS {
         object.remove(*key);
+    }
+    if !client.app_server {
+        for key in BLOB_APP_SERVER_KEYS {
+            object.remove(*key);
+        }
     }
     retain_known_keys(object, "turn_metadata", blob_key_known);
     // `sandbox` names the platform sandbox of the client's OS (codex-rs
@@ -1744,7 +2122,9 @@ fn rewrite_codex_turn_metadata_object(
 /// them (codex-tui ≤ 0.150 has no `window_number` / `context_window_id` /
 /// `agent_name`, ≤ 0.147 no `sandbox_mode` or review flags); optional keys
 /// (`root_turn_id`, `thread_source`, `turn_trigger`, `workspaces`, …) are kept
-/// only when present. `installation_id` stays as the profile pass left it.
+/// only when present (the app-server-only ones were removed by the caller
+/// under a terminal user-agent). `installation_id` stays as the profile pass
+/// left it.
 fn request_identity_blob(
     source: &Map<String, Value>,
     outbound: &OutboundCodexRuntimeIdentity,
@@ -1954,6 +2334,33 @@ struct SyntheticTurnMetadata<'a> {
     turn_started_at_unix_ms: Option<u64>,
 }
 
+/// The client the outbound user-agent names, as far as the blob shape depends
+/// on it: its OS (the `sandbox` tag) and whether it is an app-server host
+/// (Desktop / VS Code / `codex_app`), the only clients that set
+/// `BLOB_APP_SERVER_KEYS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutboundClient {
+    os: OutboundClientOs,
+    app_server: bool,
+}
+
+impl OutboundClient {
+    fn from_user_agent(user_agent: Option<&str>) -> Self {
+        let os = OutboundClientOs::from_user_agent(user_agent);
+        // An unknown / absent user-agent is treated as a terminal client: the
+        // pool's header profiles are terminal builds unless they say otherwise,
+        // and dropping an optional key is never a shape no client produces.
+        let app_server = user_agent.is_some_and(|agent| {
+            let agent = agent.trim_start();
+            !agent.is_empty()
+                && !TERMINAL_ORIGINATOR_PREFIXES
+                    .iter()
+                    .any(|prefix| agent.starts_with(prefix))
+        });
+        Self { os, app_server }
+    }
+}
+
 /// Operating system the outbound user-agent names — the only client-side fact
 /// the `sandbox` tag depends on (codex-rs `core/src/sandbox_tags.rs`,
 /// `sandboxing/src/manager.rs`). A default-configured client reports seatbelt
@@ -2014,9 +2421,9 @@ fn default_sandbox_mode(sandbox: &str) -> &'static str {
 fn synthetic_turn_metadata_json(
     outbound: &OutboundCodexRuntimeIdentity,
     installation_id: Option<&str>,
-    os: OutboundClientOs,
+    client: OutboundClient,
 ) -> Option<String> {
-    let sandbox = os.platform_sandbox();
+    let sandbox = client.os.platform_sandbox();
     let sandbox_mode = default_sandbox_mode(sandbox);
     let payload = SyntheticTurnMetadata {
         installation_id,
@@ -2053,10 +2460,10 @@ fn materialize_http_responses(
     headers: &mut BTreeMap<String, String>,
     body: Option<&mut Value>,
     outbound: &OutboundCodexRuntimeIdentity,
-    os: OutboundClientOs,
+    client: OutboundClient,
 ) {
     let installation_id = header_entry(headers, X_CODEX_INSTALLATION_ID).map(|(_, value)| value);
-    let blob = synthetic_turn_metadata_json(outbound, installation_id.as_deref(), os);
+    let blob = synthetic_turn_metadata_json(outbound, installation_id.as_deref(), client);
 
     set_header(headers, SESSION_ID_HEADER, &outbound.session_id);
     set_header(headers, THREAD_ID_HEADER, &outbound.thread_id);
@@ -2403,6 +2810,10 @@ mod tests {
         "codex-tui/0.153.4 (Mac OS 26.2.0; arm64) Orca/1.4.185 (codex-tui; 0.153.4)";
     const WINDOWS_UA: &str = "codex_cli_rs/0.153.4 (Windows 10.0.26100; x86_64) WindowsTerminal";
     const LINUX_UA: &str = "codex_cli_rs/0.153.4 (Ubuntu 24.4.0; x86_64) unknown";
+    // codex_vscode is the app-server (Desktop/IDE) originator; it is not a
+    // terminal prefix, so its blobs keep the app-server-only keys.
+    const DESKTOP_UA: &str =
+        "codex_vscode/0.153.4 (Mac OS 26.2.0; arm64) vscode/1.104.0 (codex_vscode; 0.153.4)";
 
     fn v7_millis(id: &str) -> u64 {
         u64::from_str_radix(&id.replace('-', "")[..12], 16).unwrap()
@@ -2640,30 +3051,42 @@ mod tests {
         assert!(a.account_jitter_secs < DAY_WINDOW_SECS);
         let other = CodexRuntimeIdentityScope::new(PROVIDER, "codex:account:acc-b", config(4, 8));
         assert_ne!(a.selection_fp, other.selection_fp);
-        // Keys never contain the raw selection key.
-        assert!(!a.thread_slot_key(1, 0).contains(SELECTION));
-        assert!(a.thread_slot_key(1, 0).starts_with("ap:prov-1:codex_rid:"));
-        assert!(!a.thread_roster_key(1).contains(SELECTION));
-        assert!(a.thread_roster_key(1).ends_with(":1:threads"));
+        // Keys never contain the raw selection key and share the account tree
+        // prefix. The roster and ledger are account-level (no day/thread in
+        // the name); the open-turn key is per outbound thread.
+        for key in [
+            a.thread_roster_key(),
+            a.turn_ledger_key(),
+            a.open_turn_key("out-thread"),
+        ] {
+            assert!(!key.contains(SELECTION), "{key} leaked the selection key");
+            assert!(
+                key.starts_with("ap:prov-1:codex_rid:"),
+                "{key} not in the account tree"
+            );
+        }
+        assert!(a.thread_roster_key().ends_with(":threads"));
+        assert!(a.turn_ledger_key().ends_with(":turns"));
+        assert!(a.open_turn_key("out-thread").ends_with(":open:out-thread"));
     }
 
     #[test]
     fn daily_bounds_jitter_per_account_and_day_within_band() {
         let a = scope(32, 256);
         let b = CodexRuntimeIdentityScope::new(PROVIDER, "codex:account:acc-b", config(32, 256));
-        let thread = "0199094e-7b2b-7000-8000-0123456789ab";
         let mut a_thread_bounds = HashSet::new();
         let mut a_turn_bounds = HashSet::new();
         let mut differs_from_b = false;
         for day in 20_000..20_060u64 {
             let ta = a.thread_bound(day);
-            let ua = a.turn_bound(day, thread);
+            let ua = a.turn_bound(day);
             assert!((16..=32).contains(&ta), "day {day} thread bound {ta}");
             assert!((128..=256).contains(&ua), "day {day} turn bound {ua}");
             assert_eq!(ta, a.thread_bound(day), "bound must be deterministic");
+            assert_eq!(ua, a.turn_bound(day), "bound must be deterministic");
             a_thread_bounds.insert(ta);
             a_turn_bounds.insert(ua);
-            differs_from_b |= ta != b.thread_bound(day);
+            differs_from_b |= ta != b.thread_bound(day) || ua != b.turn_bound(day);
         }
         assert!(
             a_thread_bounds.len() > 1,
@@ -2677,34 +3100,30 @@ mod tests {
             differs_from_b,
             "two accounts never disagreed on a daily bound"
         );
-        // Sibling threads of one account draw their own turn ceiling.
-        let mut sibling_bounds = HashSet::new();
-        for i in 0..32 {
-            sibling_bounds.insert(a.turn_bound(20_000, &format!("thread-{i}")));
-        }
-        assert!(sibling_bounds.len() > 1);
-        // A ceiling of 1 stays 1; the turn slot then is always 0.
+        // The turn ceiling is account-level, not per thread: `turn_bound`
+        // takes only the day.
+        // A ceiling of 1 stays 1, on both axes.
         let one = scope(1, 1);
         for day in 0..10u64 {
             assert_eq!(one.thread_bound(day), 1);
-            assert_eq!(one.turn_bound(day, thread), 1);
-            assert_eq!(one.turn_slot(day, thread, "turn"), 0);
+            assert_eq!(one.turn_bound(day), 1);
         }
         // Band edges for small ceilings: N=2 → {1,2}, N=3 → {2,3}.
         assert!((1..=2).contains(&scope(2, 2).thread_bound(7)));
         assert!((2..=3).contains(&scope(3, 3).thread_bound(7)));
+        assert!((1..=2).contains(&scope(2, 2).turn_bound(7)));
+        assert!((2..=3).contains(&scope(3, 3).turn_bound(7)));
     }
 
     #[test]
-    fn scope_ttl_covers_rest_of_window_plus_grace() {
+    fn scope_ttl_is_constant_window_plus_grace() {
+        // Every state key lives for the trailing-24h ceiling window plus a 12h
+        // grace, independent of `now`, and is slid on each activity. This
+        // keeps a roster or ledger member present for as long as it can still
+        // count against a 24h window.
         let s = scope(4, 8);
-        let now = at(1_756_857_600);
-        let ttl = s.ttl(now).as_secs();
-        assert!(ttl > TTL_GRACE_SECS && ttl <= DAY_WINDOW_SECS + TTL_GRACE_SECS);
-        let day = s.day_id(now);
-        let later = at(1_756_857_600 + ttl - TTL_GRACE_SECS);
-        assert_eq!(s.day_id(later), day + 1);
-        assert_eq!(s.day_id(at(1_756_857_600 + ttl - TTL_GRACE_SECS - 1)), day);
+        assert_eq!(s.ttl().as_secs(), DAY_WINDOW_SECS + TTL_GRACE_SECS);
+        assert_eq!(scope(1, 1).ttl(), s.ttl());
     }
 
     // ----- inbound extraction ----------------------------------------------
@@ -2784,15 +3203,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn threads_mint_by_arrival_then_reuse_least_recent_and_stay_stable() {
+    async fn threads_mint_by_arrival_then_reuse_least_recently_active() {
         let state = memory_state();
         let store = CodexRuntimeIdentityStore::new(&state);
-        let s = scope(3, 64);
+        // A generous turn budget so thread assignment is what is under test.
+        let s = scope(3, 512);
         let start = at(1_756_857_600);
         let bound = usize::try_from(s.thread_bound(s.day_id(start))).unwrap();
         assert!((2..=3).contains(&bound));
         let mut first = Vec::new();
-        for i in 0..40usize {
+        for i in 0..24usize {
             let now = start + Duration::from_secs(i as u64);
             let inbound = inbound(&format!("s{i}"), &format!("t{i}"), Some(&format!("u{i}")));
             let out = rewrite(
@@ -2802,19 +3222,19 @@ mod tests {
             assert_eq!(out.session_id, out.thread_id);
             assert_eq!(out.window_id, format!("{}:0", out.thread_id));
             assert!(out.turn_id.as_deref().is_some_and(is_uuid_v7));
+            // Every root within the budget mints its own turn, whether it opens
+            // a fresh thread or folds a new inbound turn onto an existing one.
             assert_eq!(out.turn_source, OutboundTurnSource::Minted);
             if i < bound {
-                // Arrival order: each new root opens its own thread, minted now.
                 assert!(
-                    first.iter().all(|previous: &OutboundCodexRuntimeIdentity| {
-                        previous.thread_id != out.thread_id
-                    }),
+                    first
+                        .iter()
+                        .all(|previous: &OutboundCodexRuntimeIdentity| previous.thread_id
+                            != out.thread_id),
                     "root {i} should have minted a new thread"
                 );
                 assert_eq!(v7_millis(&out.thread_id), unix_millis(now));
             } else {
-                // Full: the least recently active thread is reused, round robin
-                // here because every root is used exactly once.
                 assert_eq!(
                     out.thread_id,
                     first[i - bound].thread_id,
@@ -2825,34 +3245,229 @@ mod tests {
         }
         let threads: HashSet<&str> = first.iter().map(|out| out.thread_id.as_str()).collect();
         assert_eq!(threads.len(), bound);
-        // Stability: same inbound → same outbound (thread and turn), now Frozen.
+        // A root always keeps its own thread (root freeze), even after other
+        // roots folded onto it and moved its turns on.
         for (i, previous) in first.iter().enumerate() {
-            let inbound = inbound(&format!("s{i}"), &format!("t{i}"), Some(&format!("u{i}")));
             let again = rewrite(
                 resolve_outbound_codex_runtime_identity(
                     &store,
                     &s,
-                    &inbound,
+                    &inbound(&format!("s{i}"), &format!("t{i}"), Some(&format!("u{i}"))),
                     None,
                     start + Duration::from_secs(600),
                 )
                 .await,
             );
-            assert_eq!(again.thread_id, previous.thread_id);
-            assert_eq!(again.turn_id, previous.turn_id);
-            assert_eq!(again.turn_source, OutboundTurnSource::Frozen);
+            assert_eq!(
+                again.thread_id, previous.thread_id,
+                "root {i} changed thread"
+            );
         }
     }
 
     #[tokio::test]
-    async fn new_turn_protects_its_thread_from_reuse() {
+    async fn account_ceilings_hold_below_the_official_thresholds() {
+        // The whole point of the fix: both ceilings can sit well under the
+        // official ~100/day risk-control threshold and are never exceeded over
+        // any 24h window, no matter how much traffic arrives.
         let state = memory_state();
         let store = CodexRuntimeIdentityStore::new(&state);
-        let s = scope(4, 64);
-        let start = at(1_756_857_600);
-        let bound = usize::try_from(s.thread_bound(s.day_id(start))).unwrap();
-        assert!(bound >= 2);
-        let mut threads = Vec::new();
+        let s = scope(5, 40);
+        let now = at(1_756_857_600);
+        let day = s.day_id(now);
+        let thread_bound = usize::try_from(s.thread_bound(day)).unwrap();
+        let turn_bound = usize::try_from(s.turn_bound(day)).unwrap();
+        assert!((3..=5).contains(&thread_bound) && thread_bound < 8);
+        assert!((20..=40).contains(&turn_bound) && turn_bound < 64);
+        let mut threads = HashSet::new();
+        let mut turns = HashSet::new();
+        for i in 0..80usize {
+            for j in 0..4usize {
+                let inbound = inbound(
+                    &format!("s{i}"),
+                    &format!("t{i}"),
+                    Some(&format!("u{i}-{j}")),
+                );
+                let out = rewrite(
+                    resolve_outbound_codex_runtime_identity(&store, &s, &inbound, None, now).await,
+                );
+                threads.insert(out.thread_id);
+                if let Some(turn) = out.turn_id {
+                    turns.insert(turn);
+                }
+            }
+        }
+        // Hard caps: the realized counts never exceed the per-day ceilings, and
+        // both stay under the official thresholds.
+        assert!(threads.len() <= thread_bound, "{} threads", threads.len());
+        assert_eq!(
+            turns.len(),
+            turn_bound,
+            "turn ceiling is a hard account cap"
+        );
+        assert!(threads.len() < 8 && turns.len() < 64);
+        // A thread cannot exist without a turn, so the turn budget also bounds
+        // how many threads can ever open.
+        assert!(threads.len() <= turns.len());
+    }
+
+    #[tokio::test]
+    async fn turn_ceiling_of_one_mints_exactly_one_turn() {
+        // The extreme case the operator can now dial to: one turn per day. Every
+        // inbound turn, new or chained, steers into the single minted turn, so
+        // the account never shows a second turn id.
+        let state = memory_state();
+        let store = CodexRuntimeIdentityStore::new(&state);
+        let s = scope(1, 1);
+        let now = at(1_756_857_600);
+        assert_eq!(s.turn_bound(s.day_id(now)), 1);
+        let first = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s", "t", Some("u1")),
+                None,
+                now,
+            )
+            .await,
+        );
+        assert_eq!(first.turn_source, OutboundTurnSource::Minted);
+        let only_turn = first.turn_id.clone().unwrap();
+        let mut turns = HashSet::from([only_turn.clone()]);
+        for i in 0..12usize {
+            let mut inbound = inbound(&format!("s{i}"), &format!("t{i}"), Some(&format!("v{i}")));
+            if i % 2 == 0 {
+                inbound.previous_response_id_present = true;
+            }
+            let out = rewrite(
+                resolve_outbound_codex_runtime_identity(&store, &s, &inbound, None, now).await,
+            );
+            assert_eq!(out.thread_id, first.thread_id, "one thread only");
+            assert_eq!(out.turn_id.as_deref(), Some(only_turn.as_str()));
+            assert_eq!(out.turn_source, OutboundTurnSource::Steered);
+            assert!(!out.forwards_turn_state(), "steered turn-state stripped");
+            turns.insert(out.turn_id.unwrap());
+        }
+        assert_eq!(turns.len(), 1, "exactly one turn id all day");
+    }
+
+    #[tokio::test]
+    async fn no_turn_id_revisit_within_a_thread_under_interleaved_roots() {
+        // Two conversations folded onto one outbound thread (ceiling 1). Their
+        // turns must read as one forward-only sequence: once the thread leaves a
+        // turn id behind, no later request may bring it back, even a replay.
+        let state = memory_state();
+        let store = CodexRuntimeIdentityStore::new(&state);
+        let s = scope(1, 512);
+        let now = at(1_756_857_600);
+        // (label, session, thread, turn, chained)
+        let steps = [
+            ("a1", "sa", "ta", "ua1"),
+            ("b1", "sb", "tb", "ub1"),
+            ("a1-replay", "sa", "ta", "ua1"),
+            ("a2", "sa", "ta", "ua2"),
+            ("b1-replay", "sb", "tb", "ub1"),
+            ("b2", "sb", "tb", "ub2"),
+        ];
+        let mut trace: Vec<(&str, String, OutboundTurnSource, String)> = Vec::new();
+        for (label, session, thread, turn) in steps {
+            let out = rewrite(
+                resolve_outbound_codex_runtime_identity(
+                    &store,
+                    &s,
+                    &inbound(session, thread, Some(turn)),
+                    None,
+                    now,
+                )
+                .await,
+            );
+            trace.push((
+                label,
+                out.thread_id.clone(),
+                out.turn_source,
+                out.turn_id.clone().unwrap(),
+            ));
+        }
+        // One outbound thread throughout.
+        let thread = trace[0].1.clone();
+        assert!(trace.iter().all(|step| step.1 == thread));
+        // A replay never revisits its own earlier turn once the thread moved on:
+        // it steers into whatever the thread's open turn is now.
+        let turn_of = |label: &str| {
+            trace
+                .iter()
+                .find(|step| step.0 == label)
+                .map(|step| step.3.clone())
+                .unwrap()
+        };
+        assert_ne!(turn_of("a1-replay"), turn_of("a1"), "a1 was revisited");
+        assert_eq!(turn_of("a1-replay"), turn_of("b1"), "should steer forward");
+        assert_eq!(
+            trace.iter().find(|s| s.0 == "a1-replay").unwrap().2,
+            OutboundTurnSource::Steered
+        );
+        assert_ne!(turn_of("b1-replay"), turn_of("b1"), "b1 was revisited");
+        assert_eq!(turn_of("b1-replay"), turn_of("a2"), "should steer forward");
+        // The wire sequence, collapsed to runs of equal ids, uses every id in
+        // exactly one run: a real thread never returns to a turn it left.
+        let mut runs: Vec<&String> = Vec::new();
+        for (_, _, _, turn) in &trace {
+            if runs.last().map(|last| *last != turn).unwrap_or(true) {
+                runs.push(turn);
+            }
+        }
+        let distinct: HashSet<&String> = runs.iter().copied().collect();
+        assert_eq!(runs.len(), distinct.len(), "a turn id came back: {trace:?}");
+    }
+
+    #[tokio::test]
+    async fn resolved_turn_source_gates_turn_state_forwarding() {
+        let state = memory_state();
+        let store = CodexRuntimeIdentityStore::new(&state);
+        let s = scope(1, 512);
+        let now = at(1_756_857_600);
+        let resolve = |inbound: InboundCodexRuntimeIdentity| {
+            let store = &store;
+            let s = &s;
+            async move {
+                rewrite(
+                    resolve_outbound_codex_runtime_identity(store, s, &inbound, None, now).await,
+                )
+            }
+        };
+        // Minted: a fresh turn, upstream issues its own token.
+        let minted = resolve(inbound("sa", "ta", Some("ua1"))).await;
+        assert_eq!(minted.turn_source, OutboundTurnSource::Minted);
+        assert!(!minted.forwards_turn_state());
+        // Frozen: the same inbound turn while it is still the thread's open one.
+        let frozen = resolve(inbound("sa", "ta", Some("ua1"))).await;
+        assert_eq!(frozen.turn_source, OutboundTurnSource::Frozen);
+        assert_eq!(frozen.turn_id, minted.turn_id);
+        assert!(frozen.forwards_turn_state());
+        // Fold a second root, moving the open turn on.
+        let folded = resolve(inbound("sb", "tb", Some("ub1"))).await;
+        assert_eq!(folded.turn_source, OutboundTurnSource::Minted);
+        // Now the first turn is superseded: a replay steers and strips state.
+        let steered = resolve(inbound("sa", "ta", Some("ua1"))).await;
+        assert_eq!(steered.turn_source, OutboundTurnSource::Steered);
+        assert_ne!(steered.turn_id, minted.turn_id);
+        assert!(!steered.forwards_turn_state());
+        // Memory: no turn at all, state forwards (nothing turn-specific to leak).
+        let mut memory = inbound("sa", "ta", None);
+        memory.request_kind = Some(CodexRequestKind::Memory);
+        let memory = resolve(memory).await;
+        assert_eq!(memory.turn_source, OutboundTurnSource::None);
+        assert!(memory.forwards_turn_state());
+    }
+
+    #[tokio::test]
+    async fn roster_is_a_trailing_24h_window_not_a_calendar_day() {
+        let state = memory_state();
+        let store = CodexRuntimeIdentityStore::new(&state);
+        let s = scope(2, 512);
+        let t0 = at(1_756_857_600);
+        let bound = usize::try_from(s.thread_bound(s.day_id(t0))).unwrap();
+        let mut active = Vec::new();
         for i in 0..bound {
             let out = rewrite(
                 resolve_outbound_codex_runtime_identity(
@@ -2860,135 +3475,273 @@ mod tests {
                     &s,
                     &inbound(&format!("s{i}"), &format!("t{i}"), Some("u1")),
                     None,
-                    start + Duration::from_secs(i as u64),
+                    t0 + Duration::from_secs(i as u64),
                 )
                 .await,
             );
-            threads.push(out.thread_id);
+            active.push(out.thread_id);
         }
-        // Root 0 (oldest) gets a new turn: its thread becomes the most recent.
-        let touched = rewrite(
+        let active: HashSet<String> = active.into_iter().collect();
+        assert_eq!(active.len(), bound);
+        // A new root inside the window reuses one of the active threads.
+        let inside = rewrite(
             resolve_outbound_codex_runtime_identity(
                 &store,
                 &s,
-                &inbound("s0", "t0", Some("u2")),
+                &inbound("s-in", "t-in", Some("u1")),
                 None,
-                start + Duration::from_secs(100),
+                t0 + Duration::from_secs(100),
             )
             .await,
         );
-        assert_eq!(touched.thread_id, threads[0]);
-        assert_eq!(touched.turn_source, OutboundTurnSource::Minted);
-        // The next new root reuses root 1's thread, not root 0's.
-        let next = rewrite(
+        assert!(active.contains(&inside.thread_id), "reused a live thread");
+        // More than 24h later the old threads have aged out of the window: a
+        // new root mints a fresh thread instead of reusing an expired one.
+        // Past the window relative to the last activity (the reuse at +100s),
+        // so every live thread has aged out.
+        let later = t0 + Duration::from_secs(DAY_WINDOW_SECS + 200);
+        let fresh = rewrite(
             resolve_outbound_codex_runtime_identity(
                 &store,
                 &s,
-                &inbound("s-new", "t-new", Some("u1")),
+                &inbound("s-late", "t-late", Some("u1")),
                 None,
-                start + Duration::from_secs(101),
+                later,
             )
             .await,
         );
-        assert_eq!(next.thread_id, threads[1]);
-        // Replaying a frozen turn is not activity: root 2 stays the oldest.
-        let replay = rewrite(
-            resolve_outbound_codex_runtime_identity(
-                &store,
-                &s,
-                &inbound("s1", "t1", Some("u1")),
-                None,
-                start + Duration::from_secs(102),
-            )
-            .await,
+        assert!(
+            !active.contains(&fresh.thread_id),
+            "stale thread reused past the 24h window"
         );
-        assert_eq!(replay.turn_source, OutboundTurnSource::Frozen);
-        let after_replay = rewrite(
-            resolve_outbound_codex_runtime_identity(
-                &store,
-                &s,
-                &inbound("s-new-2", "t-new-2", Some("u1")),
-                None,
-                start + Duration::from_secs(103),
-            )
-            .await,
-        );
-        assert_eq!(after_replay.thread_id, threads[2 % bound]);
+        assert_eq!(v7_millis(&fresh.thread_id), unix_millis(later));
     }
 
     #[tokio::test]
-    async fn roster_starts_fresh_each_day_and_carried_threads_count_against_it() {
+    async fn root_freeze_survives_day_rollover_and_turn_freeze_too() {
         let state = memory_state();
         let store = CodexRuntimeIdentityStore::new(&state);
-        let s = scope(4, 64);
+        let s = scope(8, 64);
         let day0 = at(1_756_857_600);
+        let inbound_turn = inbound("s", "t", Some("u1"));
+        let first = rewrite(
+            resolve_outbound_codex_runtime_identity(&store, &s, &inbound_turn, None, day0).await,
+        );
+        // Next day (< the 36h key lifetime): same inbound root/turn keeps both IDs.
         let day1 = day0 + Duration::from_secs(DAY_WINDOW_SECS);
-        let bound0 = usize::try_from(s.thread_bound(s.day_id(day0))).unwrap();
-        let bound1 = usize::try_from(s.thread_bound(s.day_id(day1))).unwrap();
-        let mut day0_threads = HashSet::new();
-        for i in 0..bound0 {
-            let out = rewrite(
-                resolve_outbound_codex_runtime_identity(
-                    &store,
-                    &s,
-                    &inbound(&format!("s{i}"), &format!("t{i}"), Some("u1")),
-                    None,
-                    day0 + Duration::from_secs(i as u64),
-                )
-                .await,
-            );
-            day0_threads.insert(out.thread_id);
-        }
-        assert_eq!(day0_threads.len(), bound0);
-        // Day 1: root 0 continues with a new turn, keeping yesterday's thread,
-        // which thereby joins today's roster as its oldest member.
-        let carried = rewrite(
+        assert_ne!(s.day_id(day0), s.day_id(day1));
+        let second = rewrite(
+            resolve_outbound_codex_runtime_identity(&store, &s, &inbound_turn, None, day1).await,
+        );
+        assert_eq!(second.thread_id, first.thread_id);
+        assert_eq!(second.turn_id, first.turn_id);
+        assert_eq!(second.turn_source, OutboundTurnSource::Frozen);
+        // A new inbound turn on the frozen root mints under the frozen thread
+        // even though the day changed.
+        let third = rewrite(
             resolve_outbound_codex_runtime_identity(
                 &store,
                 &s,
-                &inbound("s0", "t0", Some("u2")),
+                &inbound("s", "t", Some("u2")),
                 None,
                 day1,
             )
             .await,
         );
-        assert!(day0_threads.contains(&carried.thread_id));
-        // New roots mint fresh threads until today's bound counts the carried one.
-        let mut day1_new = HashSet::new();
-        for i in 0..bound1 - 1 {
-            let out = rewrite(
-                resolve_outbound_codex_runtime_identity(
-                    &store,
-                    &s,
-                    &inbound(&format!("n{i}"), &format!("nt{i}"), Some("u1")),
-                    None,
-                    day1 + Duration::from_secs(1 + i as u64),
-                )
-                .await,
-            );
-            assert!(
-                !day0_threads.contains(&out.thread_id),
-                "day 1 reused a day 0 thread"
-            );
-            assert_eq!(
-                v7_millis(&out.thread_id),
-                unix_millis(day1 + Duration::from_secs(1 + i as u64))
-            );
-            day1_new.insert(out.thread_id);
-        }
-        assert_eq!(day1_new.len(), bound1 - 1);
-        // Full for the day: the carried thread is the least recently active.
-        let reused = rewrite(
+        assert_eq!(third.thread_id, first.thread_id);
+        assert_ne!(third.turn_id, first.turn_id);
+        assert_eq!(third.turn_source, OutboundTurnSource::Minted);
+    }
+
+    #[tokio::test]
+    async fn chained_request_continues_the_threads_open_turn() {
+        let state = memory_state();
+        let store = CodexRuntimeIdentityStore::new(&state);
+        let s = scope(8, 64);
+        let now = at(1_756_857_600);
+        let first = rewrite(
             resolve_outbound_codex_runtime_identity(
                 &store,
                 &s,
-                &inbound("n-last", "nt-last", Some("u1")),
+                &inbound("s", "t", Some("u1")),
                 None,
-                day1 + Duration::from_secs(600),
+                now,
             )
             .await,
         );
-        assert_eq!(reused.thread_id, carried.thread_id);
+        // A chained request with an unknown inbound turn continues the open
+        // turn rather than minting: it steers, and its turn-state is stripped.
+        let mut chained = inbound("s", "t", Some("u-unknown"));
+        chained.previous_response_id_present = true;
+        let second =
+            rewrite(resolve_outbound_codex_runtime_identity(&store, &s, &chained, None, now).await);
+        assert_eq!(second.thread_id, first.thread_id);
+        assert_eq!(second.turn_id, first.turn_id);
+        assert_eq!(second.turn_source, OutboundTurnSource::Steered);
+        assert!(!second.forwards_turn_state());
+        // Not chained: a new inbound turn mints a new outbound turn.
+        let third = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s", "t", Some("u-new")),
+                None,
+                now,
+            )
+            .await,
+        );
+        assert_ne!(third.turn_id, first.turn_id);
+        assert_eq!(third.turn_source, OutboundTurnSource::Minted);
+    }
+
+    #[tokio::test]
+    async fn memory_requests_share_thread_but_carry_no_turn() {
+        let state = memory_state();
+        let store = CodexRuntimeIdentityStore::new(&state);
+        let s = scope(8, 64);
+        let now = at(1_756_857_600);
+        let turn = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s", "t", Some("u1")),
+                None,
+                now,
+            )
+            .await,
+        );
+        let mut memory = inbound("s", "t", None);
+        memory.request_kind = Some(CodexRequestKind::Memory);
+        let out =
+            rewrite(resolve_outbound_codex_runtime_identity(&store, &s, &memory, None, now).await);
+        assert_eq!(out.thread_id, turn.thread_id);
+        assert_eq!(out.turn_id, None);
+        assert_eq!(out.turn_source, OutboundTurnSource::None);
+        assert!(out.forwards_turn_state());
+    }
+
+    #[tokio::test]
+    async fn ws_snapshot_stays_authoritative_for_its_bound_turn() {
+        let state = memory_state();
+        let store = CodexRuntimeIdentityStore::new(&state);
+        let s = scope(8, 64);
+        let now = at(1_756_857_600);
+        let snapshot = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s", "t", Some("u1")),
+                None,
+                now,
+            )
+            .await,
+        );
+        // Same inbound turn: the snapshot answers without the store (an
+        // outage falls back to it) and keeps identical IDs.
+        let unavailable = CodexRuntimeIdentityStore::unavailable(&state);
+        let same = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &unavailable,
+                &s,
+                &inbound("s", "t", Some("u1")),
+                Some(&snapshot),
+                now,
+            )
+            .await,
+        );
+        assert_eq!(same.thread_id, snapshot.thread_id);
+        assert_eq!(same.turn_id, snapshot.turn_id);
+        assert_eq!(same.turn_source, OutboundTurnSource::Snapshot);
+        // Another turn on the same root mints a new open turn on the thread
+        // (moving it on). The bound connection's own step still keeps its turn
+        // (a WS stream cannot be steered mid-flight).
+        let moved_on = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s", "t", Some("v-fold")),
+                None,
+                now,
+            )
+            .await,
+        );
+        assert_eq!(moved_on.thread_id, snapshot.thread_id);
+        assert_ne!(moved_on.turn_id, snapshot.turn_id);
+        assert_eq!(moved_on.turn_source, OutboundTurnSource::Minted);
+        let step = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s", "t", Some("u1")),
+                Some(&snapshot),
+                now,
+            )
+            .await,
+        );
+        assert_eq!(step.thread_id, snapshot.thread_id);
+        assert_eq!(step.turn_id, snapshot.turn_id);
+        assert_eq!(step.turn_source, OutboundTurnSource::Snapshot);
+        // A new inbound turn: thread from snapshot, turn minted under it.
+        let next = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("s", "t", Some("u2")),
+                Some(&snapshot),
+                now,
+            )
+            .await,
+        );
+        assert_eq!(next.thread_id, snapshot.thread_id);
+        assert_ne!(next.turn_id, snapshot.turn_id);
+        assert_eq!(next.turn_source, OutboundTurnSource::Minted);
+        // Snapshot for another root is ignored.
+        let other = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &store,
+                &s,
+                &inbound("other2", "t3", Some("u1")),
+                Some(&snapshot),
+                now,
+            )
+            .await,
+        );
+        assert_eq!(other.inbound_root, "other2");
+    }
+
+    #[tokio::test]
+    async fn store_unavailable_falls_back_to_passthrough_or_snapshot() {
+        let state = memory_state();
+        let unavailable = CodexRuntimeIdentityStore::unavailable(&state);
+        let s = scope(8, 64);
+        let now = at(1_756_857_600);
+        let resolution = resolve_outbound_codex_runtime_identity(
+            &unavailable,
+            &s,
+            &inbound("s", "t", Some("u1")),
+            None,
+            now,
+        )
+        .await;
+        assert_eq!(resolution, CodexRuntimeIdentityResolution::Passthrough);
+
+        let snapshot = outbound_fixture(Some("snap-turn"), OutboundTurnSource::Minted);
+        let mut inbound_new_turn = inbound("in-session", "t", Some("u-new"));
+        inbound_new_turn.previous_response_id_present = false;
+        let out = rewrite(
+            resolve_outbound_codex_runtime_identity(
+                &unavailable,
+                &s,
+                &inbound_new_turn,
+                Some(&snapshot),
+                now,
+            )
+            .await,
+        );
+        assert_eq!(out.thread_id, snapshot.thread_id);
+        assert_eq!(out.turn_id.as_deref(), Some("snap-turn"));
+        assert_eq!(out.turn_source, OutboundTurnSource::Snapshot);
+        assert_eq!(out.inbound_turn_key.as_deref(), Some("u-new"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3037,238 +3790,6 @@ mod tests {
             );
             assert_eq!(&again.thread_id, thread);
         }
-    }
-
-    #[tokio::test]
-    async fn turn_slots_bound_per_thread_and_never_cross_threads() {
-        let state = memory_state();
-        let store = CodexRuntimeIdentityStore::new(&state);
-        let s = scope(2, 4);
-        let now = at(1_756_857_600);
-        let mut turns_by_thread: BTreeMap<String, HashSet<String>> = BTreeMap::new();
-        let mut thread_by_turn: BTreeMap<String, String> = BTreeMap::new();
-        for i in 0..30 {
-            for j in 0..6 {
-                let inbound = inbound(
-                    &format!("s{i}"),
-                    &format!("t{i}"),
-                    Some(&format!("u{i}-{j}")),
-                );
-                let out = rewrite(
-                    resolve_outbound_codex_runtime_identity(&store, &s, &inbound, None, now).await,
-                );
-                let turn = out.turn_id.clone().unwrap();
-                turns_by_thread
-                    .entry(out.thread_id.clone())
-                    .or_default()
-                    .insert(turn.clone());
-                let owner = thread_by_turn
-                    .entry(turn)
-                    .or_insert_with(|| out.thread_id.clone());
-                assert_eq!(owner, &out.thread_id, "turn shared across threads");
-            }
-        }
-        assert!(turns_by_thread.len() <= 2);
-        for (thread, turns) in &turns_by_thread {
-            assert!(
-                turns.len() <= 4,
-                "thread {thread} has {} turns",
-                turns.len()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn root_freeze_survives_day_rollover_and_turn_freeze_too() {
-        let state = memory_state();
-        let store = CodexRuntimeIdentityStore::new(&state);
-        let s = scope(8, 64);
-        let day0 = at(1_756_857_600);
-        let inbound_turn = inbound("s", "t", Some("u1"));
-        let first = rewrite(
-            resolve_outbound_codex_runtime_identity(&store, &s, &inbound_turn, None, day0).await,
-        );
-        // Next day: same inbound root/turn keeps both IDs.
-        let day1 = day0 + Duration::from_secs(DAY_WINDOW_SECS);
-        assert_ne!(s.day_id(day0), s.day_id(day1));
-        let second = rewrite(
-            resolve_outbound_codex_runtime_identity(&store, &s, &inbound_turn, None, day1).await,
-        );
-        assert_eq!(second.thread_id, first.thread_id);
-        assert_eq!(second.turn_id, first.turn_id);
-        assert_eq!(second.turn_source, OutboundTurnSource::Frozen);
-        // A new inbound turn on the frozen root mints under the frozen thread
-        // even though the day changed.
-        let third = rewrite(
-            resolve_outbound_codex_runtime_identity(
-                &store,
-                &s,
-                &inbound("s", "t", Some("u2")),
-                None,
-                day1,
-            )
-            .await,
-        );
-        assert_eq!(third.thread_id, first.thread_id);
-        assert_ne!(third.turn_id, first.turn_id);
-        assert_eq!(third.turn_source, OutboundTurnSource::Minted);
-    }
-
-    #[tokio::test]
-    async fn chained_request_reuses_last_turn_when_turn_freeze_missing() {
-        let state = memory_state();
-        let store = CodexRuntimeIdentityStore::new(&state);
-        let s = scope(8, 64);
-        let now = at(1_756_857_600);
-        let first = rewrite(
-            resolve_outbound_codex_runtime_identity(
-                &store,
-                &s,
-                &inbound("s", "t", Some("u1")),
-                None,
-                now,
-            )
-            .await,
-        );
-        let mut chained = inbound("s", "t", Some("u-unknown"));
-        chained.previous_response_id_present = true;
-        let second =
-            rewrite(resolve_outbound_codex_runtime_identity(&store, &s, &chained, None, now).await);
-        assert_eq!(second.thread_id, first.thread_id);
-        assert_eq!(second.turn_id, first.turn_id);
-        assert_eq!(second.turn_source, OutboundTurnSource::Frozen);
-        // Not chained: a new inbound turn mints a new outbound turn.
-        let third = rewrite(
-            resolve_outbound_codex_runtime_identity(
-                &store,
-                &s,
-                &inbound("s", "t", Some("u-new")),
-                None,
-                now,
-            )
-            .await,
-        );
-        assert_ne!(third.turn_id, first.turn_id);
-    }
-
-    #[tokio::test]
-    async fn memory_requests_share_thread_but_carry_no_turn() {
-        let state = memory_state();
-        let store = CodexRuntimeIdentityStore::new(&state);
-        let s = scope(8, 64);
-        let now = at(1_756_857_600);
-        let turn = rewrite(
-            resolve_outbound_codex_runtime_identity(
-                &store,
-                &s,
-                &inbound("s", "t", Some("u1")),
-                None,
-                now,
-            )
-            .await,
-        );
-        let mut memory = inbound("s", "t", None);
-        memory.request_kind = Some(CodexRequestKind::Memory);
-        let out =
-            rewrite(resolve_outbound_codex_runtime_identity(&store, &s, &memory, None, now).await);
-        assert_eq!(out.thread_id, turn.thread_id);
-        assert_eq!(out.turn_id, None);
-        assert_eq!(out.turn_source, OutboundTurnSource::None);
-        assert!(out.forwards_turn_state());
-    }
-
-    #[tokio::test]
-    async fn ws_snapshot_keeps_thread_and_turn_for_same_inbound_turn() {
-        let state = memory_state();
-        let store = CodexRuntimeIdentityStore::new(&state);
-        let s = scope(8, 64);
-        let now = at(1_756_857_600);
-        let snapshot = rewrite(
-            resolve_outbound_codex_runtime_identity(
-                &store,
-                &s,
-                &inbound("s", "t", Some("u1")),
-                None,
-                now,
-            )
-            .await,
-        );
-        // Same inbound turn: no store needed, identical IDs.
-        let unavailable = CodexRuntimeIdentityStore::unavailable(&state);
-        let same = rewrite(
-            resolve_outbound_codex_runtime_identity(
-                &unavailable,
-                &s,
-                &inbound("s", "t", Some("u1")),
-                Some(&snapshot),
-                now,
-            )
-            .await,
-        );
-        assert_eq!(same.thread_id, snapshot.thread_id);
-        assert_eq!(same.turn_id, snapshot.turn_id);
-        assert_eq!(same.turn_source, OutboundTurnSource::Snapshot);
-        // New inbound turn: thread from snapshot, turn minted under it.
-        let next = rewrite(
-            resolve_outbound_codex_runtime_identity(
-                &store,
-                &s,
-                &inbound("s", "t", Some("u2")),
-                Some(&snapshot),
-                now,
-            )
-            .await,
-        );
-        assert_eq!(next.thread_id, snapshot.thread_id);
-        assert_ne!(next.turn_id, snapshot.turn_id);
-        assert_eq!(next.turn_source, OutboundTurnSource::Minted);
-        // Snapshot for another root is ignored.
-        let other = rewrite(
-            resolve_outbound_codex_runtime_identity(
-                &store,
-                &s,
-                &inbound("other", "t2", Some("u1")),
-                Some(&snapshot),
-                now,
-            )
-            .await,
-        );
-        assert_eq!(other.inbound_root, "other");
-    }
-
-    #[tokio::test]
-    async fn store_unavailable_falls_back_to_passthrough_or_snapshot() {
-        let state = memory_state();
-        let unavailable = CodexRuntimeIdentityStore::unavailable(&state);
-        let s = scope(8, 64);
-        let now = at(1_756_857_600);
-        let resolution = resolve_outbound_codex_runtime_identity(
-            &unavailable,
-            &s,
-            &inbound("s", "t", Some("u1")),
-            None,
-            now,
-        )
-        .await;
-        assert_eq!(resolution, CodexRuntimeIdentityResolution::Passthrough);
-
-        let snapshot = outbound_fixture(Some("snap-turn"), OutboundTurnSource::Minted);
-        let mut inbound_new_turn = inbound("in-session", "t", Some("u-new"));
-        inbound_new_turn.previous_response_id_present = false;
-        let out = rewrite(
-            resolve_outbound_codex_runtime_identity(
-                &unavailable,
-                &s,
-                &inbound_new_turn,
-                Some(&snapshot),
-                now,
-            )
-            .await,
-        );
-        assert_eq!(out.thread_id, snapshot.thread_id);
-        assert_eq!(out.turn_id.as_deref(), Some("snap-turn"));
-        assert_eq!(out.turn_source, OutboundTurnSource::Snapshot);
-        assert_eq!(out.inbound_turn_key.as_deref(), Some("u-new"));
     }
 
     #[tokio::test]
@@ -3670,7 +4191,10 @@ mod tests {
             blob.get("forked_from_ordinal_exclusive").is_none(),
             "fork leaked"
         );
-        assert_eq!(blob["workspace_kind"], "project", "known extra kept");
+        assert!(
+            blob.get("workspace_kind").is_none(),
+            "app-server-only key dropped under a terminal user-agent"
+        );
         assert_eq!(blob["compaction"]["phase"], "mid_turn");
         assert!(blob.get("model").is_none(), "unknown key must be stripped");
         assert!(
@@ -3821,9 +4345,10 @@ mod tests {
             "prewarm precedes the task stamp"
         );
 
-        // Compaction carries the same identity set; `compaction` and the
-        // Desktop `workspace_kind` extra keep their official positions, and
-        // values the client did send (policy, flags) are kept.
+        // Compaction carries the same identity set and keeps values the
+        // client did send (policy, flags). Its user-agent is a terminal
+        // build, so the app-server-only `workspace_kind` is dropped and
+        // `compaction` is the last key.
         let compaction = rewrite_codex_turn_metadata_string(
             r#"{"session_id":"in","thread_id":"in","turn_id":"t","window_id":"in:0","request_kind":"compaction","workspace_kind":"project","sandbox":"windows_elevated","sandbox_mode":"read-only","auto_review_enabled":true,"compaction":{"phase":"mid_turn"}}"#,
             &outbound,
@@ -3837,7 +4362,11 @@ mod tests {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        assert_eq!(keys[keys.len() - 2..], ["compaction", "workspace_kind"]);
+        assert_eq!(*keys.last().unwrap(), "compaction");
+        assert!(
+            !keys.contains(&"workspace_kind".to_string()),
+            "app-server-only key dropped under a terminal user-agent"
+        );
         assert_eq!(compaction["window_number"], 2);
         assert_eq!(compaction["agent_name"], "/root");
         assert_eq!(
@@ -3908,6 +4437,36 @@ mod tests {
         let header_blob: Value = serde_json::from_str(&headers["x-codex-turn-metadata"]).unwrap();
         assert_eq!(header_blob["sandbox"], "windows_elevated");
         assert_eq!(header_blob["window_number"], 2);
+    }
+
+    #[test]
+    fn app_server_only_blob_keys_survive_only_under_an_app_server_user_agent() {
+        // `turn_trigger` and `workspace_kind` are sent only by the app-server
+        // (Desktop/IDE) client. A terminal build never emits them, so they are
+        // kept in their official positions only under an app-server user-agent
+        // and dropped under a terminal or unknown one.
+        let outbound = outbound_fixture(Some("out-turn"), OutboundTurnSource::Frozen);
+        let inbound = r#"{"session_id":"in","thread_id":"in","turn_id":"t","window_id":"in:0","request_kind":"turn","thread_source":"user","turn_trigger":"user_input","workspace_kind":"project"}"#;
+
+        // App-server user-agent: both keys kept, in their official positions.
+        let kept =
+            rewrite_codex_turn_metadata_string(inbound, &outbound, Some(DESKTOP_UA)).unwrap();
+        let kept: Value = serde_json::from_str(&kept).unwrap();
+        assert_eq!(kept["turn_trigger"], "user_input");
+        assert_eq!(kept["workspace_kind"], "project");
+        let keys: Vec<String> = kept.as_object().unwrap().keys().cloned().collect();
+        let trigger = keys.iter().position(|k| k == "turn_trigger").unwrap();
+        let sandbox = keys.iter().position(|k| k == "sandbox").unwrap();
+        assert!(trigger < sandbox, "turn_trigger precedes sandbox");
+        assert_eq!(keys.last().unwrap(), "workspace_kind", "flat extra is last");
+
+        // Every terminal originator, and an unknown/absent user-agent, drop both.
+        for ua in [Some(MAC_UA), Some(WINDOWS_UA), Some(LINUX_UA), None] {
+            let dropped = rewrite_codex_turn_metadata_string(inbound, &outbound, ua).unwrap();
+            let dropped: Value = serde_json::from_str(&dropped).unwrap();
+            assert!(dropped.get("turn_trigger").is_none(), "{ua:?}");
+            assert!(dropped.get("workspace_kind").is_none(), "{ua:?}");
+        }
     }
 
     #[test]

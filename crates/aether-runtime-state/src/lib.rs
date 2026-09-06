@@ -611,6 +611,56 @@ impl RuntimeState {
         }
     }
 
+    /// Atomically prunes members scored below `prune_below`, then adds
+    /// `member` only while fewer than `max_count` members score at or above
+    /// `count_min`; slides the key's TTL on success. Returns whether the member
+    /// was added. This is the sliding-window admission primitive: callers pass
+    /// the same window start for both bounds to enforce "at most `max_count`
+    /// admissions in any trailing window".
+    pub async fn score_add_if_count_below(
+        &self,
+        key: &str,
+        member: &str,
+        score: f64,
+        prune_below: f64,
+        count_min: f64,
+        max_count: usize,
+        ttl: Duration,
+    ) -> Result<bool, DataLayerError> {
+        if !score.is_finite() || !prune_below.is_finite() || !count_min.is_finite() {
+            return Err(DataLayerError::InvalidInput(
+                "runtime score must be finite".to_string(),
+            ));
+        }
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => Ok(memory
+                .score_add_if_count_below(
+                    key,
+                    member,
+                    score,
+                    prune_below,
+                    count_min,
+                    max_count,
+                    ttl,
+                )
+                .await),
+            RuntimeStateBackend::Redis(redis) => {
+                redis
+                    .runtime
+                    .score_add_if_count_below(
+                        key,
+                        member,
+                        score,
+                        prune_below,
+                        count_min,
+                        max_count,
+                        ttl,
+                    )
+                    .await
+            }
+        }
+    }
+
     pub async fn score_many(
         &self,
         key: &str,
@@ -2594,6 +2644,50 @@ mod tests {
                 .await
                 .expect("score many"),
             vec![None, None, Some(3.0)]
+        );
+        // Sliding-window admission: three of four fit within the window,
+        // members below the prune bound leave first and stop counting.
+        for (member, score, admitted) in [
+            ("w1", 100.0, true),
+            ("w2", 101.0, true),
+            ("w3", 102.0, true),
+            ("w4", 103.0, false),
+        ] {
+            assert_eq!(
+                runtime
+                    .score_add_if_count_below(
+                        "contract:window",
+                        member,
+                        score,
+                        50.0,
+                        50.0,
+                        3,
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .expect("window admission"),
+                admitted,
+                "member {member}"
+            );
+        }
+        assert!(runtime
+            .score_add_if_count_below(
+                "contract:window",
+                "w5",
+                200.0,
+                100.5,
+                100.5,
+                3,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("window admission after prune"));
+        assert_eq!(
+            runtime
+                .score_range_by_min("contract:window", 0.0)
+                .await
+                .expect("window members"),
+            vec!["w2", "w3", "w5"]
         );
         assert!(runtime
             .key_expire("contract:zset", Duration::from_millis(30))

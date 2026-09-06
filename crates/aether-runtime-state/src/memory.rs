@@ -716,6 +716,42 @@ impl MemoryRuntimeBackend {
             .insert(member.to_string(), score);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn score_add_if_count_below(
+        &self,
+        key: &str,
+        member: &str,
+        score: f64,
+        prune_below: f64,
+        count_min: f64,
+        max_count: usize,
+        ttl: Duration,
+    ) -> bool {
+        let mut scores = self.scores.lock().await;
+        let now = Instant::now();
+        prune_memory_key(&mut scores, key, now);
+        if ttl.is_zero() {
+            scores.remove(key);
+            return false;
+        }
+        let entry = scores.entry(key.to_string()).or_default();
+        entry.scores.retain(|_, existing| *existing >= prune_below);
+        let count = entry
+            .scores
+            .values()
+            .filter(|existing| **existing >= count_min)
+            .count();
+        if count >= max_count {
+            if entry.scores.is_empty() {
+                scores.remove(key);
+            }
+            return false;
+        }
+        entry.scores.insert(member.to_string(), score);
+        entry.expires_at = Some(now + ttl);
+        true
+    }
+
     pub(crate) async fn score_many(&self, key: &str, members: &[String]) -> Vec<Option<f64>> {
         let mut scores = self.scores.lock().await;
         prune_memory_key(&mut scores, key, Instant::now());

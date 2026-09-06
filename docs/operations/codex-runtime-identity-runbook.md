@@ -2,22 +2,22 @@
 
 > 对象：接手维护 `pool_advanced.codex_runtime_identity` 的人或 AI。设计与算法在
 > `docs/architecture/codex-pool-runtime-identity-synthesis-plan-2026-09-03.md`（下称「设计文档」），本文只讲线上怎么看、怎么判、怎么退。
-> 最后更新：2026-09-05（线上 `backend-v0.7.108`，10:27 UTC，含 `.107` 内容；`.109` 已提交到 `custom`，未发版）。
+> 最后更新：2026-09-06（线上 `backend-v0.7.108`，2026-09-05 10:27 UTC，含 `.107` 内容；`.109` 已提交到 `custom`，未发版；`.110` 在 `custom` 工作区、未提交，见 §4.2 与设计文档 §18.18）。
 
 ## 1. 现状速览
 
 | 项 | 值 |
 |---|---|
 | 功能 | Codex OAuth 号池选号之后，把上游可见的 `session_id` / `thread_id` / `turn_id` / `window_id` 改写成「每账号每日少量 thread / turn」的合成身份；入站官方 ID 一律不动（sticky、WS 绑定、fence、用量都读入站） |
-| 开关 | 号池高级设置 →「会话身份合成」卡片；JSON 为 `pool_advanced.codex_runtime_identity {enabled, expected_threads_per_day 1..=64, expected_turns_per_day 1..=512}`；缺省关闭。两个数字是 **每日上限**：.107 起当天实际额度按账号、按天（turn 再按 thread）在 `[⌈N/2⌉, N]` / `[⌈M/2⌉, M]` 内确定性抖动，.106 及之前是固定模数；.108 起新对话按到达顺序各开一条 thread，当天额度用满后复用最久没有新 turn 的那条（.107 及之前按哈希分槽）。一个人日常用 codex 大约几条到十几条 thread，上限建议 8–16；Codex Pro 现填 32 偏高 |
+| 开关 | 号池高级设置 →「会话身份合成」卡片；JSON 为 `pool_advanced.codex_runtime_identity {enabled, expected_threads_per_day 1..=64, expected_turns_per_day 1..=512}`；缺省关闭。两个数字是 **上限**：.107 起实际额度按账号、按天在 `[⌈N/2⌉, N]` / `[⌈M/2⌉, M]` 内确定性抖动，.106 及之前是固定模数；.108 起新对话按到达顺序各开一条 thread，额度用满后复用最久没有新 turn 的那条（.107 及之前按哈希分槽）。**.110（工作区，未发版）起 thread 与 turn 都是账号级、按最近 24 小时滚动统计的硬上限**（.109 及之前 turn 是「每 thread」、名册按日历日分区），同一条出站 thread 内的 turn 只顺序向前、不回访旧 turn id；上限可低至 1。官方风控按账号看：近 24h turn 超过约 100 就可能被切模型，务必压在 100 以内。一个人日常用 codex 大约几条到十几条 thread，上限建议 Thread 8–16、Turn ≤64；Codex Pro 现填 32/256 偏高，.110 发版时应下调到 8/64 以内 |
 | 线上 | `backend-v0.7.108`（2026-09-05 10:27 UTC）；Codex Pro 号池开着 32 thread/天、256 turn/天 + 请求体/响应体捕获。.104 于 02:36 UTC、.105 于 06:05 UTC、.106 于 06:40 UTC 同日上线 |
 | 代码 | `apps/aether-gateway/src/codex_runtime_identity.rs`（算法、白名单、四个表面）；HTTP 挂点 `ai_serving/planner/standard/openai/responses/decision/request.rs`、`ai_serving/planner/standard/codex.rs`；WS 挂点 `codex_ws/runtime.rs`；配置校验 `handlers/admin/provider/write/normalize.rs`；前端号池高级设置卡片 |
-| 状态存储 | Redis `ap:{provider_id}:codex_rid:{selection_fp}:...`（thread 到达序号、当天 thread 名册 ZSET（.108）、turn 槽、root/turn freeze、window），全部带 TTL；进程内还有 WS 候选快照 |
-| 观测 | 日志事件 `codex_rid_config_invalid` / `codex_rid_store_unavailable` / `codex_rid_chain_freeze_miss` / `codex_rid_unknown_metadata_key` / `codex_rid_thread_reused`（§4） |
+| 状态存储 | Redis `ap:{provider_id}:codex_rid:{selection_fp}:...`（.110 起：账号级 thread 名册 ZSET `…:threads`、账号级 turn 台账 ZSET `…:turns`，均按最近 24h 滚动窗口计数、去掉日期段；每条 thread 一个 open turn `…:open:{thread}`；root / turn freeze；window。.108/.109 是 `…:{day_id}:threads` 名册 + 按 thread 的 turn 槽），全部带 TTL；进程内还有 WS 候选快照 |
+| 观测 | 日志事件 `codex_rid_config_invalid` / `codex_rid_store_unavailable` / `codex_rid_chain_freeze_miss` / `codex_rid_unknown_metadata_key` / `codex_rid_thread_reused` / `codex_rid_turn_steered`（.110）/ `codex_rid_turn_budget_exceeded`（.110）（§4） |
 | 部署记录 | 仓库根 `容器更新历史.md`（操作员本地文件，未纳入 git）+ `.env.bak.<ts>_pre_vX`；更新流程见 `docs/operations/release-and-container-update-spec.md` |
 | 官方源码基准 | 本地 checkout `/opt/stacks/openai-codex`（codex-rs），**不要上网查**；核对前先 `git -C /opt/stacks/openai-codex log -1 --format='%h %cd'` 记下版本 |
 
-版本演进（详见设计文档 §18.10–§18.17）：
+版本演进（详见设计文档 §18.10–§18.18）：
 
 | tag | 内容 | 线上 |
 |---|---|---|
@@ -28,6 +28,7 @@
 | .107（候选，未单独发版） | 每日 thread / turn 槽数上限按账号、按天抖动（设计文档 §7.0、§18.15）；内置 Codex UA 字典换成 23 组线上观察到的 0.153.x（gpt-6 要求 ≥ 0.153 客户端）；`version` 头随出站 UA 改写（此前透传入站值、中转无此头、Search 遇 `Codex Desktop` UA 会删掉） | 并入 .108 |
 | .108 | 含 .107 全部内容；thread 改为按到达顺序 mint、当天名册满后复用最久没有新 turn 的 thread（设计文档 §7.1、§8、§18.16）；新事件 `codex_rid_thread_reused` | 2026-09-05 10:27 UTC；Redis 新增 `…:{day}:threads` ZSET，无需迁移，切换当天账号 thread 数可能一次性略超上限 |
 | .109 | turn / compaction / prewarm 的出站 blob 按当前（0.153.x）客户端形状重建：旧客户端（codex-tui ≤ 0.150）没发的 `agent_name` / `window_number` / `context_window_id` / `sandbox_mode` / 三个 review 标志按默认值补齐；`sandbox` 跟随出站 UA 的操作系统（Mac `seatbelt`、Windows `windows_elevated` 或保留 `windows_sandbox`、其它 `seccomp`；`none` / `external` 保持）（设计文档 §18.17） | 已提交到 `custom`，未发版；上线后用 §3.5 Q11 / Q12 复核 |
+| .110 | turn 上限从「每 thread」改为账号级、最近 24h 滚动的硬顶（新 turn 台账 ZSET `…:turns`）；thread 名册同样改账号级滑动 24h（去日期段）；一条出站 thread 只有一个 open turn，被取代的旧入站 turn 回放时 steer 向前、不回访 turn id；thread mint 与 turn 预算耦合 ⇒ distinct thread ≤ min(thread_bound, turn_bound)；上限可低至 1；`turn_trigger` / `workspace_kind` 只在 app-server（codex_vscode）UA 下保留，终端 / 无头 UA 出站 blob 删除。新事件 `codex_rid_turn_steered` / `codex_rid_turn_budget_exceeded`（设计文档 §18.18） | **工作区，未提交 / 未发版**；上线后按 §4 末「.110 上线后复核」核对 |
 
 ## 2. 数据源与取数规矩
 
@@ -262,12 +263,14 @@ docker logs aether-app --since 2026-09-05T06:40:00Z 2>&1 | grep -E 'codex_rid_' 
 | `codex_rid_config_invalid` | 号池 `pool_advanced.codex_runtime_identity` 形状/范围不合法 | 该池当次请求按关闭处理（透传）。到管理后台重新保存卡片；校验规则见设计文档 §6、§18.7 |
 | `codex_rid_store_unavailable` | Redis 不可用，取不到槽位/freeze | 按设计回退：HTTP 透传入站身份或用进程内快照（设计文档 §7.5、§18.3）。先看 `docs/operations/redis-runtime-runbook.md`，Redis 恢复后自愈；持续出现说明 Redis 出问题，不是本功能问题 |
 | `codex_rid_chain_freeze_miss` | 带 `previous_response_id` 或跨路径接续时找不到 freeze | 按 §7.1 正常分配 thread（不透传）。偶发正常（freeze TTL 到期、跨日）；集中出现查 Redis TTL 与时钟 |
-| `codex_rid_thread_reused`（debug 级，.108） | 该账号当天 thread 额度已用满，新对话复用了最久没有新 turn 的 thread | 正常行为，忙账号每天都会出现。若某账号几乎每个新对话都触发（复用远多于 mint），说明上限相对该账号的流量偏低，酌情上调 `expected_threads_per_day`；不出现则说明流量没到上限 |
+| `codex_rid_thread_reused`（debug 级，.108） | 该账号 thread 额度已用满（.110 起按最近 24h），新对话复用了最久没有新 turn 的 thread | 正常行为，忙账号每天都会出现。若某账号几乎每个新对话都触发（复用远多于 mint），说明上限相对该账号的流量偏低，酌情上调 `expected_threads_per_day`；不出现则说明流量没到上限 |
+| `codex_rid_turn_steered`（debug 级，.110） | 同一出站 thread 上，被取代的旧入站 turn 回放时 steer 到当前 open turn（不回访旧 turn id，只刷 TTL） | 正常行为。thread 内 turn 交错时保证出站 turn id 单调向前；集中出现只说明该账号有大量乱序 / 重放请求，不需处理 |
+| `codex_rid_turn_budget_exceeded`（debug 级，.110） | 该账号最近 24h 的 turn 台账已满 `turn_bound`，本请求折回已有 thread、不再开新 turn | 正常的账号级硬顶生效。若某账号频繁触发，说明流量下该上限把可见 turn 压得偏紧，可上调 `expected_turns_per_day`（但别超约 100 的风控线）；这是把账号可见 turn 压到官方阈值以下的预期机制 |
 | `codex_rid_unknown_metadata_key` | 客户端带了三表面白名单之外的键，已被删除；每进程每 (surface, key) 只 warn 一次 | 走 §4.1 判定 |
 
 ### 4.1 未知键判定流程（白名单维护）
 
-白名单常量都在 `apps/aether-gateway/src/codex_runtime_identity.rs` 顶部：`BLOB_IDENTITY_KEYS` / `BLOB_NORMALIZED_KEYS` / `BLOB_LEAK_KEYS` / `BLOB_PASS_KEYS`（turn-metadata blob），`FLAT_IDENTITY_KEYS` / `FLAT_LEAK_KEYS` / `FLAT_PASS_KEYS`（扁平 `client_metadata`），`HEADER_PASS_KEYS` / `HEADER_STRIP_KEYS`（`x-codex-*` 等前缀头）。
+白名单常量都在 `apps/aether-gateway/src/codex_runtime_identity.rs` 顶部：`BLOB_IDENTITY_KEYS` / `BLOB_NORMALIZED_KEYS` / `BLOB_LEAK_KEYS` / `BLOB_PASS_KEYS`（turn-metadata blob），`FLAT_IDENTITY_KEYS` / `FLAT_LEAK_KEYS` / `FLAT_PASS_KEYS`（扁平 `client_metadata`），`HEADER_PASS_KEYS` / `HEADER_STRIP_KEYS`（`x-codex-*` 等前缀头）。.110 起另有 `BLOB_APP_SERVER_KEYS = ["turn_trigger", "workspace_kind"]`：这两个键只在 app-server（`codex_vscode` 等 IDE）originator 下出现，终端 / 无头出站 UA（originator 前缀在 `TERMINAL_ORIGINATOR_PREFIXES`：`codex-tui/` / `codex_exec/` / `codex_cli_rs/`）或无 UA 时按出站客户端形状从 blob 删除。所以某个 pass 键在终端 UA 下不出现是预期，不是漏配。
 
 1. 在本地 codex-rs 里找这个键：
    ```bash
@@ -282,6 +285,66 @@ docker logs aether-app --since 2026-09-05T06:40:00Z 2>&1 | grep -E 'codex_rid_' 
    - 键含 thread/turn/session 类身份 → 归入 `*_IDENTITY_KEYS`（需要改写规则）或 `*_LEAK_KEYS`（只在子/fork thread 出现的一律删），并补改写逻辑与测试。
    - 键是 Aether 自己的控制字段（`sub2api_*`、`aether.*`）→ 已由 `FLAT_CONTROL_PREFIXES` 处理，不该报；报了就是控制字段命名漂移。
 3. 原则：任何真实 codex-rs 单一版本产生不了的确定性形状都算缺陷，优先级高于「少泄漏」。加白之前先问「出站 UA 那个版本的 codex 会不会发这个键」。
+
+### 4.2 `.110` 上线后复核（发版后按此三查）
+
+`.110` 把 turn 上限改成账号级、最近 24h 滚动的硬顶，并保证一条出站 thread 内 turn id 单调不回访、终端 UA 出站 blob 不带 app-server-only 键。上线后用容器启动时间之后的窗口（`docker inspect aether-app --format '{{.State.StartedAt}}'`）跑下面三查。
+
+**查一：每账号最近 24h 出站 distinct thread / turn ≤ 上限。** 按 blob 里的 `installation_id` 假名分组（一账号一 installation）：
+
+```sql
+-- psql -v since='<StartedAt 或 now-24h>' -f post_110_ceilings.sql
+with r as (
+  select (h.provider_request_headers::jsonb->>'x-codex-turn-metadata')::jsonb b,
+         h.provider_request_headers::jsonb->>'thread-id' th
+  from usage_http_audits h join usage u on u.request_id=h.request_id
+  where h.created_at >= :'since' and u.provider_name='Codex Pro' and u.status_code=200
+    and jsonb_typeof(h.provider_request_headers::jsonb)='object')
+select left(md5(b->>'installation_id'),6) acct6,
+       count(distinct th) distinct_threads,
+       count(distinct b->>'turn_id') distinct_turns
+from r where b ? 'installation_id' group by 1 order by 2 desc, 3 desc;
+```
+
+期望：每个 `acct6` 的 `distinct_threads` ≤ 该池 thread 上限、`distinct_turns` ≤ turn 上限（抖动后实际额度在 `[⌈上限/2⌉, 上限]`，可能更低）。任一列超过配置上限即缺陷，查 Redis 台账 `…:threads` / `…:turns` 的 `ZCOUNT` 与准入逻辑。
+
+**查二：同一出站 thread 内 turn id 不回访（应 0 行）。** 用「岛屿分组」把一个 thread 里同一 turn id 的连续出现压成一段，若某 turn id 在同一 thread 出现于两段以上，就是回访：
+
+```sql
+with r as (
+  select h.created_at ts,
+         h.provider_request_headers::jsonb->>'thread-id' th,
+         (h.provider_request_headers::jsonb->>'x-codex-turn-metadata')::jsonb->>'turn_id' tid
+  from usage_http_audits h join usage u on u.request_id=h.request_id
+  where h.created_at >= :'since' and u.provider_name='Codex Pro' and u.status_code=200
+    and jsonb_typeof(h.provider_request_headers::jsonb)='object'),
+runs as (
+  select th, tid,
+         row_number() over (partition by th order by ts)
+           - row_number() over (partition by th, tid order by ts) grp
+  from r where tid is not null and th is not null)
+select left(md5(th),6) th6, count(distinct grp) segments
+from runs group by th, tid having count(distinct grp) > 1 order by segments desc;
+```
+
+期望 0 行。有行说明该 thread 的出站 turn id 来回跳（`.109` 及之前的交错缺陷复现），查 `resolve_turn` 的 open turn / steer 分支。
+
+**查三：终端 / 无头出站 UA 的 blob 不带 app-server-only 键（应 leaked=0）。** `turn_trigger` / `workspace_kind` 只该在 app-server（`codex_vscode` 等）originator 的出站 UA 下出现：
+
+```sql
+select count(*) filter (
+         where (b ? 'turn_trigger' or b ? 'workspace_kind')
+           and (ua is null or ua = '' or ua ~ '^(codex-tui|codex_exec|codex_cli_rs)/')
+       ) leaked,
+       count(*) n
+from (select (h.provider_request_headers::jsonb->>'x-codex-turn-metadata')::jsonb b,
+             h.provider_request_headers::jsonb->>'user-agent' ua
+      from usage_http_audits h join usage u on u.request_id=h.request_id
+      where h.created_at >= :'since' and u.provider_name='Codex Pro'
+        and jsonb_typeof(h.provider_request_headers::jsonb)='object') s;
+```
+
+期望 `leaked = 0`。有值说明 `OutboundClient::from_user_agent` 的 app-server 判定或 blob 删键漏了（注意池档位 UA 若是 `Codex Desktop` / `codex_vscode` 属 app-server，保留这两键是对的，不计入 leaked）。
 
 ## 5. 版本核对：codex-rs 基准
 

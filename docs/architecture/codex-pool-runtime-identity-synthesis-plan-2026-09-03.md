@@ -12,11 +12,11 @@
 
 | 项 | 现状 |
 |---|---|
-| 线上版本 | `backend-v0.7.108`（2026-09-05 10:27 UTC，含 .107 内容）；Codex Pro 号池开着 32 thread/天、256 turn/天 + body capture；其他号池关闭。`.109`（§18.17）已提交到 `custom`，未发版 |
+| 线上版本 | `backend-v0.7.108`（2026-09-05 10:27 UTC，含 .107 内容）；Codex Pro 号池开着 32 thread/天、256 turn/天 + body capture；其他号池关闭。`.109`（§18.17）已提交到 `custom`，未发版；`.110`（§18.18）在工作区，未提交 |
 | 代码 | `apps/aether-gateway/src/codex_runtime_identity.rs`（算法、四个表面 `HttpResponses` / `HttpCompact` / `Headers` / `WsStepBody`、三表面白名单）；挂点见 §11、§18.1、§18.5、§18.6 |
 | 不变量 | 三套身份平面不混用（§5）；只改出站副本，sticky / WS 绑定 / fence / 用量读入站（§2）；任何真实单一版本 codex-rs 产生不了的确定性形状都是缺陷，优先级高于「少泄漏」（§18.13） |
 | 官方基准 | 本地 `/opt/stacks/openai-codex`；§1–§18.12 按 `357696c5` 复核，§18.13 起按 `07f18d5f`。核对时先看 checkout 版本，不上网查 |
-| 演进 | §18.11（.102 修复）→ §18.12（.104 window / 白名单 + 线上验证）→ §18.13 / §18.14（.105 风控复核、无元数据合成、官方头补齐）→ §18.14.3（.106 compact）→ §18.14.7（缓存回退根因）→ §18.14.8 / §18.14.9（未知键原则、上线验证结果）→ §7.0 / §18.15（.107：每日槽数上限按账号按天抖动）→ §7.1 / §8 / §18.16（.108：thread 按到达顺序 mint、满员复用最久未用）→ §18.17（.109：turn / compaction / prewarm blob 按当前客户端形状补齐、`sandbox` 跟随出站 UA 操作系统） |
+| 演进 | §18.11（.102 修复）→ §18.12（.104 window / 白名单 + 线上验证）→ §18.13 / §18.14（.105 风控复核、无元数据合成、官方头补齐）→ §18.14.3（.106 compact）→ §18.14.7（缓存回退根因）→ §18.14.8 / §18.14.9（未知键原则、上线验证结果）→ §7.0 / §18.15（.107：每日槽数上限按账号按天抖动）→ §7.1 / §8 / §18.16（.108：thread 按到达顺序 mint、满员复用最久未用）→ §18.17（.109：turn / compaction / prewarm blob 按当前客户端形状补齐、`sandbox` 跟随出站 UA 操作系统）→ §18.18（.110：turn 上限改账号级近 24h、thread 内 turn 单调不回访、上限可低至 1、终端 UA 收敛 app-server-only blob 键；工作区未提交） |
 | 部署记录 | 仓库根 `容器更新历史.md`（操作员本地文件，未纳入 git）+ `.env.bak.<ts>_pre_vX` |
 | 残余 | §15、§18.14.5：`internal_<source>:<parent>` 形式 `prompt_cache_key` 透传；合成请求压缩探测不到；中转 65 字符 `rs_` id 400 循环另行设计 |
 
@@ -964,3 +964,40 @@ cd frontend && npm run type-check
 **不做**：不按入站 `sandbox_mode` 去猜 `sandbox`（策略与后端是两个维度）；不重写客户端自己发的 `turn_started_at_unix_ms` / 标志 / 策略；不改 memory 与 None 形状；不给合成请求补 `workspaces` 等可选键；UA 之外不做别的指纹推断。
 
 **测试**：新增 `request_identity_blob_matches_current_client_shape_and_outbound_os`（0.147 形状 turn blob 重建后的完整键序与取值、缺 stamp 时从 v7 turn 补、prewarm 不补 stamp、compaction 保留 `compaction` / `workspace_kind` 位置与已发的 `read-only` / `true`、`project_sandbox` 投影表、None 形状只投影 sandbox 不补键、Headers 表面从头里读 UA）；`body_rewrite_keeps_flat_and_blob_consistent` 改为 Windows UA 下 `seatbelt → windows_elevated` 并断言补齐键；`whitelist_strips_unknown_keys_on_every_surface` 改为按键断言。线上复核见 runbook §3.5 Q11 / Q12。
+
+### 18.18 v0.7.110 turn 上限改账号级近 24h、thread 内 turn 不回访、上限可压到官方阈值以下、终端 UA 收敛 app-server-only blob 键
+
+**起因**：从上游风控视角复核 .108 / .109 的形状，操作员点出四处「真实单一 codex 客户端产生不了」的确定性偏差（按 §18.13 标准均为缺陷，优先级高于「少泄漏」）：
+
+1. **turn 上限是「每条出站 thread」而不是「每账号」**。`.108` 的 turn 槽按出站 thread 分区，一个 thread 一天 M 个 turn；忙账号 thread 数×M 可以远超官方按账号计的每日 turn 阈值。官方风控按账号历史里的 turn 计数看，报称一天超过约 100 个 turn 就可能被切模型 / 风控。
+2. **thread 内 turn-id 会回访 / 交错**。`.108` 的 LRU 复用把新 root 折进已有 thread 后，同一 thread 上不同入站 turn 交错到达时，出站 turn id 可能来回跳（回到早先的 turn UUID）。真实 codex 一条 thread 同一时刻只推进一个 turn，且单调向前，从不回到旧 turn id。
+3. **上限压不到官方阈值以下**。产品需要 thread 能低于 8、turn 能低于 64（直到 1）作硬顶，把账号每日可见 turn 稳定压在 ~100 以内。
+4. **§18.17 的 blob 重建把 `turn_trigger` / `workspace_kind` 原样搬**。这两个键只在 app-server originator（`codex_vscode`）下出现；终端 / 无头客户端（codex-tui / codex_exec / codex_cli_rs）从不发。一个出站 UA 是 0.153 codex-tui 的 blob 带着 `turn_trigger` / `workspace_kind`，是该客户端产生不了的形状。
+
+**依据（codex-rs 07f18d5f，本地 checkout）**：一条 conversation/thread 顺序推进 turn，`start_task` 串行开任务，同一 thread 不并发两个 turn，出站 turn id 只会向前；`turn_trigger` / `workspace_kind` 仅由 app-server（IDE）形状携带，TUI / exec 的 `turn_metadata_payload()` 不含它们。
+
+**修法**（`codex_runtime_identity.rs` + `crates/aether-runtime-state`；freeze、window、四表面白名单、UA / originator / version、profile pass 不动）：
+
+1. **turn 上限改账号级、trailing-24h 硬顶**。thread 名册与 turn 台账都从「日历日分区」改为「账号级滑动 24h 窗口」：
+   - 键去掉 `:{day_id}`：thread 名册 `ap:{provider_id}:codex_rid:{selection_fp}:threads`（成员=出站 thread UUID、分数=最后活跃 unix 秒）；新增 turn 台账 `…:turns`（成员=出站 turn UUID、分数=mint 时刻 unix 秒）。两者成员的分数落在最近 24h 内才计入上限。
+   - 准入走原子滑动窗口 `admit → score_add_if_count_below(key, member, score, prune_below=window_start, count_min=window_start, max_count=bound, ttl)`：先按分数窗口修剪并计数，`>= max_count` 拒绝，否则写入并刷 TTL。thread 按 `thread_bound`、turn 按 `turn_bound` 各自准入。
+   - **thread mint 与 turn 预算耦合**：mint 新 thread 前先向 turn 台账预留预算；预算已花 / 本请求不开新 turn（memory、compact、frozen 回放）就把 root 折回已有 thread，绝不为「只 steer」开新 thread。于是 distinct thread ≤ min(thread_bound, turn_bound)，账号每日出站 turn ≤ turn_bound 是账号级硬顶。
+2. **一条出站 thread 只有一个 open turn，禁止 turn-id 回访**。`…:open:{thread}` 存 `OpenTurn{turn_id, inbound_turn}`。同一 thread 上：新的入站 turn 单调 fold 出新出站 turn（`OutboundTurnSource::Minted`）；被取代的旧入站 turn 回放时 steer 到当前 open turn（`Steered`，只刷 TTL，不回旧 UUID，打点 `codex_rid_turn_steered`）；WS 绑定连接对自己在飞的 turn 永远权威（`Snapshot`）。三个 root（A、B、A）交错到达不会让出站 turn id 在同一 thread 内来回跳。turn-state 只在 `forwards_turn_state()`（`Snapshot` / `Frozen` / `None`）时转发。
+3. **上限降到官方阈值以下作硬顶**。`MIN_THREADS_PER_DAY = MIN_TURNS_PER_DAY = 1`，配置校验与前端范围都允许 1；`jittered_bound` 在配置上限内确定性抽取，天花板为 1 时恒 1，永不超配置值。thread 可低于 8、turn 可低于 64 直到 1。turn 侧从「每 thread M」变成「每账号 M/天」，64 即账号一天的出站 turn 硬顶，远低于 ~100。Codex Pro 现调到 8 thread / 64 turn。
+4. **app-server-only blob 键按出站 UA 收敛**。`BLOB_APP_SERVER_KEYS = ["turn_trigger", "workspace_kind"]`；`OutboundClient::from_user_agent` 按「UA 存在且 originator 不在 `TERMINAL_ORIGINATOR_PREFIXES = ["codex-tui/", "codex_exec/", "codex_cli_rs/"]`」判 `app_server`。改写 blob 时 `!client.app_server`（终端 UA 或无 UA）就删这两键；app-server UA（codex_vscode 等）保留。修正 §18.17 「按白名单原样搬」这一步。
+
+**存储层新增（`crates/aether-runtime-state`）**：`score_add_if_count_below(key, member, score, prune_below, count_min, max_count, ttl)` — 原子「按分数窗口计数、低于上限才写入」。内存后端（`memory.rs`）：先 `scores.retain(|_, e| *e >= prune_below)`，再数分数 `>= count_min` 的成员，`>= max_count` 拒绝、否则写入并设 TTL。Redis 后端（`redis/runtime.rs`）单条 Lua：`ZREMRANGEBYSCORE key -inf (prune_below` → `ZCOUNT key count_min +inf` → 满则拒绝、否则 `ZADD` + `PEXPIRE`。契约测试 `runtime_backends_share_kv_score_and_queue_contracts` 覆盖两后端一致（窗口修剪、计数、拒绝、TTL），已通过。
+
+**结果形状**：忙账号一天出站 thread ≤ thread_bound、出站 turn ≤ turn_bound，两者都是账号级滑动 24h 硬顶，可压到官方阈值以下；一条 thread 内 turn 单调向前不回访；终端 / 无头 UA 的出站 blob 不带 app-server-only 键。
+
+**没有改的**：root / per-turn freeze（滑动 TTL）、window 跟压缩推进、四表面白名单、UA / originator / version 头改写、profile pass、memory 与 `request_kind=None` 的 blob 形状（除随第 4 条一起收敛 app-server 键）。
+
+**升级与迁移**：名册 / 台账键改名（`.108` 的 `…:{day_id}:threads` 与按 thread 的 turn 槽键弃用；新键 `…:threads` / `…:turns` 无日期段）。升级瞬间旧日分区键不再被读、自然过期；当天在飞的 thread 在其下一个新 turn 时按滑动窗口重新登记进新名册，因此切换当天该账号可见 thread 可能一次性略超上限（旧日分区 thread + 新名册 thread），一个滑动窗口（约 24–36h）后收敛。回滚到 .109 时新键自然过期。**过渡建议**：正式发版前把线上 thread 上限暂留 ≥16，避免旧 / 新名册叠加期对话过度折叠。
+
+**观测**：沿用 / 新增事件 `codex_rid_turn_steered`（旧入站 turn 回放被 steer 到 open turn，debug）、`codex_rid_turn_budget_exceeded`（账号级 turn 台账满，本请求折回已有 thread 不开新 turn，debug）、`codex_rid_thread_reused`（.108）、`codex_rid_chain_freeze_miss`（跨路径 freeze 未命中，按槽正常 mint）。
+
+**前端**：卡片正文改为「账号级、按最近 24 小时滚动统计的硬上限……同一条出站 Thread 内的 Turn 只顺序向前，不回头复用旧 Turn ID」；Thread / Turn 标签括注改成 `(账号级 / 近 24h, {min}-{max})`；底部提示补「官方风控很严格：同一账号最近 24 小时 Turn 超过约 100 就可能被风控，务必压在 100 以内（可低至 1），Thread 同样可低至 1」。`poolAdvancedDialog.ts` 的范围校验 HEAD 即为 `{min: 1, max: 64}` / `{min: 1, max: 512}`，无需改。
+
+**测试**（`codex_runtime_identity::tests`，14 项全绿；`aether-runtime-state` 契约测试通过）：`threads_mint_by_arrival_then_reuse_least_recently_active`、`account_ceilings_hold_below_the_official_thresholds`、`turn_ceiling_of_one_mints_exactly_one_turn`、`no_turn_id_revisit_within_a_thread_under_interleaved_roots`、`resolved_turn_source_gates_turn_state_forwarding`、`roster_is_a_trailing_24h_window_not_a_calendar_day`、`root_freeze_survives_day_rollover_and_turn_freeze_too`、`chained_request_continues_the_threads_open_turn`、`memory_requests_share_thread_but_carry_no_turn`、`ws_snapshot_stays_authoritative_for_its_bound_turn`、`store_unavailable_falls_back_to_passthrough_or_snapshot`、`concurrent_new_roots_never_mint_past_the_daily_bound`、`concurrent_mints_converge_on_one_identity`、`app_server_only_blob_keys_survive_only_under_an_app_server_user_agent`。
+
+**交付状态**：已在 `custom` 工作区改好并自测（`cargo test -p aether-gateway codex_runtime_identity` 40 通过 0 失败；`aether-runtime-state` 契约测试通过）。**未提交、未 tag、未发版、未上线**——tag / CI / 上线时机由操作员另行决定。

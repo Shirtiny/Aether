@@ -503,6 +503,42 @@ impl RedisRuntimeRunner {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn score_add_if_count_below(
+        &self,
+        key: &str,
+        member: &str,
+        score: f64,
+        prune_below: f64,
+        count_min: f64,
+        max_count: usize,
+        ttl: Duration,
+    ) -> Result<bool, DataLayerError> {
+        let key = self.keyspace.key(key);
+        let ttl_ms = u64::try_from(ttl.as_millis().max(1)).unwrap_or(u64::MAX);
+        let mut connection = self.connections.connection(RedisConnectionLane::Fast);
+        let added = script(
+            "redis.call('zremrangebyscore', KEYS[1], '-inf', '(' .. ARGV[3]) \
+             if redis.call('zcount', KEYS[1], ARGV[4], '+inf') >= tonumber(ARGV[5]) then \
+                 return 0 \
+             end \
+             redis.call('zadd', KEYS[1], ARGV[2], ARGV[1]) \
+             redis.call('pexpire', KEYS[1], ARGV[6]) \
+             return 1",
+        )
+        .key(key)
+        .arg(member)
+        .arg(score)
+        .arg(prune_below)
+        .arg(count_min)
+        .arg(max_count)
+        .arg(ttl_ms)
+        .invoke_async::<i32>(&mut connection)
+        .await
+        .map_redis_err()?;
+        Ok(added > 0)
+    }
+
     pub(crate) async fn score_many(
         &self,
         key: &str,

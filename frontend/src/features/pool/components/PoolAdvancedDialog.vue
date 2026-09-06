@@ -574,8 +574,8 @@
                 </span>
               </div>
               <p class="text-xs leading-5 text-muted-foreground">
-                开启后，每个账号对上游呈现的会话树会按下方「每日上限」折叠：新对话按到达顺序各开一条 Thread，当天额度用满后复用最久没有新 Turn 的那条；每个 Thread 一天内新出现的 Turn 不超过上限。
-                上限是天花板而不是固定值：当天实际额度按账号、按天在「上限的一半 ～ 上限」之间确定性抖动，流量少的账号只出现实际用到的数量，忙的账号也不会天天恰好停在同一个数。
+                开启后，每个账号对上游呈现的会话树会按下方「上限」折叠：新对话按到达顺序各开一条 Thread，额度用满后复用最久未活跃的那条。Thread 与 Turn 都是账号级、按最近 24 小时滚动统计的硬上限，而不是每条 Thread 单独计数；同一条出站 Thread 内的 Turn 只会顺序向前，不回头复用旧的 Turn ID。
+                上限是天花板而不是固定值：实际额度按账号、按天在「上限的一半 ～ 上限」之间确定性抖动，流量少的账号只出现实际用到的数量，忙的账号也不会天天恰好停在同一个数。
                 客户端侧 sticky、WebSocket 绑定与用量统计仍使用原始会话身份。关闭后原样透传客户端会话 ID。
               </p>
             </div>
@@ -592,9 +592,9 @@
           >
             <div class="space-y-1.5">
               <Label>
-                每日 Thread 上限
+                Thread 上限
                 <span class="text-xs text-muted-foreground">
-                  ({{ CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY_RANGE.min }}-{{ CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY_RANGE.max }})
+                  (账号级 / 近 24h，{{ CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY_RANGE.min }}-{{ CODEX_RUNTIME_IDENTITY_THREADS_PER_DAY_RANGE.max }})
                 </span>
               </Label>
               <Input
@@ -608,9 +608,9 @@
             </div>
             <div class="space-y-1.5">
               <Label>
-                每日 Turn 上限
+                Turn 上限
                 <span class="text-xs text-muted-foreground">
-                  (每个 Thread，{{ CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY_RANGE.min }}-{{ CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY_RANGE.max }})
+                  (账号级 / 近 24h，{{ CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY_RANGE.min }}-{{ CODEX_RUNTIME_IDENTITY_TURNS_PER_DAY_RANGE.max }})
                 </span>
               </Label>
               <Input
@@ -623,7 +623,7 @@
               />
             </div>
             <p class="text-xs leading-5 text-muted-foreground sm:col-span-2">
-              建议值：Thread 8、Turn 64。上限越小，上游可见的会话数越少，但更多真实会话会共用同一个出站 Thread；一个人日常用 Codex 大约是几条到十几条 Thread，上限不宜远超这个量级。跨日重连的会话仍保持原出站身份。
+              建议值：Thread 8、Turn 64。官方风控很严格：同一账号最近 24 小时的 Turn 数超过约 100 就可能被风控，务必把 Turn 上限压在 100 以内（可低至 1），Thread 同样可低至 1。上限越小，上游可见的会话数越少，但更多真实会话会共用同一条出站 Thread；一个人日常用 Codex 大约是几条到十几条 Thread。跨日重连的会话仍保持原出站身份。
             </p>
           </div>
         </div>
