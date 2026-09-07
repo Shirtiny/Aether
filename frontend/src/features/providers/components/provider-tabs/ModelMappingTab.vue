@@ -321,6 +321,8 @@
     :open="modelTest.dialogOpen.value"
     :result="modelTest.testResult.value"
     mode="direct"
+    :batch-mode="modelTest.batchMode.value"
+    :batch-results="modelTest.batchResults.value"
     :provider-type="provider.provider_type"
     :selecting-model-name="testingModelName"
     :endpoints="selectableTestEndpoints"
@@ -334,11 +336,19 @@
     :request-body-draft="testRequestBodyDraft"
     :request-body-reset-value="testRequestBodyResetValue"
     :request-body-error="testRequestBodyError"
+    :key-options="testKeys.keyOptions.value"
+    :selected-key-ids="testKeys.selectedIds.value"
+    :key-options-loading="testKeys.loading.value"
+    :key-options-error="testKeys.loadError.value"
     :start-disabled="!selectedTestEndpoint || !!testRequestHeadersError || !!testRequestBodyError"
     @close="handleTestDialogClose"
     @back="handleTestDialogBack"
     @select-endpoint="handleSelectTestEndpoint"
     @start="handleStartMappingTest"
+    @cancel-batch="modelTest.cancelBatch"
+    @reload-keys="testKeys.load"
+    @update:batch-mode="modelTest.batchMode.value = $event"
+    @update:selected-key-ids="testKeys.select"
     @update:request-headers-draft="testRequestHeadersDraft = $event"
     @update:request-body-draft="testRequestBodyDraft = $event"
   />
@@ -355,6 +365,7 @@ import {
 import AlertDialog from '@/components/common/AlertDialog.vue'
 import ModelMappingDialog, { type AliasGroup } from '../ModelMappingDialog.vue'
 import ModelTestDialog from './ModelTestDialog.vue'
+import { useModelTestKeys } from './useModelTestKeys'
 import { useToast } from '@/composables/useToast'
 import {
   type Model,
@@ -432,6 +443,12 @@ const testingModelName = ref<string | null>(null)
 const testingSourceModel = ref<Model | null>(null)
 const preselectedModelId = ref<string | null>(null)
 const selectedTestEndpoint = ref<ProviderEndpoint | null>(null)
+const testKeys = useModelTestKeys({
+  providerId: () => props.provider.id,
+  providerType: () => props.provider.provider_type,
+  endpoint: () => selectedTestEndpoint.value,
+  fallbackKeys: () => props.providerKeys ?? [],
+})
 const testRequestHeadersDraft = ref('')
 const testRequestHeadersResetValue = ref('')
 const testRequestBodyDraft = ref('')
@@ -716,6 +733,7 @@ async function onDialogSaved() {
 
 function handleTestDialogClose() {
   modelTest.resetState()
+  testKeys.select([])
   pendingMappingKey.value = null
   testingModelName.value = null
   testingSourceModel.value = null
@@ -729,9 +747,7 @@ function handleTestDialogClose() {
 }
 
 function handleTestDialogBack() {
-  if (modelTest.testing.value) return
-  modelTest.testResult.value = null
-  modelTest.stopPolling()
+  modelTest.backToSetup()
 }
 
 function handleSelectTestEndpoint(endpointId: string) {
@@ -766,7 +782,7 @@ function runMappingTest(
     return
   }
   pendingMappingKey.value = testingKey
-  modelTest.testResult.value = null
+  modelTest.backToSetup()
   modelTest.dialogOpen.value = true
   testingMapping.value = null
   testingModelName.value = modelName
@@ -779,6 +795,8 @@ function runMappingTest(
   testRequestHeadersResetValue.value = buildDefaultModelTestRequestHeaders()
   testRequestHeadersDraft.value = testRequestHeadersResetValue.value
   resetMappingTestRequestBody()
+  testKeys.select([])
+  void testKeys.load()
 }
 
 function resetMappingTestRequestBody() {
@@ -839,6 +857,11 @@ async function handleStartMappingTest() {
     apiFormat: endpoint.api_format,
     endpointId: endpoint.id,
     endpointBaseUrl: endpoint.base_url,
+    apiKeyIds: testKeys.selectedIds.value,
+    batchKeys: modelTest.batchMode.value
+      ? testKeys.keyOptions.value.filter(key => testKeys.selectedIds.value.includes(key.value))
+        .map(key => ({ id: key.value, name: key.label }))
+      : undefined,
     requestHeaders,
     requestBody,
   })

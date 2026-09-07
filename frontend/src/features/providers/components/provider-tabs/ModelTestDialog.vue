@@ -103,6 +103,25 @@
         v-if="showKeySelector"
         class="space-y-2"
       >
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="text-sm font-medium">测试模式</span>
+          <Button
+            size="sm"
+            :variant="batchMode ? 'outline' : 'default'"
+            :aria-pressed="!batchMode"
+            @click="emit('update:batchMode', false)"
+          >
+            常规测试
+          </Button>
+          <Button
+            size="sm"
+            :variant="batchMode ? 'default' : 'outline'"
+            :aria-pressed="batchMode"
+            @click="emit('update:batchMode', true)"
+          >
+            批量测试
+          </Button>
+        </div>
         <div class="flex items-center justify-between gap-3">
           <div class="text-sm font-medium text-foreground">
             测试 Key
@@ -124,6 +143,46 @@
           :disabled="keyOptionsLoading && keyOptions.length === 0"
           @update:model-value="emit('update:selectedKeyIds', $event)"
         />
+        <div
+          v-if="keyOptionsError"
+          role="alert"
+          class="flex items-center gap-2 text-xs text-destructive"
+        >
+          <span>{{ keyOptionsError }}</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            :disabled="keyOptionsLoading"
+            @click="emit('reloadKeys')"
+          >
+            重试加载 Key
+          </Button>
+        </div>
+        <div
+          v-if="batchMode"
+          class="space-y-2"
+        >
+          <div class="flex gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              :disabled="keyOptionsLoading || !!keyOptionsError || !keyOptions.length"
+              @click="emit('update:selectedKeyIds', keyOptions.map(key => key.value))"
+            >
+              全选 {{ keyOptions.length }} 个 Key
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              @click="emit('update:selectedKeyIds', [])"
+            >
+              清空选择
+            </Button>
+          </div>
+          <p class="text-xs text-muted-foreground">
+            将使用同一份请求逐个测试所选 Key，最多并发 3 个；成功不会提前停止，每个 Key 都会产生独立请求并可能计费。
+          </p>
+        </div>
       </div>
 
       <ModelTestRequestPresets
@@ -227,12 +286,19 @@
 
       <Button
         class="w-full"
-        :disabled="startDisabled"
+        :disabled="startDisabled || (batchMode && (keyOptionsLoading || !selectedKeyIds.length))"
         @click="emit('start')"
       >
-        开始测试
+        {{ batchMode ? `开始批量测试（${selectedKeyIds.length} 个 Key）` : '开始测试' }}
       </Button>
     </div>
+
+    <ModelTestBatchResults
+      v-else-if="batchResults.length"
+      :entries="batchResults"
+      :testing="testing === true"
+      @cancel="emit('cancelBatch')"
+    />
 
     <div
       v-else-if="testing"
@@ -503,7 +569,7 @@
             </div>
             <div
               v-else-if="attemptDetail(attempt) !== '-'"
-              class="mt-1 break-all text-muted-foreground"
+              class="mt-1 whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-muted-foreground"
             >
               {{ attemptDetail(attempt) }}
             </div>
@@ -604,7 +670,7 @@
                 </div>
                 <div
                   v-else
-                  class="line-clamp-2 break-all"
+                  class="whitespace-pre-wrap break-words [overflow-wrap:anywhere]"
                   :title="attemptDetail(attempt)"
                 >
                   {{ attemptDetail(attempt) }}
@@ -665,6 +731,7 @@
                 <div class="content-block rounded-md border overflow-hidden">
                   <div class="flex items-center justify-end gap-0.5 px-3 py-1 border-b bg-muted/40">
                     <button
+                      v-if="inspectionTab !== 'response-body'"
                       :title="inspectionExpandDepth === 0 ? '展开全部' : '收缩全部'"
                       class="p-1 rounded transition-colors text-muted-foreground hover:bg-muted"
                       @click="inspectionExpandDepth === 0 ? expandInspectionContent() : collapseInspectionContent()"
@@ -726,13 +793,7 @@
                   </TabsContent>
 
                   <TabsContent value="response-body">
-                    <JsonContent
-                      :data="selectedInspectionAttempt.response_body"
-                      view-mode="formatted"
-                      :expand-depth="inspectionExpandDepth"
-                      :is-dark="isDark"
-                      empty-message="无响应体数据"
-                    />
+                    <ModelTestResponseBody :body="selectedInspectionAttempt.response_body" />
                   </TabsContent>
                 </div>
               </Tabs>
@@ -750,7 +811,7 @@
         {{ showSetup ? '取消' : '关闭' }}
       </Button>
       <Button
-        v-if="showResult"
+        v-if="showResult && !testing"
         variant="outline"
         @click="emit('back')"
       >
@@ -825,6 +886,10 @@ import {
 } from './model-test-request'
 import type { ModelTestImagePreview } from './model-test-request'
 import ModelTestRequestPresets from './ModelTestRequestPresets.vue'
+import ModelTestBatchResults from './ModelTestBatchResults.vue'
+import ModelTestResponseBody from './ModelTestResponseBody.vue'
+import { extractModelTestResponseText } from './model-test-response'
+import type { ModelTestBatchEntry } from '@/composables/useModelTest'
 
 type TestEndpointOption = {
   id: string
@@ -864,13 +929,19 @@ const props = defineProps<{
   keyOptions?: TestKeyOption[]
   selectedKeyIds?: string[]
   keyOptionsLoading?: boolean
+  keyOptionsError?: string
   startDisabled?: boolean
+  batchMode?: boolean
+  batchResults?: ModelTestBatchEntry[]
 }>()
 
 const emit = defineEmits<{
   close: []
   back: []
   start: []
+  cancelBatch: []
+  reloadKeys: []
+  'update:batchMode': [value: boolean]
   selectEndpoint: [endpointId: string]
   selectModelMapping: [modelName: string]
   'update:selectedKeyIds': [value: string[]]
@@ -883,19 +954,22 @@ const modelMappingOptions = computed(() => props.modelMappingOptions ?? [])
 const keyOptions = computed(() => props.keyOptions ?? [])
 const selectedKeyIds = computed(() => props.selectedKeyIds ?? [])
 const keyOptionsLoading = computed(() => props.keyOptionsLoading === true)
+const batchMode = computed(() => props.batchMode === true)
+const batchResults = computed(() => props.batchResults ?? [])
 const modelMappingAvailable = computed(
   () => props.modelMappingAvailable === true && modelMappingOptions.value.length > 0,
 )
 const showKeySelector = computed(() => (
-  keyOptionsLoading.value || keyOptions.value.length > 0 || selectedKeyIds.value.length > 0
+  batchMode.value || props.keyOptionsError || keyOptionsLoading.value || keyOptions.value.length > 0 || selectedKeyIds.value.length > 0
 ))
 const keySelectorPlaceholder = computed(() => (
-  keyOptionsLoading.value && keyOptions.value.length === 0 ? '正在加载 Key' : '默认调度（不指定 Key）'
+  keyOptionsLoading.value && keyOptions.value.length === 0 ? '正在加载 Key'
+    : batchMode.value ? '请选择需要测试的 Key' : '默认调度（不指定 Key）'
 ))
 const keySelectionStatus = computed(() => {
   if (selectedKeyIds.value.length > 0) return `已选 ${selectedKeyIds.value.length}`
   if (keyOptionsLoading.value) return '加载中'
-  return '默认'
+  return batchMode.value ? '未选择' : '默认'
 })
 const requestedModelName = computed(() => props.requestedModelName?.trim() || '')
 const selectedModelMapping = computed(() => props.selectedModelMapping?.trim() || '')
@@ -905,8 +979,8 @@ const selectedModelMappingValue = computed(() => (
 const requestHeadersDraft = computed(() => props.requestHeadersDraft ?? '')
 const requestBodyDraft = computed(() => props.requestBodyDraft ?? '')
 const traceCandidates = computed(() => props.trace?.candidates ?? [])
-const showSetup = computed(() => props.open && !props.testing && !props.result)
-const showResult = computed(() => !!props.result)
+const showSetup = computed(() => props.open && !props.testing && !props.result && !batchResults.value.length)
+const showResult = computed(() => !!props.result || batchResults.value.length > 0)
 const resultSummary = computed(() => deriveSummaryFromAttempts(props.result))
 const showCandidateDiagnostics = computed(() => resultSummary.value.total_candidates > 1)
 const showAttemptDiagnostics = computed(() => (
@@ -923,6 +997,7 @@ function handleModelMappingValueChange(value: string) {
 }
 
 const dialogTitle = computed(() => {
+  if (batchResults.value.length) return '模型批量测试'
   if (props.result) return '模型测试结果'
   return '模型测试'
 })
@@ -958,7 +1033,7 @@ const resultEmptyMessage = computed(() => {
   return '没有可用的候选进行测试'
 })
 const showAllAttempts = ref(false)
-const inspectionTab = ref<'request-headers' | 'request-body' | 'response-headers' | 'response-body'>('request-body')
+const inspectionTab = ref<'request-headers' | 'request-body' | 'response-headers' | 'response-body'>('response-body')
 const selectedInspectionKey = ref<string | null>(null)
 const inspectionExpandDepth = ref(0)
 const inspectionCopiedStates = ref<Record<string, boolean>>({})
@@ -974,9 +1049,7 @@ watch(() => props.result, () => {
     ?? resultAttempts.value[0]
     ?? null
   selectedInspectionKey.value = defaultAttempt ? inspectionKey(defaultAttempt) : null
-  inspectionTab.value = defaultAttempt && attemptImagePreviews(defaultAttempt).length > 0
-    ? 'response-body'
-    : 'request-body'
+  inspectionTab.value = 'response-body'
 })
 
 const shouldCollapseAttempts = computed(() => resultAttempts.value.length > 20)
@@ -1449,7 +1522,8 @@ function attemptDetail(attempt: TestAttemptDetail): string {
   if (attempt.skip_reason) return formatModelTestDiagnostic(attempt.skip_reason)
   if (attempt.error_message) return formatModelTestDiagnostic(attempt.error_message)
   if (attempt.status === 'success') {
-    return extractModelTestResponsePreview(attempt.response_body)
+    return extractModelTestResponseText(attempt.response_body)
+      ?? extractModelTestResponsePreview(attempt.response_body)
       ?? (attempt.effective_model ? `请求模型：${attempt.effective_model}` : attempt.endpoint_base_url)
   }
   return '-'
@@ -1469,7 +1543,7 @@ function inspectionKey(attempt: TestAttemptDetail): string {
 
 function selectInspectionAttempt(attempt: TestAttemptDetail) {
   selectedInspectionKey.value = inspectionKey(attempt)
-  inspectionTab.value = attemptImagePreviews(attempt).length > 0 ? 'response-body' : 'request-body'
+  inspectionTab.value = 'response-body'
 }
 
 function hasDebugData(attempt: TestAttemptDetail): boolean {

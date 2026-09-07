@@ -1,4 +1,4 @@
-import { ref, onBeforeUnmount } from 'vue'
+import { ref, watch, onBeforeUnmount } from 'vue'
 import { isAxiosError } from 'axios'
 import { useToast } from './useToast'
 import {
@@ -25,12 +25,28 @@ export interface StartTestParams {
   mappedModelName?: string
   requestHeaders?: Record<string, unknown>
   requestBody?: Record<string, unknown>
+  /** Each selected key gets one independent direct test, never a failover list. */
+  batchKeys?: Array<{ id: string; name: string }>
   onSuccess?: (result: TestModelFailoverResponse) => void
   /** Return `true` to indicate the failure has been handled; otherwise the composable sets `testResult`. */
   onFailure?: (result: TestModelFailoverResponse) => boolean | void
   /** Return `true` to indicate the error has been handled; otherwise a toast is shown and state is reset. */
   onError?: (err: unknown) => boolean | void
 }
+
+export interface ModelTestBatchEntry {
+  keyId: string
+  keyName: string
+  requestId: string
+  status: 'pending' | 'running' | 'success' | 'failed' | 'skipped' | 'cancelled'
+  result: TestModelFailoverResponse | null
+  error: string | null
+  errorResponse: unknown
+  elapsedMs: number | null
+  statusCode: number | null
+}
+
+const MODEL_TEST_BATCH_CONCURRENCY = 3
 
 export interface UseModelTestOptions {
   providerId: () => string
@@ -48,6 +64,8 @@ export function useModelTest(options: UseModelTestOptions) {
   const testTrace = ref<RequestTrace | null>(null)
   const requestId = ref<string | null>(null)
   const dialogOpen = ref(false)
+  const batchMode = ref(false)
+  const batchResults = ref<ModelTestBatchEntry[]>([])
 
   let tracePollTimer: ReturnType<typeof setInterval> | null = null
   let tracePollToken = 0
@@ -72,6 +90,7 @@ export function useModelTest(options: UseModelTestOptions) {
   function normalizeDirectTestResult(
     params: StartTestParams,
     result: TestModelResponse,
+    selectedProviderId: string,
   ): TestModelFailoverResponse {
     const responsePayload = result.data?.response
     const failureMessage = typeof result.error === 'string' && result.error.trim()
@@ -136,7 +155,7 @@ export function useModelTest(options: UseModelTestOptions) {
     return {
       success: result.success,
       model: result.model || params.modelName,
-      provider: result.provider || { id: providerId(), name: providerId() },
+      provider: result.provider || { id: selectedProviderId, name: selectedProviderId },
       attempts,
       total_candidates: totalCandidates,
       total_attempts: totalAttempts,
@@ -150,12 +169,13 @@ export function useModelTest(options: UseModelTestOptions) {
     params: StartTestParams,
     reqId: string,
     signal?: AbortSignal,
+    selectedProviderId = providerId(),
   ): Promise<TestModelFailoverResponse> {
     const message = normalizedMessage(params.message)
     const apiKeyIds = normalizedApiKeyIds(params.apiKeyIds)
 
     return normalizeDirectTestResult(params, await testModel({
-      provider_id: providerId(),
+      provider_id: selectedProviderId,
       model_name: params.modelName,
       mode: params.mode,
       api_format: params.apiFormat,
@@ -169,7 +189,7 @@ export function useModelTest(options: UseModelTestOptions) {
       request_id: reqId,
     }, {
       signal,
-    }))
+    }), selectedProviderId)
   }
 
   function normalizedMessage(message?: string): string | undefined {
@@ -243,12 +263,106 @@ export function useModelTest(options: UseModelTestOptions) {
   function resetState() {
     abortActiveRequest()
     stopPolling()
+    testing.value = false
     dialogOpen.value = false
     testResult.value = null
+    batchResults.value = []
+  }
+
+  function backToSetup() {
+    if (testing.value) return
+    stopPolling()
+    testResult.value = null
+    batchResults.value = []
+  }
+
+  function cancelBatch() {
+    if (!batchResults.value.length || !testing.value) return
+    abortActiveRequest()
+    for (const entry of batchResults.value) {
+      if (entry.status === 'pending' || entry.status === 'running') entry.status = 'cancelled'
+    }
+    testing.value = false
+  }
+
+  async function startBatchTest(params: StartTestParams) {
+    const seen = new Set<string>()
+    const keys = (params.batchKeys ?? []).filter(key => {
+      if (!key.id.trim() || seen.has(key.id.trim())) return false
+      seen.add(key.id.trim())
+      return true
+    })
+    if (!keys.length || !params.endpointId) {
+      showError('批量测试需要选择端点和至少一个 Key')
+      return
+    }
+    // Freeze the provider, selected keys and draft for the whole batch.
+    const selectedProviderId = providerId()
+    const snapshot: StartTestParams = {
+      ...params,
+      mode: 'direct',
+      requestHeaders: params.requestHeaders ? JSON.parse(JSON.stringify(params.requestHeaders)) : undefined,
+      requestBody: params.requestBody ? JSON.parse(JSON.stringify(params.requestBody)) : undefined,
+    }
+    const controller = new AbortController()
+    activeAbortController = controller
+    stopPolling()
+    testResult.value = null
+    testing.value = true
+    dialogOpen.value = true
+    testMode.value = 'direct'
+    batchResults.value = keys.map(key => ({
+      keyId: key.id.trim(), keyName: key.name, requestId: buildTestRequestId(),
+      status: 'pending', result: null, error: null, errorResponse: null, elapsedMs: null, statusCode: null,
+    }))
+    const entries = batchResults.value
+    let nextIndex = 0
+    const isActive = () => activeAbortController === controller && !controller.signal.aborted
+    async function worker() {
+      while (isActive() && nextIndex < entries.length) {
+        const entry = entries[nextIndex++]
+        entry.status = 'running'
+        const started = Date.now()
+        try {
+          const result = await runDirectTest(
+            { ...snapshot, apiKeyIds: [entry.keyId] }, entry.requestId, controller.signal, selectedProviderId,
+          )
+          if (!isActive()) return
+          entry.result = result
+          entry.status = result.success ? 'success'
+            : result.attempts.length > 0 && result.attempts.every(attempt => attempt.status === 'skipped')
+              ? 'skipped' : 'failed'
+          entry.error = result.error ?? null
+          entry.statusCode = result.attempts[result.attempts.length - 1]?.status_code ?? null
+        } catch (error) {
+          if (!isActive()) return
+          entry.status = 'failed'
+          entry.error = parseApiError(error, '测试请求失败')
+          entry.errorResponse = isAxiosError(error) ? error.response?.data ?? null : null
+          entry.statusCode = isAxiosError(error) ? error.response?.status ?? null : null
+        } finally {
+          if (isActive()) entry.elapsedMs = Date.now() - started
+        }
+      }
+    }
+    try {
+      await Promise.all(Array.from({ length: Math.min(MODEL_TEST_BATCH_CONCURRENCY, entries.length) }, worker))
+    } finally {
+      if (activeAbortController === controller) {
+        activeAbortController = null
+        testing.value = false
+      }
+    }
   }
 
   async function startTest(params: StartTestParams) {
     abortActiveRequest()
+    testing.value = false
+    if (params.batchKeys !== undefined) {
+      await startBatchTest(params)
+      return
+    }
+    batchResults.value = []
     testing.value = true
     testMode.value = params.mode
     dialogOpen.value = true
@@ -283,6 +397,7 @@ export function useModelTest(options: UseModelTestOptions) {
           signal: abortController.signal,
         })
 
+      if (activeAbortController !== abortController) return
       if (
         params.mode === 'global'
         && !result.success
@@ -291,14 +406,18 @@ export function useModelTest(options: UseModelTestOptions) {
         result = await runDirectTest(params, reqId, abortController.signal)
       }
 
+      if (activeAbortController !== abortController) return
+
       const keepTraceContext = resultHasTraceContext(result)
       if (result.success) {
         if (keepTraceContext) {
           await refreshTraceSnapshot(reqId)
+          if (activeAbortController !== abortController) return
           stopPolling({ clearState: false })
         } else {
           stopPolling()
         }
+        if (activeAbortController !== abortController) return
         testResult.value = result
         const successAttempt = result.attempts.find(a => a.status === 'success')
         const latency = successAttempt?.latency_ms != null ? ` (${successAttempt.latency_ms}ms)` : ''
@@ -312,15 +431,18 @@ export function useModelTest(options: UseModelTestOptions) {
 
       if (keepTraceContext) {
         await refreshTraceSnapshot(reqId)
+        if (activeAbortController !== abortController) return
         stopPolling({ clearState: false })
       } else {
         stopPolling()
       }
+      if (activeAbortController !== abortController) return
       const handled = params.onFailure?.(result)
       if (!handled) {
         testResult.value = result
       }
     } catch (err: unknown) {
+      if (activeAbortController !== abortController) return
       if (isRequestCancelled(err)) {
         return
       }
@@ -333,14 +455,15 @@ export function useModelTest(options: UseModelTestOptions) {
     } finally {
       if (activeAbortController === abortController) {
         activeAbortController = null
+        testing.value = false
       }
-      testing.value = false
     }
   }
 
   onBeforeUnmount(() => {
     resetState()
   })
+  watch(providerId, () => resetState())
 
   return {
     testing,
@@ -349,6 +472,10 @@ export function useModelTest(options: UseModelTestOptions) {
     testTrace,
     requestId,
     dialogOpen,
+    batchMode,
+    batchResults,
+    cancelBatch,
+    backToSetup,
     startTest,
     resetState,
     stopPolling,
