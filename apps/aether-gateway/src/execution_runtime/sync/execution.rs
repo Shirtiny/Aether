@@ -49,6 +49,7 @@ use crate::execution_runtime::kiro_cache::{
     KIRO_SIMULATED_CACHE_ENABLED_CONTEXT_FIELD,
 };
 use crate::execution_runtime::oauth_retry::refresh_oauth_plan_auth_for_retry;
+use crate::execution_runtime::overload_retry::OverloadRetry;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::post_sync_plan_to_remote_execution_runtime;
 use crate::execution_runtime::session_risk_control::should_return_and_record_session_risk_control_block_response;
@@ -1850,6 +1851,7 @@ async fn execute_execution_runtime_sync_impl(
         }
     };
     let mut oauth_retry_attempted = false;
+    let mut overload_retry = OverloadRetry::default();
     let (
         result_error_type,
         result_error_message,
@@ -1951,6 +1953,28 @@ async fn execute_execution_runtime_sync_impl(
                     );
                 }
             }
+        }
+
+        if overload_retry.wait(
+            &plan.request_id,
+            result.status_code,
+            local_failover_response_text.as_deref(),
+            &headers,
+        ).await {
+            match crate::execution_runtime::execute_execution_runtime_sync_plan_with_report_context(
+                state, Some(trace_id), &plan, report_context.as_ref(),
+            ).await {
+                Ok(retry_result) => {
+                    result = retry_result;
+                    continue;
+                }
+                Err(err) => {
+                    warn!(event_name = "local_sync_overload_retry_execution_failed", trace_id, error = ?err, "same-plan capacity retry transport failed");
+                }
+            }
+        }
+        if (200..300).contains(&result.status_code) {
+            overload_retry.recovered(&plan.request_id);
         }
 
         let local_failover_analysis = analyze_local_candidate_failover_sync(

@@ -453,7 +453,7 @@ async fn gateway_retries_next_candidate_when_prefetch_detects_embedded_stream_er
                 let frames = if current_hit == 1 {
                     concat!(
                         "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
-                        "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"error\\\":{\\\"message\\\":\\\"Our servers are currently overloaded. Please try again later.\\\",\\\"type\\\":\\\"service_unavailable_error\\\",\\\"code\\\":\\\"503\\\"}}\\n\\n\"}}\n",
+                        "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"error\\\":{\\\"message\\\":\\\"Upstream temporarily unavailable\\\",\\\"type\\\":\\\"service_unavailable_error\\\",\\\"code\\\":\\\"503\\\"}}\\n\\n\"}}\n",
                     )
                 } else {
                     concat!(

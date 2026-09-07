@@ -132,7 +132,7 @@ fn should_failover_local_upstream_status(status_code: u16) -> bool {
     status_code >= 400
 }
 
-fn is_session_preserving_overload(input: LocalFailoverInput<'_>) -> bool {
+pub(crate) fn is_session_preserving_overload(input: LocalFailoverInput<'_>) -> bool {
     if input.status_code != 503 {
         return false;
     }

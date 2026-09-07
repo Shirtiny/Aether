@@ -111,6 +111,11 @@ jobs:
       - name: Test gateway local probes
         run: cargo test --locked -p aether-gateway --lib openai_local_probe
 
+      - name: Test bounded overload retries and stream prefetch
+        run: |
+          cargo test --locked -p aether-gateway --lib overload_retry -- --test-threads=1
+          cargo test --locked -p aether-gateway --lib prefetch -- --test-threads=1
+
       - name: Test Grok report context
         run: cargo test --locked -p aether-gateway --lib grok_report_context
 

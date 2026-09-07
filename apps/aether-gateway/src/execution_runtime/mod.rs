@@ -10,6 +10,7 @@ mod kiro_cache;
 mod kiro_web_search;
 pub(crate) mod ndjson;
 mod oauth_retry;
+mod overload_retry;
 #[cfg(test)]
 pub(crate) mod remote_compat;
 mod response_header_rules;

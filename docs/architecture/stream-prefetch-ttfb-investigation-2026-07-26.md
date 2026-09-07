@@ -1,5 +1,11 @@
 # Stream Prefetch TTFB Investigation (2026-07-26)
 
+> September follow-up: [same-plan overload retry](overload-retry-2026-09-07.md)
+> adds a bounded, content-aware opening gate behind this short HTTP prefetch.
+> It can retry a capacity rejection after headers have been released while no
+> substantive event has escaped, without extending the prefetch timer or buffering
+> the whole response. The findings below describe the July implementation.
+
 ## Summary
 
 Aether holds a streaming response after it has already received the first

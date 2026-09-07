@@ -953,6 +953,41 @@ async fn execute_in_process_stream_with_oauth_retry(
     Ok(execution)
 }
 
+fn build_retrying_direct_frame_stream(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    trace_id: &str,
+    report_context: Option<&Value>,
+    execution: DirectUpstreamStreamExecution,
+) -> BoxStream<'static, Result<Bytes, IoError>> {
+    let state = state.clone();
+    let plan = plan.clone();
+    let request_id = plan.request_id.clone();
+    let trace_id = trace_id.to_owned();
+    let report_context = report_context.cloned();
+    super::overload_retry::retry_opening_stream(
+        build_direct_execution_frame_stream(execution).boxed(),
+        move || {
+            let state = state.clone();
+            let mut plan = plan.clone();
+            let trace_id = trace_id.clone();
+            let report_context = report_context.clone();
+            async move {
+                execute_in_process_stream_with_oauth_retry(
+                    &state,
+                    &mut plan,
+                    &trace_id,
+                    report_context.as_ref(),
+                )
+                .await
+                .map(|execution| build_direct_execution_frame_stream(execution).boxed())
+                .map_err(|err| IoError::other(err.to_string()))
+            }
+        },
+        request_id,
+    )
+}
+
 #[allow(clippy::too_many_arguments)] // internal function, grouping would add unnecessary indirection
 pub(crate) async fn execute_execution_runtime_stream(
     state: &AppState,
@@ -1212,7 +1247,13 @@ pub(crate) async fn execute_execution_runtime_stream(
                 return Ok(None);
             }
         };
-        let frame_stream = build_direct_execution_frame_stream(execution).boxed();
+        let frame_stream = build_retrying_direct_frame_stream(
+            state,
+            &plan,
+            trace_id,
+            report_context.as_ref(),
+            execution,
+        );
         return execute_stream_from_frame_stream(
             state,
             plan,
@@ -1277,7 +1318,13 @@ pub(crate) async fn execute_execution_runtime_stream(
                     return Ok(None);
                 }
             };
-            let frame_stream = build_direct_execution_frame_stream(execution).boxed();
+            let frame_stream = build_retrying_direct_frame_stream(
+                state,
+                &plan,
+                trace_id,
+                report_context.as_ref(),
+                execution,
+            );
             return execute_stream_from_frame_stream(
                 state,
                 plan,
@@ -2097,6 +2144,7 @@ fn sse_data_payload_is_terminal(data: &str) -> bool {
                 .get("type")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(is_terminal_sse_event_type)
+                || crate::execution_runtime::submission::has_nested_error(&value)
         })
 }
 
@@ -2910,9 +2958,10 @@ async fn execute_stream_from_frame_stream(
                 prefetch_release_reason = "frame_limit";
                 break;
             }
-            let extend_control_prefetch = control_prefetch_extension_allowed
-                && (prefetched_chunks.len() >= MAX_STREAM_PREFETCH_FRAMES
-                    || prefetched_inspection_body.len() >= MAX_STREAM_PREFETCH_BYTES);
+            // Bound the hold from the first control frame, not only after five
+            // frames. The opening retry gate keeps protecting late pre-content
+            // errors after this HTTP prefetch window has expired.
+            let extend_control_prefetch = control_prefetch_extension_allowed;
             if extend_control_prefetch && !logged_control_prefetch_extension {
                 logged_control_prefetch_extension = true;
                 debug!(
@@ -2937,7 +2986,7 @@ async fn execute_stream_from_frame_stream(
             }
             let prefetch_budget = if extend_control_prefetch {
                 let Some(remaining) = CONTROL_STREAM_PREFETCH_EXTENSION_TIMEOUT
-                    .checked_sub(prefetch_started_at.elapsed())
+                    .checked_sub(first_data_frame_at.unwrap_or(prefetch_started_at).elapsed())
                 else {
                     prefetch_release_reason = "control_extension_expired";
                     debug!(
@@ -3911,7 +3960,12 @@ async fn execute_stream_from_frame_stream(
                     _ = tx.closed(), if !downstream_dropped => {
                         downstream_dropped = true;
                         downstream_dropped_at = Some(Instant::now());
-                        if client_visible_stream_completed {
+                        // An uncommitted opening has nothing to drain for the
+                        // client. Drop its source now so an abandoned request
+                        // cannot dispatch a hidden capacity retry during grace.
+                        if client_visible_stream_completed
+                            || client_stream_bytes.load(Ordering::Relaxed) == 0
+                        {
                             break;
                         }
                         warn!(
@@ -4531,7 +4585,11 @@ async fn execute_stream_from_frame_stream(
                         report_context_owned.as_ref(),
                         failure,
                     ))
-                } else if emit_passthrough_sse_terminal_error {
+                } else if emit_passthrough_sse_terminal_error && !client_visible_stream_completed {
+                    // A terminal response.failed may already have been forwarded
+                    // (including after the opening retry budget was exhausted).
+                    // Keep recording the failure, but never send a second final
+                    // event for the same response.
                     Some(encode_terminal_sse_error_event(&plan_for_report, failure))
                 } else {
                     None
@@ -5140,6 +5198,8 @@ mod tests {
         AppState::new().expect("gateway state should build")
     }
 
+    include!("execution_overload_retry_tests.rs");
+
     fn test_stream_state() -> (
         AppState,
         Arc<InMemoryUsageReadRepository>,
@@ -5363,7 +5423,7 @@ mod tests {
         let body_json = json!({
             "error": {
                 "type": "service_unavailable_error",
-                "message": "Our servers are currently overloaded. Please try again later.",
+                "message": "Upstream temporarily unavailable",
                 "code": "503"
             }
         });
@@ -5382,7 +5442,7 @@ mod tests {
             "openai_responses_sync_finalize",
             BTreeMap::from([("content-type".to_string(), "text/event-stream".to_string())]),
             None,
-            br#"data: {"error":{"type":"service_unavailable_error","message":"Our servers are currently overloaded. Please try again later.","code":"503"}}"#,
+            br#"data: {"error":{"type":"service_unavailable_error","message":"Upstream temporarily unavailable","code":"503"}}"#,
             resolve_local_sync_error_status_code(200, &body_json),
             body_json,
         )
@@ -5489,7 +5549,7 @@ mod tests {
                     chunk_b64: None,
                     text: Some(concat!(
                         "event: response.failed\n",
-                        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"503\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n"
+                        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"503\",\"message\":\"Upstream temporarily unavailable\"}}}\n\n"
                     ).to_string()),
                 },
             }));
@@ -5599,7 +5659,7 @@ mod tests {
                     chunk_b64: None,
                     text: Some(concat!(
                         "event: response.failed\n",
-                        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"503\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n"
+                        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"503\",\"message\":\"Upstream temporarily unavailable\"}}}\n\n"
                     ).to_string()),
                 },
             }));
@@ -5709,7 +5769,7 @@ mod tests {
                     chunk_b64: None,
                     text: Some(concat!(
                         "event: response.failed\n",
-                        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"503\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n"
+                        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"503\",\"message\":\"Upstream temporarily unavailable\"}}}\n\n"
                     ).to_string()),
                 },
             }));
@@ -5803,7 +5863,7 @@ mod tests {
             &[],
             build_stream_failure_report(
                 "service_unavailable_error",
-                "Our servers are currently overloaded. Please try again later.",
+                "Upstream temporarily unavailable",
                 503,
             ),
         )
@@ -7446,7 +7506,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
             "cand-client-progress-timeout",
         );
         plan.timeouts = Some(ExecutionTimeouts {
-            read_ms: Some(40),
+            stream_idle_ms: Some(40),
             ..ExecutionTimeouts::default()
         });
         let frame_stream = stream! {
@@ -7517,7 +7577,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"type":"s
         .expect("control-only stream response should terminate")
         .expect("control-only stream response body should read");
         let body = String::from_utf8_lossy(body.as_ref());
-        assert!(body.contains("stream_progress_timeout"));
+        assert!(body.contains("stream_progress_timeout"), "{body}");
         assert!(!body.contains(": upstream-keepalive"));
 
         let candidates = tokio::time::timeout(Duration::from_secs(1), async {
