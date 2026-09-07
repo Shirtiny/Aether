@@ -17,6 +17,7 @@ use crate::ai_serving::{
     OPENAI_CHAT_SYNC_FINALIZE_REPORT_KIND, OPENAI_IMAGE_SYNC_FINALIZE_REPORT_KIND,
 };
 use crate::clock::current_unix_ms;
+use crate::codex_runtime_identity::CodexRuntimeIdentitySurface;
 use crate::execution_runtime;
 use crate::handlers::admin::provider::write::provider::reconcile_admin_fixed_provider_template_endpoints;
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
@@ -2198,6 +2199,18 @@ async fn provider_query_execute_openai_image_test_candidate(
             &transport,
             "openai:image",
         );
+        // Match the live image path: rewrite supplied identity headers, but
+        // do not synthesize a Responses body identity for image requests.
+        crate::ai_serving::apply_codex_pool_runtime_identity(
+            state.runtime_state(),
+            &transport,
+            &mut request_headers,
+            None,
+            &parts.headers,
+            Some(&request_body),
+            CodexRuntimeIdentitySurface::Headers,
+        )
+        .await;
     }
     crate::provider_transport::ensure_upstream_auth_header(
         &mut request_headers,
@@ -3045,7 +3058,10 @@ async fn provider_query_execute_standard_test_candidate(
             response_body: None,
         });
     }
-    if crate::ai_serving::is_openai_responses_format(provider_api_format) {
+    if matches!(
+        normalized_provider_api_format.as_str(),
+        "openai:responses" | "openai:responses:compact"
+    ) {
         crate::ai_serving::apply_codex_openai_responses_special_headers(
             &mut request_headers,
             &provider_request_body,
@@ -3061,6 +3077,24 @@ async fn provider_query_execute_standard_test_candidate(
             &transport,
             provider_api_format,
         );
+        // Match live traffic: identity runs after endpoint rules, special
+        // headers and the selected account's stable client profile. Inspect
+        // the original test draft, not Aether's cache-key/header fillers.
+        let identity_surface = if normalized_provider_api_format == "openai:responses:compact" {
+            CodexRuntimeIdentitySurface::HttpCompact
+        } else {
+            CodexRuntimeIdentitySurface::HttpResponses
+        };
+        crate::ai_serving::apply_codex_pool_runtime_identity(
+            state.runtime_state(),
+            &transport,
+            &mut request_headers,
+            Some(&mut provider_request_body),
+            &parts.headers,
+            Some(&original_request_body),
+            identity_surface,
+        )
+        .await;
     }
     // A model test has to carry the same identity as real traffic, on both the
     // chat and responses formats, or it reports a failure the live path would

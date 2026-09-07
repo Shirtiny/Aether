@@ -29,6 +29,8 @@ use crate::constants::{
 };
 use crate::data::GatewayDataState;
 
+mod codex;
+
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for &byte in data {
