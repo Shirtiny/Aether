@@ -32,6 +32,340 @@ fn overload_retry_success_sse() -> String {
 }
 
 #[tokio::test]
+async fn overload_retry_mislabeled_content_length_sse_releases_before_eof_and_keeps_json_fallback()
+{
+    for json_reply in [false, true] {
+        let listener = crate::test_support::bind_loopback_listener().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let release = Arc::new(Notify::new());
+        let peer_release = release.clone();
+        let app = Router::new().route(
+            "/responses",
+            any(move || {
+                let release = peer_release.clone();
+                async move {
+                    if json_reply {
+                        let mut response = overload_retry_success_response();
+                        response["output"][0]["content"][0]["text"] = json!("hello".repeat(15000));
+                        return axum::http::Response::builder()
+                            .header("content-type", "application/json")
+                            .body(Body::from(response.to_string()))
+                            .unwrap();
+                    }
+                    let prefix =
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
+                    // A native terminal record can exceed the lightweight wire
+                    // detector's 1 MiB line bound; the full existing observer must
+                    // still prevent a false missing-terminal failure.
+                    let mut completed = overload_retry_success_response();
+                    completed["output"][0]["content"][0]["text"] = json!("hello".repeat(300000));
+                    let suffix = format!(
+                        "event: response.completed\ndata: {}\n\n",
+                        json!({"type":"response.completed","response":completed})
+                    );
+                    axum::http::Response::builder()
+                        .header("content-type", "application/json")
+                        .header("content-length", prefix.len() + suffix.len())
+                        .body(Body::from_stream(stream! {
+                            yield Ok::<Bytes,Infallible>(Bytes::from_static(prefix.as_bytes()));
+                            release.notified().await;
+                            yield Ok(Bytes::from(suffix));
+                        }))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (state, _, _) = test_stream_state();
+        let mut plan =
+            test_responses_stream_plan("req-wire-first-content", "cand-wire-first-content");
+        plan.url = format!("http://{addr}/responses");
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            execute_execution_runtime_stream(
+                &state,
+                plan,
+                "trace-wire-first-content",
+                &test_decision(),
+                "openai_responses_stream",
+                None,
+                Some(test_prefetch_report_context(
+                    "req-wire-first-content",
+                    "cand-wire-first-content",
+                )),
+            ),
+        )
+        .await
+        .expect("do not buffer mislabeled SSE until EOF")
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_secs(1), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("hello"));
+        release.notify_one();
+        let mut text = first.to_vec();
+        while let Some(part) = body.next().await {
+            text.extend(part.unwrap());
+        }
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("response.completed"));
+        assert!(!text.contains("response.failed"));
+        if json_reply {
+            assert!(text.contains(&"hello".repeat(15000)));
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn overload_retry_missing_media_type_recovery_and_native_exhaustion() {
+    for (media, bare_json, persistent) in [
+        (None, false, false),
+        (Some("text/plain"), false, false),
+        (None, true, false),
+        (Some("application/json"), true, false),
+        (None, true, true),
+    ] {
+        let listener = crate::test_support::bind_loopback_listener().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let release = Arc::new(Notify::new());
+        let server_release = release.clone();
+        let app = Router::new().route("/responses", any(move || {
+            let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let release = server_release.clone();
+            async move {
+                let body = if n == 0 {
+                    Body::from_stream(stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"hidden\",\"output\":[]}}\n\n"));
+                        release.notified().await;
+                        let error = if bare_json {
+                            r#"{"error":{"code":503,"message":"Our servers are currently overloaded. Please try again later."}}"#
+                        } else {
+                            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":503,\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n"
+                        };
+                        yield Ok(Bytes::from_static(error.as_bytes()));
+                    })
+                } else if persistent {
+                    Body::from(r#"{"error":{"code":503,"message":"Our servers are currently overloaded. Please try again later."}}"#)
+                } else { Body::from(overload_retry_success_sse()) };
+                let mut response = axum::http::Response::builder();
+                if let Some(media) = media { response = response.header("content-type", media); }
+                response.body(body).unwrap()
+            }
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (state, usage, candidates) = test_stream_state();
+        let mut plan = test_responses_stream_plan("req-wire-type", "cand-wire-type");
+        plan.url = format!("http://{addr}/responses");
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            execute_execution_runtime_stream(
+                &state,
+                plan,
+                "trace-wire-type",
+                &test_decision(),
+                "openai_responses_stream",
+                None,
+                Some(test_prefetch_report_context(
+                    "req-wire-type",
+                    "cand-wire-type",
+                )),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert_ne!(
+            response
+                .headers()
+                .get("x-aether-prefetch-release")
+                .and_then(|v| v.to_str().ok()),
+            Some("skipped")
+        );
+        release.notify_one();
+        let body = tokio::time::timeout(
+            Duration::from_secs(5),
+            to_bytes(response.into_body(), 1_000_000),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("hidden"), "{body}");
+        if persistent {
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+            assert_eq!(body.matches("event: response.failed").count(), 1, "{body}");
+            assert_eq!(
+                body.matches("Our servers are currently overloaded").count(),
+                1,
+                "{body}"
+            );
+            assert!(!body.contains("response.completed"));
+        } else {
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert!(
+                body.contains("hello"),
+                "{media:?} {bare_json} {persistent}: {body}"
+            );
+            assert!(!body.contains("overloaded"));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(record) = usage
+                    .find_by_request_id("req-wire-type")
+                    .await
+                    .unwrap()
+                    .filter(|u| matches!(u.status.as_str(), "completed" | "failed"))
+                {
+                    assert_eq!(
+                        record.status,
+                        if persistent { "failed" } else { "completed" }
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            candidates
+                .list_by_request_id("req-wire-type")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn overload_retry_missing_terminal_emits_native_failure_without_fabricating_success() {
+    for client in ["openai:responses", "openai:chat", "claude:messages"] {
+        for content in [false, true] {
+            let request_id = format!("req-wire-eof-{}-{content}", client.replace(':', "-"));
+            let candidate_id = format!("cand-wire-eof-{}-{content}", client.replace(':', "-"));
+            let plan_kind = match client {
+                "openai:chat" => "openai_chat_stream",
+                "claude:messages" => "claude_cli_stream",
+                _ => "openai_responses_stream",
+            };
+
+            let listener = crate::test_support::bind_loopback_listener().await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let release = Arc::new(Notify::new());
+            let peer_release = release.clone();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let peer_calls = calls.clone();
+            let app = Router::new().route("/responses", any(move || {
+                peer_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let release = peer_release.clone();
+                async move {
+                    axum::http::Response::builder().body(Body::from_stream(stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"opening\",\"output\":[]}}\n\n"));
+                        if content { yield Ok(Bytes::from_static(b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n")); }
+                        release.notified().await;
+                        // Normal TCP EOF, but the Responses protocol never finished.
+                    })).unwrap()
+                }
+            }));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let (state, usage, _) = test_stream_state();
+            let mut plan = test_responses_stream_plan(&request_id, &candidate_id);
+            plan.url = format!("http://{addr}/responses");
+            plan.client_api_format = client.into();
+            let mut context = test_prefetch_report_context(&request_id, &candidate_id);
+            context["client_api_format"] = json!(client);
+            context["needs_conversion"] = json!(client != "openai:responses");
+            let response = tokio::time::timeout(
+                Duration::from_secs(3),
+                execute_execution_runtime_stream(
+                    &state,
+                    plan,
+                    "trace-wire-eof",
+                    &test_decision(),
+                    plan_kind,
+                    None,
+                    Some(context),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.headers()["content-type"], "text/event-stream");
+            release.notify_one();
+            let body = tokio::time::timeout(
+                Duration::from_secs(3),
+                to_bytes(response.into_body(), 1_000_000),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(
+                body.contains("stream_missing_terminal_event"),
+                "{client} {content}: {body}"
+            );
+            assert!(
+                !body.contains("response.completed") && !body.contains("message_stop"),
+                "{body}"
+            );
+            if client == "openai:responses" {
+                assert_eq!(body.matches("event: response.failed").count(), 1);
+            }
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "Aether must not replay an ambiguous EOF"
+            );
+            let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(record) = usage
+                        .find_by_request_id(&request_id)
+                        .await
+                        .unwrap()
+                        .filter(|u| {
+                            matches!(u.status.as_str(), "failed" | "completed" | "cancelled")
+                        })
+                    {
+                        break record;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            let record = match terminal {
+                Ok(record) => record,
+                Err(err) => panic!("terminal persistence timed out: {client} content={content}: {err:?}; last={:?}", usage.find_by_request_id(&request_id).await.unwrap()),
+            };
+            assert_eq!(record.status, "failed", "{client} {content}: {record:?}");
+            assert!(record
+                .error_message
+                .unwrap_or_default()
+                .contains("terminal"));
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
 async fn overload_retry_real_http_late_sse_preserves_identity_conversion_and_single_settlement() {
     for (client_format, plan_kind, disconnect, persistent) in [
         ("openai:responses", "openai_responses_stream", false, false),

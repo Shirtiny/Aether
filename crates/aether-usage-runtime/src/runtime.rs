@@ -213,46 +213,65 @@ impl UsageRuntime {
     ) where
         T: UsageRuntimeAccess + Clone + 'static,
     {
+        // Dropping a task handle keeps the legacy fire-and-forget behavior.
+        let _ = self.record_stream_started_tracked(data, seed, status_code, telemetry);
+    }
+
+    /// Streaming relays can join these writes after closing the client body and
+    /// before persisting terminal usage, so a late lifecycle write cannot reopen
+    /// an already failed request. No persistence wait is added to token delivery.
+    pub fn record_stream_started_tracked<T>(
+        &self,
+        data: &T,
+        seed: &LifecycleUsageSeed,
+        status_code: u16,
+        telemetry: Option<&ExecutionTelemetry>,
+    ) -> Option<tokio::task::JoinHandle<()>>
+    where
+        T: UsageRuntimeAccess + Clone + 'static,
+    {
         if !self.is_enabled() {
-            return;
+            return None;
         }
         let data = T::clone(data);
         let seed = seed.clone();
         let telemetry = telemetry.cloned();
         let request_id = seed.request_id.clone();
-        spawn_on_usage_background_runtime(boxed_usage_task(async move {
-            let now_unix_secs = now_unix_secs();
-            match build_streaming_usage_record_offthread(
-                seed,
-                status_code,
-                telemetry,
-                now_unix_secs,
-            )
-            .await
-            {
-                Ok(mut record) => {
-                    apply_body_capture_policy_to_record_from_data(&data, &mut record).await;
-                    if let Err(err) = data.upsert_usage_record(record).await {
+        Some(spawn_on_usage_background_runtime(boxed_usage_task(
+            async move {
+                let now_unix_secs = now_unix_secs();
+                match build_streaming_usage_record_offthread(
+                    seed,
+                    status_code,
+                    telemetry,
+                    now_unix_secs,
+                )
+                .await
+                {
+                    Ok(mut record) => {
+                        apply_body_capture_policy_to_record_from_data(&data, &mut record).await;
+                        if let Err(err) = data.upsert_usage_record(record).await {
+                            warn!(
+                                event_name = "usage_stream_record_failed",
+                                log_type = "event",
+                                request_id = %request_id,
+                                error = %err,
+                                "usage runtime failed to record stream usage"
+                            );
+                        }
+                    }
+                    Err(err) => {
                         warn!(
-                            event_name = "usage_stream_record_failed",
+                            event_name = "usage_stream_build_failed",
                             log_type = "event",
                             request_id = %request_id,
                             error = %err,
-                            "usage runtime failed to record stream usage"
-                        );
+                            "usage runtime failed to build stream usage"
+                        )
                     }
                 }
-                Err(err) => {
-                    warn!(
-                        event_name = "usage_stream_build_failed",
-                        log_type = "event",
-                        request_id = %request_id,
-                        error = %err,
-                        "usage runtime failed to build stream usage"
-                    )
-                }
-            }
-        }));
+            },
+        )))
     }
 
     pub fn record_sync_terminal<T>(

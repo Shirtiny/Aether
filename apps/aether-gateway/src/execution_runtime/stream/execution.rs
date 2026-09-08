@@ -65,7 +65,6 @@ use crate::constants::{
     PREFETCH_RELEASE_HEADER, STREAM_IDLE_TIMEOUT_MS_HEADER, UPSTREAM_TTFB_MS_HEADER,
 };
 use crate::control::GatewayControlDecision;
-use crate::execution_runtime::build_direct_execution_frame_stream;
 use crate::execution_runtime::chatgpt_web_image::maybe_execute_chatgpt_web_image_stream;
 use crate::execution_runtime::kiro_cache::{
     billed_input_tokens as kiro_billed_input_tokens, build_kiro_prompt_cache_profile,
@@ -79,6 +78,7 @@ use crate::execution_runtime::oauth_retry::refresh_oauth_plan_auth_for_retry;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::post_stream_plan_to_remote_execution_runtime;
 use crate::execution_runtime::session_risk_control::should_return_and_record_session_risk_control_block_response;
+use crate::execution_runtime::stream_pump::build_direct_frame_stream;
 use crate::execution_runtime::submission::{
     resolve_core_error_background_report_kind, resolve_local_sync_error_status_code,
     strip_utf8_bom_and_ws, submit_local_core_error_or_sync_finalize,
@@ -700,9 +700,9 @@ fn finalize_stream_usage_observer(
     observer: &mut Option<StreamingStandardTerminalObserver>,
     report_context: Option<&Value>,
     buffered: &mut Vec<u8>,
-) -> Option<ExecutionStreamTerminalSummary> {
+) -> (Option<ExecutionStreamTerminalSummary>, bool) {
     let (Some(observer), Some(report_context)) = (observer.as_mut(), report_context) else {
-        return None;
+        return (None, false);
     };
 
     if !buffered.is_empty() {
@@ -712,13 +712,18 @@ fn finalize_stream_usage_observer(
         }
     }
 
-    match observer.finish(report_context) {
+    // Save actual parser-observed termination before EOF can synthesize Finish.
+    // Unlike the bounded wire tracker, the existing parser also covers large
+    // response.completed records (e.g. final responses containing image data).
+    let observed_wire_finish = observer.latest_summary().is_some_and(|s| s.observed_finish);
+    let summary = match observer.finish(report_context) {
         Ok(summary) => summary,
         Err(err) => {
             observer.disable_with_error(err.to_string());
             observer.latest_summary().cloned()
         }
-    }
+    };
+    (summary, observed_wire_finish)
 }
 
 fn merge_stream_terminal_summary(
@@ -960,13 +965,21 @@ fn build_retrying_direct_frame_stream(
     report_context: Option<&Value>,
     execution: DirectUpstreamStreamExecution,
 ) -> BoxStream<'static, Result<Bytes, IoError>> {
+    let inspect_wire = plan.stream
+        && super::wire::public_text_stream_format(&plan.provider_api_format)
+        && super::wire::public_text_stream_format(&plan.client_api_format)
+        && maybe_build_provider_private_stream_normalizer(report_context).is_none();
     let state = state.clone();
     let plan = plan.clone();
     let request_id = plan.request_id.clone();
     let trace_id = trace_id.to_owned();
     let report_context = report_context.cloned();
+    let provider_format = plan.provider_api_format.clone();
     super::overload_retry::retry_opening_stream(
-        build_direct_execution_frame_stream(execution).boxed(),
+        super::wire::inspect_stream_wire(
+            build_direct_frame_stream(execution, !inspect_wire).boxed(),
+            inspect_wire,
+        ),
         move || {
             let state = state.clone();
             let mut plan = plan.clone();
@@ -980,11 +993,17 @@ fn build_retrying_direct_frame_stream(
                     report_context.as_ref(),
                 )
                 .await
-                .map(|execution| build_direct_execution_frame_stream(execution).boxed())
+                .map(|execution| {
+                    super::wire::inspect_stream_wire(
+                        build_direct_frame_stream(execution, !inspect_wire).boxed(),
+                        inspect_wire,
+                    )
+                })
                 .map_err(|err| IoError::other(err.to_string()))
             }
         },
         request_id,
+        provider_format,
     )
 }
 
@@ -1959,11 +1978,24 @@ impl ClientVisibleStreamCompletionTracker {
         }
     }
 
+    fn finish(&mut self) -> bool {
+        if !self.completed && !self.line_buffer.is_empty() {
+            self.finish_line();
+        }
+        if !self.completed {
+            self.completed = self.current_event_is_terminal();
+        }
+        self.completed
+    }
+
     fn current_event_is_terminal(&self) -> bool {
-        self.event_type
-            .as_deref()
-            .is_some_and(is_terminal_sse_event_type)
-            || (self.has_data_payload && sse_data_payload_is_terminal(&self.data_payload))
+        self.has_data_payload
+            && (sse_data_payload_is_terminal(&self.data_payload)
+                || (self
+                    .event_type
+                    .as_deref()
+                    .is_some_and(is_terminal_sse_event_type)
+                    && serde_json::from_str::<Value>(&self.data_payload).is_ok()))
     }
 
     fn reset_current_event(&mut self) {
@@ -2133,7 +2165,14 @@ impl StreamTerminalEventDiagnosticsTracker {
 fn is_terminal_sse_event_type(event_type: &str) -> bool {
     matches!(
         event_type,
-        "message_stop" | "response.completed" | "response.failed" | "response.incomplete" | "error"
+        "message_stop"
+            | "response.completed"
+            | "response.done"
+            | "response.failed"
+            | "response.incomplete"
+            | "response.cancelled"
+            | "response.canceled"
+            | "error"
     )
 }
 
@@ -2304,24 +2343,24 @@ fn maybe_record_first_stream_event_started(
     event_observed_at: Instant,
     upstream_telemetry: Option<&ExecutionTelemetry>,
     usage_stream_telemetry: &mut Option<ExecutionTelemetry>,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     if !maybe_capture_first_stream_event_telemetry(
         stream_started_at,
         event_observed_at,
         upstream_telemetry,
         usage_stream_telemetry,
     ) {
-        return;
+        return None;
     }
     let Some(telemetry) = usage_stream_telemetry.as_ref() else {
-        return;
+        return None;
     };
-    state.usage_runtime.record_stream_started(
+    state.usage_runtime.record_stream_started_tracked(
         state.data.as_ref(),
         lifecycle_seed,
         status_code,
         Some(telemetry),
-    );
+    )
 }
 
 fn build_terminal_stream_telemetry(
@@ -3561,12 +3600,16 @@ async fn execute_stream_from_frame_stream(
             .as_ref()
             .map(|telemetry| usage_refresh_telemetry(telemetry, None))
     });
-    state.usage_runtime.record_stream_started(
-        state.data.as_ref(),
-        &lifecycle_seed,
-        status_code,
-        initial_usage_telemetry.as_ref(),
-    );
+    let mut stream_usage_writes: Vec<_> = state
+        .usage_runtime
+        .record_stream_started_tracked(
+            state.data.as_ref(),
+            &lifecycle_seed,
+            status_code,
+            initial_usage_telemetry.as_ref(),
+        )
+        .into_iter()
+        .collect();
     if let Some(snapshot) = request_candidate_status_snapshot {
         let state_bg = state.clone();
         let latency_ms = prefetched_telemetry
@@ -3717,6 +3760,16 @@ async fn execute_stream_from_frame_stream(
             .filter(|_| !sync_json_stream_bridge_active_for_report)
             .map(|_| StreamingStandardTerminalObserver::default());
         let mut stream_usage_observer_buffered = Vec::new();
+        // Conversion parsers can synthesize Finish on EOF. Track terminal
+        // records from the native provider wire independently of that summary.
+        let mut provider_completion_tracker = (private_stream_normalizer.is_none()
+            && !sync_json_stream_bridge_active_for_report
+            && stream_requires_observed_terminal_event(
+                plan_for_report.provider_api_format.as_str(),
+                stream_usage_report_context.as_ref(),
+            ))
+        .then(ClientVisibleStreamCompletionTracker::default);
+
         append_stream_capture_bytes(
             &mut provider_buffered_body,
             &provider_prefetched_body_for_report,
@@ -3894,6 +3947,10 @@ async fn execute_stream_from_frame_stream(
             if let Some(tracker) = provider_terminal_diagnostics_tracker.as_mut() {
                 tracker.observe_chunk(replay_chunk);
             }
+            if let Some(tracker) = provider_completion_tracker.as_mut() {
+                tracker.observe_chunk(replay_chunk);
+            }
+
             if let (Some(observer), Some(report_context)) = (
                 stream_usage_observer.as_mut(),
                 stream_usage_report_context.as_ref(),
@@ -4071,7 +4128,7 @@ async fn execute_stream_from_frame_stream(
                 last_upstream_frame_elapsed_ms.store(frame_elapsed_ms, Ordering::Relaxed);
                 match observed_frame.frame.payload {
                     StreamFramePayload::Data { chunk_b64, text } => {
-                        maybe_record_first_stream_event_started(
+                        stream_usage_writes.extend(maybe_record_first_stream_event_started(
                             &state_for_report,
                             &lifecycle_seed_for_report,
                             status_code,
@@ -4079,7 +4136,7 @@ async fn execute_stream_from_frame_stream(
                             frame_observed_at,
                             telemetry.as_ref(),
                             &mut usage_stream_telemetry,
-                        );
+                        ));
                         if sync_json_stream_bridge_active_for_report {
                             continue;
                         }
@@ -4150,6 +4207,10 @@ async fn execute_stream_from_frame_stream(
                         if let Some(tracker) = provider_terminal_diagnostics_tracker.as_mut() {
                             tracker.observe_chunk(&normalized_chunk);
                         }
+                        if let Some(tracker) = provider_completion_tracker.as_mut() {
+                            tracker.observe_chunk(&normalized_chunk);
+                        }
+
                         let provider_private_error_body_json =
                             extract_provider_private_stream_error_body(
                                 stream_usage_report_context.as_ref(),
@@ -4299,11 +4360,16 @@ async fn execute_stream_from_frame_stream(
                             &usage_frame_telemetry,
                         );
                         if should_refresh_stream_usage {
-                            state_for_report.usage_runtime.record_stream_started(
-                                state_for_report.data.as_ref(),
-                                &lifecycle_seed_for_report,
-                                status_code,
-                                Some(&usage_frame_telemetry),
+                            stream_usage_writes.retain(|write| !write.is_finished());
+                            stream_usage_writes.extend(
+                                state_for_report
+                                    .usage_runtime
+                                    .record_stream_started_tracked(
+                                        state_for_report.data.as_ref(),
+                                        &lifecycle_seed_for_report,
+                                        status_code,
+                                        Some(&usage_frame_telemetry),
+                                    ),
                             );
                             usage_stream_telemetry = Some(usage_frame_telemetry);
                         }
@@ -4497,7 +4563,46 @@ async fn execute_stream_from_frame_stream(
                 }
             }
         }
-        if !downstream_dropped && terminal_failure.is_none() {
+        let (usage_summary, parser_observed_wire_finish) = finalize_stream_usage_observer(
+            &mut stream_usage_observer,
+            stream_usage_report_context.as_ref(),
+            &mut stream_usage_observer_buffered,
+        );
+        stream_terminal_summary =
+            merge_stream_terminal_summary(stream_terminal_summary, usage_summary);
+
+        if let Some(tracker) = provider_completion_tracker.as_mut() {
+            let summary =
+                stream_terminal_summary.get_or_insert_with(ExecutionStreamTerminalSummary::default);
+            summary.observed_finish = tracker.finish() || parser_observed_wire_finish;
+            if !summary.observed_finish {
+                summary.finish_reason = None; // discard a conversion parser's synthetic stop
+                summary.parser_error.get_or_insert_with(|| {
+                    "execution runtime stream ended before provider terminal event".into()
+                });
+            }
+        }
+
+        // Resolve required terminal state before a conversion finalizer can
+        // manufacture a successful ending. Keep EOF accounting on the existing
+        // stream-summary path so partial usage is not lost in a sync error report.
+        let missing_terminal_wire_failure = (stream_requires_observed_terminal_event(
+            plan_for_report.provider_api_format.as_str(),
+            stream_usage_report_context.as_ref(),
+        ) && !stream_terminal_summary
+            .as_ref()
+            .is_some_and(|summary| summary.observed_finish))
+        .then(|| {
+            build_stream_failure_report(
+                "stream_missing_terminal_event",
+                "execution runtime stream ended before provider terminal event",
+                502,
+            )
+        });
+        if !downstream_dropped
+            && terminal_failure.is_none()
+            && missing_terminal_wire_failure.is_none()
+        {
             if let Some(rewriter) = local_stream_rewriter.as_mut() {
                 match rewriter.finish() {
                     Ok(flushed_chunk) if !flushed_chunk.is_empty() => {
@@ -4579,7 +4684,10 @@ async fn execute_stream_from_frame_stream(
         }
 
         if !downstream_dropped {
-            if let Some(failure) = terminal_failure.as_ref() {
+            if let Some(failure) = terminal_failure
+                .as_ref()
+                .or(missing_terminal_wire_failure.as_ref())
+            {
                 let terminal_event = if is_openai_image_stream_for_report {
                     Some(encode_openai_image_failed_event(
                         report_context_owned.as_ref(),
@@ -4660,14 +4768,20 @@ async fn execute_stream_from_frame_stream(
         idle_monitor_done.store(true, Ordering::Relaxed);
         idle_monitor_handle.abort();
 
-        stream_terminal_summary = merge_stream_terminal_summary(
-            stream_terminal_summary,
-            finalize_stream_usage_observer(
-                &mut stream_usage_observer,
-                stream_usage_report_context.as_ref(),
-                &mut stream_usage_observer_buffered,
-            ),
-        );
+        // The client body is already closed. Order terminal persistence after
+        // pending lifecycle writes without putting database work on the token path.
+        for write in stream_usage_writes {
+            if let Err(err) = write.await {
+                warn!(
+                    event_name = "usage_stream_lifecycle_join_failed",
+                    log_type = "event",
+                    request_id = %request_id_for_report_log,
+                    error = %err,
+                    "gateway stream lifecycle task failed before terminal persistence"
+                );
+            }
+        }
+
         remember_provider_session_risk_control_block_for_terminal_summary(
             &state_for_report,
             &plan_for_report,

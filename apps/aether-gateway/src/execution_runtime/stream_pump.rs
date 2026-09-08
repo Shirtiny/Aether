@@ -28,6 +28,15 @@ use crate::GatewayError;
 pub(crate) fn build_direct_execution_frame_stream(
     execution: DirectUpstreamStreamExecution,
 ) -> impl Stream<Item = Result<Bytes, IoError>> + Send + 'static {
+    build_direct_frame_stream(execution, true)
+}
+
+// The opening inspector owns bounded JSON/SSE discrimination for public text
+// streams. Other callers retain the existing complete-JSON bridge behavior.
+pub(super) fn build_direct_frame_stream(
+    execution: DirectUpstreamStreamExecution,
+    allow_json_buffering: bool,
+) -> impl Stream<Item = Result<Bytes, IoError>> + Send + 'static {
     stream! {
         let DirectUpstreamStreamExecution {
             request_id: _,
@@ -64,7 +73,7 @@ pub(crate) fn build_direct_execution_frame_stream(
         let mut stream_terminal_observer = StreamingStandardTerminalObserver::default();
         let mut observer_buffered = Vec::new();
 
-        if should_buffer_non_stream_response(&headers, &observer_context) {
+        if allow_json_buffering && should_buffer_non_stream_response(&headers, &observer_context) {
             let original_headers = headers.clone();
             match buffer_non_sse_upstream_body(response, started_at, stream_first_byte_timeout).await {
                 Ok(buffered) => {

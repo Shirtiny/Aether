@@ -23,7 +23,7 @@ const PENDING_COMMENT: &[u8] = b": aether-upstream-pending\n\n";
 
 type Frames = BoxStream<'static, Result<Bytes, IoError>>;
 
-fn data_frame(bytes: &[u8]) -> Result<Bytes, IoError> {
+pub(super) fn data_frame(bytes: &[u8]) -> Result<Bytes, IoError> {
     encode_stream_frame_ndjson(&StreamFrame {
         frame_type: StreamFrameType::Data,
         payload: StreamFramePayload::Data {
@@ -33,7 +33,7 @@ fn data_frame(bytes: &[u8]) -> Result<Bytes, IoError> {
     })
 }
 
-fn data_bytes(frame: &StreamFrame) -> Result<Option<Vec<u8>>, IoError> {
+pub(super) fn data_bytes(frame: &StreamFrame) -> Result<Option<Vec<u8>>, IoError> {
     match &frame.payload {
         StreamFramePayload::Data { chunk_b64, text } => {
             if let Some(encoded) = chunk_b64 {
@@ -51,12 +51,39 @@ fn data_bytes(frame: &StreamFrame) -> Result<Option<Vec<u8>>, IoError> {
     }
 }
 
+fn provider_error_frame(
+    provider_format: &str,
+    status: u16,
+    error: &Value,
+) -> Result<Bytes, IoError> {
+    let mut detail = error
+        .get("error")
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({"type":"upstream_error","message":"Upstream stream failed"}));
+    detail
+        .as_object_mut()
+        .expect("object above")
+        .entry("code")
+        .or_insert(json!(status));
+    let (event, payload) = match provider_format {
+        "openai:responses" => (
+            "response.failed",
+            json!({"type":"response.failed","response":{"status":"failed","error":detail}}),
+        ),
+        "claude:messages" => ("error", json!({"type":"error","error":detail})),
+        _ => ("error", json!({"error":detail})),
+    };
+    data_frame(format!("event: {event}\ndata: {payload}\n\n").as_bytes())
+}
+
 /// Input comes from build_direct_execution_frame_stream: exactly one encoded
 /// NDJSON frame per item (the provider's SSE records may span any number of items).
 pub(super) fn retry_opening_stream<F, Fut>(
     mut frames: Frames,
     mut reopen: F,
     request_id: String,
+    provider_format: String,
 ) -> Frames
 where
     F: FnMut() -> Fut + Send + 'static,
@@ -167,7 +194,10 @@ where
                         error = json!({"error": {"message": error.to_string()}});
                     }
                     error["error"]["code"] = json!(status_code);
-                    yield data_frame(format!("event: error\ndata: {error}\n\n").as_bytes());
+                    // Let the finalizer emit the client's native terminal event
+                    // (response.failed for Responses), not a generic error that
+                    // some downstream Responses clients do not treat as terminal.
+                    yield provider_error_frame(&provider_format, status_code, &error);
                     yield encode_stream_frame_ndjson(&StreamFrame::eof_with_summary(None));
                 } else {
                     for item in held {
@@ -262,6 +292,15 @@ where
                                 };
                                 continue 'attempt;
                             }
+                            if opening.raw_json_error {
+                                // Some providers switch from SSE to bare JSON
+                                // for errors. Never leak that JSON into an SSE
+                                // response or turn it into a missing-terminal EOF.
+                                if let Some(telemetry) = telemetry.take() { yield Ok(telemetry); }
+                                yield provider_error_frame(&provider_format, status, error);
+                                yield encode_stream_frame_ndjson(&StreamFrame::eof_with_summary(None));
+                                return;
+                            }
                         }
                         if matches!(inspection, OpeningInspection::Pending) {
                             // Comments carry no attempt/response IDs or content.
@@ -318,6 +357,7 @@ struct OpeningSse {
     line_start: usize,
     record_start: usize,
     saw_data_line: bool,
+    raw_json_error: bool,
 }
 
 enum OpeningInspection {
@@ -329,6 +369,9 @@ enum OpeningInspection {
 impl OpeningSse {
     fn push(&mut self, chunk: &[u8]) -> OpeningInspection {
         self.bytes.extend_from_slice(chunk);
+        if let Some(error) = self.bare_json_error() {
+            return OpeningInspection::Error(error);
+        }
         while self.scanned < self.bytes.len() {
             let index = self.scanned;
             self.scanned += 1;
@@ -363,8 +406,23 @@ impl OpeningSse {
             if !matches!(result, OpeningInspection::Pending) {
                 return result;
             }
+            if let Some(error) = self.bare_json_error() {
+                return OpeningInspection::Error(error);
+            }
         }
         OpeningInspection::Pending
+    }
+
+    fn bare_json_error(&mut self) -> Option<Value> {
+        let tail = self.bytes[self.record_start..].trim_ascii();
+        if !tail.starts_with(b"{") {
+            return None;
+        }
+        let value: Value = serde_json::from_slice(tail).ok()?;
+        let error = openai_stream_terminal_error_body(&value)
+            .or_else(|| has_nested_error(&value).then_some(value))?;
+        self.raw_json_error = true;
+        Some(error)
     }
 }
 
@@ -372,6 +430,7 @@ fn inspect_record(record: &[u8]) -> OpeningInspection {
     let Ok(text) = std::str::from_utf8(record) else {
         return OpeningInspection::Commit;
     };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut event = "";
     let mut data = String::new();
     for line in text.lines() {
@@ -522,6 +581,7 @@ mod tests {
                 async move { next.ok_or_else(|| IoError::other("unexpected retry")) }
             },
             "test-overload".into(),
+            "openai:responses".into(),
         );
         (output, calls)
     }
@@ -656,7 +716,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn overload_retry_http_failure_after_sse_stays_a_valid_sse_error() {
+    async fn overload_retry_http_failure_after_sse_uses_native_error_finalization() {
         let (output, calls) = with_attempts(
             attempt(200, sse(CREATED) + &sse(OVERLOAD)),
             vec![attempt(
@@ -668,7 +728,7 @@ mod tests {
         assert_eq!(statuses, [200]);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(!returned.contains("failed-attempt-id"));
-        assert!(returned.contains("event: error"));
+        assert!(returned.contains("event: response.failed"));
         assert!(returned.contains("\"code\":401"));
     }
 
