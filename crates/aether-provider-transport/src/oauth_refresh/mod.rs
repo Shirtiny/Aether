@@ -214,10 +214,21 @@ impl OAuthHttpExecutor for ProviderOAuthLocalHttpExecutor<'_> {
     }
 }
 
+/// Returns the `User-Agent` string assigned to this account's codex pool
+/// profile, or `None` when the provider is not codex or no profile is
+/// configured.  Mirrors the selection logic in the gateway planner so OAuth
+/// maintenance traffic (token refresh) carries the same client fingerprint as
+/// ordinary requests. Exposed for gateway-side logging of the selected UA.
+pub fn resolve_oauth_maintenance_user_agent(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<String> {
+    codex_pool_account_user_agent(transport)
+}
+
 pub(crate) fn provider_oauth_transport_context_from_snapshot(
     transport: &GatewayProviderTransportSnapshot,
 ) -> ProviderOAuthTransportContext {
-    let user_agent = codex_pool_account_user_agent(transport);
+    let user_agent = resolve_oauth_maintenance_user_agent(transport);
     ProviderOAuthTransportContext {
         provider_id: transport.provider.id.clone(),
         provider_type: transport.provider.provider_type.clone(),

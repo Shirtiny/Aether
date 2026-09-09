@@ -1111,6 +1111,10 @@ impl AppState {
                 .as_deref()
                 .map(str::trim)
                 .is_some_and(|value| !value.is_empty()),
+            codex_oauth_user_agent = provider_transport::resolve_oauth_maintenance_user_agent(
+                &current_transport,
+            )
+            .unwrap_or_else(|| "-".to_string()),
             "gateway manual oauth refresh starting"
         );
 
@@ -1584,6 +1588,11 @@ impl AppState {
             http1_only = plan
                 .headers
                 .get(EXECUTION_REQUEST_HTTP1_ONLY_HEADER)
+                .map(String::as_str)
+                .unwrap_or("-"),
+            user_agent = plan
+                .headers
+                .get("user-agent")
                 .map(String::as_str)
                 .unwrap_or("-"),
             "gateway local oauth execution request prepared"

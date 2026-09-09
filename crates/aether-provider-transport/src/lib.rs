@@ -90,9 +90,10 @@ pub use network::{
     TransportTunnelAffinityLookup, TransportTunnelAttachmentOwner,
 };
 pub use oauth_refresh::{
-    supports_local_oauth_request_auth_resolution, CachedOAuthEntry, LocalOAuthHttpExecutor,
-    LocalOAuthHttpRequest, LocalOAuthHttpResponse, LocalOAuthRefreshCoordinator,
-    LocalOAuthRefreshError, LocalResolvedOAuthRequestAuth, ReqwestLocalOAuthHttpExecutor,
+    resolve_oauth_maintenance_user_agent, supports_local_oauth_request_auth_resolution,
+    CachedOAuthEntry, LocalOAuthHttpExecutor, LocalOAuthHttpRequest, LocalOAuthHttpResponse,
+    LocalOAuthRefreshCoordinator, LocalOAuthRefreshError, LocalResolvedOAuthRequestAuth,
+    ReqwestLocalOAuthHttpExecutor,
 };
 pub use openai_image::{
     build_openai_image_headers, build_openai_image_upstream_url,
