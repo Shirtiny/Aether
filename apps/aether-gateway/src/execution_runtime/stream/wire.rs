@@ -9,7 +9,6 @@ use axum::body::Bytes;
 use futures_util::{stream::BoxStream, StreamExt};
 use serde_json::Value;
 
-use super::overload_retry::{data_bytes, data_frame};
 use crate::ai_serving::api::openai_stream_terminal_error_body;
 use crate::execution_runtime::ndjson::{decode_stream_frame_ndjson, encode_stream_frame_ndjson};
 use crate::execution_runtime::submission::{
@@ -19,6 +18,36 @@ use crate::execution_runtime::submission::{
 const MAX_PROBE_BYTES: usize = 16 * 1024;
 const MAX_PROBE_FRAMES: usize = 128;
 type Frames = BoxStream<'static, Result<Bytes, IoError>>;
+
+pub(super) fn data_frame(bytes: &[u8]) -> Result<Bytes, IoError> {
+    use base64::Engine as _;
+    encode_stream_frame_ndjson(&StreamFrame {
+        frame_type: StreamFrameType::Data,
+        payload: StreamFramePayload::Data {
+            chunk_b64: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            text: None,
+        },
+    })
+}
+
+pub(super) fn data_bytes(frame: &StreamFrame) -> Result<Option<Vec<u8>>, IoError> {
+    use base64::Engine as _;
+    match &frame.payload {
+        StreamFramePayload::Data { chunk_b64, text } => {
+            if let Some(encoded) = chunk_b64 {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map(Some)
+                    .map_err(IoError::other)
+            } else {
+                Ok(Some(
+                    text.as_deref().unwrap_or_default().as_bytes().to_vec(),
+                ))
+            }
+        }
+        _ => Ok(None),
+    }
+}
 
 pub(crate) fn public_text_stream_format(format: &str) -> bool {
     matches!(
@@ -208,10 +237,6 @@ pub(super) fn inspect_stream_wire(mut frames: Frames, enabled: bool) -> Frames {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
     use std::time::Duration;
 
     fn input(content_type: Option<&str>, chunks: Vec<Bytes>) -> Frames {
@@ -227,7 +252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overload_retry_wire_sniffs_missing_and_misleading_sse_headers() {
+    async fn wire_sniffs_missing_and_misleading_sse_headers() {
         let body = b"\xef\xbb\xbfevent: response.created\r\ndata: {\"type\":\"response.created\",\"response\":{\"output\":[]}}\r\n\r\n";
         for media in [
             None,
@@ -271,7 +296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overload_retry_wire_maps_json_error_before_waiting_for_eof() {
+    async fn wire_maps_json_error_before_waiting_for_eof() {
         for media in [None, Some("application/json"), Some("text/event-stream")] {
             let initial = input(media, vec![Bytes::from_static(br#"{"error":{"code":503,"message":"Our servers are currently overloaded. Please try again later."}}"#)]);
             let mut input = initial
@@ -302,39 +327,8 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn overload_retry_wire_is_applied_again_on_reopen_and_keeps_first_content_immediate() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let count = calls.clone();
-        let first = inspect_stream_wire(input(None, vec![Bytes::from_static(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"hidden\",\"output\":[]}}\n\n"), Bytes::from_static(b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":503,\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n")]), true);
-        let mut result = super::super::overload_retry::retry_opening_stream(
-            first,
-            move || {
-                count.fetch_add(1, Ordering::SeqCst);
-                async {
-                    Ok(inspect_stream_wire(input(Some("application/octet-stream"), vec![Bytes::from_static(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n")]), true))
-                }
-            },
-            "wire-retry".into(),
-            "openai:responses".into(),
-        );
-        let mut data = Vec::new();
-        while let Some(raw) = result.next().await {
-            if let Some(bytes) =
-                data_bytes(&decode_stream_frame_ndjson(&raw.unwrap()).unwrap()).unwrap()
-            {
-                data.extend(bytes);
-            }
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let text = String::from_utf8(data).unwrap();
-        assert!(text.contains("hello"));
-        assert!(!text.contains("hidden"));
-        assert!(!text.contains("overloaded"));
-    }
-
     #[tokio::test]
-    async fn overload_retry_wire_preserves_unknown_binary_and_unselected_routes() {
+    async fn wire_preserves_unknown_binary_and_unselected_routes() {
         for enabled in [true, false] {
             let body = Bytes::from_static(b"\x89PNG\r\n\x1a\nnot SSE");
             let mut frames = inspect_stream_wire(
@@ -355,7 +349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overload_retry_wire_empty_stream_has_a_terminal_error_channel() {
+    async fn wire_empty_stream_has_a_terminal_error_channel() {
         let mut frames = inspect_stream_wire(input(None, vec![]), true);
         let header = decode_stream_frame_ndjson(&frames.next().await.unwrap().unwrap()).unwrap();
         let StreamFramePayload::Headers { headers, .. } = header.payload else {

@@ -959,56 +959,24 @@ async fn execute_in_process_stream_with_oauth_retry(
     Ok(execution)
 }
 
-fn build_retrying_direct_frame_stream(
-    state: &AppState,
+fn build_direct_frame_stream_with_inspection(
     plan: &ExecutionPlan,
-    trace_id: &str,
     report_context: Option<&Value>,
     execution: DirectUpstreamStreamExecution,
-) -> (BoxStream<'static, Result<Bytes, IoError>>, RetryAudit) {
+) -> BoxStream<'static, Result<Bytes, IoError>> {
     let inspect_wire = plan.stream
         && super::wire::public_text_stream_format(&plan.provider_api_format)
         && super::wire::public_text_stream_format(&plan.client_api_format)
         && maybe_build_provider_private_stream_normalizer(report_context).is_none();
-    let state = state.clone();
-    let plan = plan.clone();
-    let request_id = plan.request_id.clone();
-    let trace_id = trace_id.to_owned();
-    let report_context = report_context.cloned();
-    let provider_format = plan.provider_api_format.clone();
-    let audit = RetryAudit::default();
-    let frames = super::overload_retry::retry_opening_stream_with_audit(
-        super::wire::inspect_stream_wire(
-            build_direct_frame_stream(execution, !inspect_wire).boxed(),
-            inspect_wire,
-        ),
-        move || {
-            let state = state.clone();
-            let mut plan = plan.clone();
-            let trace_id = trace_id.clone();
-            let report_context = report_context.clone();
-            async move {
-                execute_in_process_stream_with_oauth_retry(
-                    &state,
-                    &mut plan,
-                    &trace_id,
-                    report_context.as_ref(),
-                )
-                .await
-                .map(|execution| {
-                    super::wire::inspect_stream_wire(
-                        build_direct_frame_stream(execution, !inspect_wire).boxed(),
-                        inspect_wire,
-                    )
-                })
-                .map_err(|err| IoError::other(err.to_string()))
-            }
-        },
-        request_id,
-        provider_format,
-        audit.clone(),
+    // Do not replay an already prepared stream on an upstream 503.  In
+    // particular, buffering the opening response until EOF can make clients
+    // report an SSE idle timeout while the upstream connection remains open.
+    // OAuth refresh/retry is handled before this stream is built.
+    let frames = super::wire::inspect_stream_wire(
+        build_direct_frame_stream(execution, !inspect_wire).boxed(),
+        inspect_wire,
     );
-    (frames, audit)
+    frames
 }
 
 #[allow(clippy::too_many_arguments)] // internal function, grouping would add unnecessary indirection
@@ -1270,14 +1238,9 @@ pub(crate) async fn execute_execution_runtime_stream(
                 return Ok(None);
             }
         };
-        let (frame_stream, retry_audit) = build_retrying_direct_frame_stream(
-            state,
-            &plan,
-            trace_id,
-            report_context.as_ref(),
-            execution,
-        );
-        return execute_stream_from_frame_stream_with_retry_audit(
+        let frame_stream =
+            build_direct_frame_stream_with_inspection(&plan, report_context.as_ref(), execution);
+        return execute_stream_from_frame_stream(
             state,
             plan,
             trace_id,
@@ -1289,7 +1252,6 @@ pub(crate) async fn execute_execution_runtime_stream(
             stream_started_at,
             frame_stream,
             provider_pool_in_flight_guard.take(),
-            Some(retry_audit),
         )
         .await;
     }
@@ -1342,14 +1304,12 @@ pub(crate) async fn execute_execution_runtime_stream(
                     return Ok(None);
                 }
             };
-            let (frame_stream, retry_audit) = build_retrying_direct_frame_stream(
-                state,
+            let frame_stream = build_direct_frame_stream_with_inspection(
                 &plan,
-                trace_id,
                 report_context.as_ref(),
                 execution,
             );
-            return execute_stream_from_frame_stream_with_retry_audit(
+            return execute_stream_from_frame_stream(
                 state,
                 plan,
                 trace_id,
@@ -1361,7 +1321,6 @@ pub(crate) async fn execute_execution_runtime_stream(
                 stream_started_at,
                 frame_stream,
                 provider_pool_in_flight_guard.take(),
-                Some(retry_audit),
             )
             .await;
         }
@@ -5362,8 +5321,6 @@ mod tests {
     fn test_state() -> AppState {
         AppState::new().expect("gateway state should build")
     }
-
-    include!("execution_overload_retry_tests.rs");
 
     fn test_stream_state() -> (
         AppState,
