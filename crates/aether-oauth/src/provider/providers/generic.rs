@@ -69,7 +69,16 @@ pub const GENERIC_PROVIDER_OAUTH_TEMPLATES: &[GenericProviderOAuthTemplate] = &[
         token_url: "https://auth.openai.com/oauth/token",
         client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
         client_secret: "",
-        scopes: &["openid", "email", "profile", "offline_access"],
+        // Same scope string, in the same order, as codex-rs
+        // `login/src/server.rs::build_authorize_url`.
+        scopes: &[
+            "openid",
+            "profile",
+            "email",
+            "offline_access",
+            "api.connectors.read",
+            "api.connectors.invoke",
+        ],
         redirect_uri: "http://localhost:1455/auth/callback",
         use_pkce: true,
         uses_json_payload: false,
@@ -497,6 +506,188 @@ impl GenericProviderOAuthAdapter {
         }
     }
 
+    fn is_codex(&self) -> bool {
+        self.template.provider_type == "codex"
+    }
+
+    /// Authorize URL in the exact shape codex-rs produces
+    /// (`login/src/server.rs::build_authorize_url`): fixed parameter order,
+    /// `urlencoding::encode`-style percent encoding (space is `%20`, never
+    /// `+`), no `prompt=login`, and the client `originator` as the last
+    /// parameter when the caller knows which client profile this account
+    /// will be presented as.
+    fn build_codex_authorize_url(
+        &self,
+        ctx: &ProviderOAuthTransportContext,
+        state: &str,
+        code_challenge: Option<&str>,
+    ) -> Result<OAuthAuthorizeResponse, OAuthError> {
+        let mut query: Vec<(&str, String)> = vec![
+            ("response_type", "code".to_string()),
+            ("client_id", self.client_id().to_string()),
+            ("redirect_uri", self.redirect_uri().to_string()),
+            ("scope", self.scopes().join(" ")),
+        ];
+        if let Some(challenge) = code_challenge {
+            query.push(("code_challenge", challenge.to_string()));
+            query.push(("code_challenge_method", "S256".to_string()));
+        }
+        query.push(("id_token_add_organizations", "true".to_string()));
+        query.push(("codex_cli_simplified_flow", "true".to_string()));
+        query.push(("state", state.to_string()));
+        if let Some(originator) = codex_context_originator(ctx) {
+            query.push(("originator", originator.to_string()));
+        }
+        let query_string = query
+            .into_iter()
+            .map(|(key, value)| format!("{key}={}", codex_percent_encode(&value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        Ok(OAuthAuthorizeResponse {
+            authorize_url: format!("{}?{query_string}", self.authorize_url()),
+            state: state.to_string(),
+            code_challenge: code_challenge.map(ToOwned::to_owned),
+        })
+    }
+
+    /// Token endpoint traffic in the exact shape codex-rs sends it.
+    ///
+    /// * `authorization_code` → form body
+    ///   `grant_type=authorization_code&code=…&redirect_uri=…&client_id=…&code_verifier=…`
+    ///   (no `scope`, no `state`), followed by the API-key token exchange the
+    ///   CLI performs unconditionally after every login. That second call is
+    ///   fidelity only: its result is discarded and a failure is tolerated,
+    ///   mirroring `obtain_api_key(...).await.ok()` upstream.
+    /// * `refresh_token` → JSON body
+    ///   `{"client_id":…,"grant_type":"refresh_token","refresh_token":…}`.
+    ///
+    /// Both carry the `originator` header when the context provides one and
+    /// add no `accept` header (codex-rs leaves reqwest's default in place).
+    async fn exchange_codex_grant(
+        &self,
+        executor: &dyn OAuthHttpExecutor,
+        ctx: &ProviderOAuthTransportContext,
+        grant_type: &str,
+        code_or_refresh_token: &str,
+        pkce_verifier: Option<&str>,
+    ) -> Result<ProviderOAuthTokenSet, OAuthError> {
+        let request = match grant_type {
+            "authorization_code" => {
+                let mut body = format!(
+                    "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}",
+                    codex_percent_encode(code_or_refresh_token),
+                    codex_percent_encode(self.redirect_uri()),
+                    codex_percent_encode(self.client_id()),
+                );
+                if let Some(verifier) = pkce_verifier {
+                    body.push_str("&code_verifier=");
+                    body.push_str(&codex_percent_encode(verifier));
+                }
+                OAuthHttpRequest {
+                    request_id: "provider-oauth:exchange-code".to_string(),
+                    method: reqwest::Method::POST,
+                    url: self.token_url(),
+                    headers: codex_auth_headers(ctx, CODEX_FORM_CONTENT_TYPE),
+                    content_type: Some(CODEX_FORM_CONTENT_TYPE.to_string()),
+                    json_body: None,
+                    body_bytes: Some(body.into_bytes()),
+                    network: ctx.network.clone(),
+                    user_agent: ctx.user_agent.clone(),
+                }
+            }
+            "refresh_token" => {
+                // Field order matches codex-rs `RefreshRequest`; serde_json is
+                // built with `preserve_order`, so insertion order is wire order.
+                let body = serde_json::Map::from_iter([
+                    (
+                        "client_id".to_string(),
+                        Value::String(self.client_id().to_string()),
+                    ),
+                    (
+                        "grant_type".to_string(),
+                        Value::String("refresh_token".to_string()),
+                    ),
+                    (
+                        "refresh_token".to_string(),
+                        Value::String(code_or_refresh_token.to_string()),
+                    ),
+                ]);
+                OAuthHttpRequest {
+                    request_id: "provider-oauth:refresh-token".to_string(),
+                    method: reqwest::Method::POST,
+                    url: self.token_url(),
+                    headers: codex_auth_headers(ctx, CODEX_JSON_CONTENT_TYPE),
+                    content_type: Some(CODEX_JSON_CONTENT_TYPE.to_string()),
+                    json_body: Some(Value::Object(body)),
+                    body_bytes: None,
+                    network: ctx.network.clone(),
+                    user_agent: ctx.user_agent.clone(),
+                }
+            }
+            other => {
+                return Err(OAuthError::invalid_request(format!(
+                    "unsupported codex grant_type {other}"
+                )))
+            }
+        };
+        let response = executor.execute(request).await?;
+        if !(200..300).contains(&response.status_code) {
+            return Err(OAuthError::HttpStatus {
+                status_code: response.status_code,
+                body_excerpt: truncate_body(&response.body_text),
+            });
+        }
+        let payload = response
+            .json_body
+            .or_else(|| serde_json::from_str::<Value>(&response.body_text).ok())
+            .ok_or_else(|| OAuthError::invalid_response("token response is not json"))?;
+        if grant_type == "authorization_code" {
+            self.codex_obtain_api_key(executor, ctx, &payload).await;
+        }
+        self.token_set_from_payload(payload)
+    }
+
+    /// codex-rs `login/src/server.rs::obtain_api_key`: RFC 8693 token
+    /// exchange of the login `id_token` for an API key. The CLI runs it right
+    /// after every successful code exchange and ignores failures; Aether does
+    /// the same and does not keep the result.
+    async fn codex_obtain_api_key(
+        &self,
+        executor: &dyn OAuthHttpExecutor,
+        ctx: &ProviderOAuthTransportContext,
+        token_payload: &Value,
+    ) {
+        let Some(id_token) = token_payload
+            .get("id_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        let body = format!(
+            "grant_type={}&client_id={}&requested_token={}&subject_token={}&subject_token_type={}",
+            codex_percent_encode("urn:ietf:params:oauth:grant-type:token-exchange"),
+            codex_percent_encode(self.client_id()),
+            codex_percent_encode("openai-api-key"),
+            codex_percent_encode(id_token),
+            codex_percent_encode("urn:ietf:params:oauth:token-type:id_token"),
+        );
+        let _ = executor
+            .execute(OAuthHttpRequest {
+                request_id: "provider-oauth:codex:api-key-exchange".to_string(),
+                method: reqwest::Method::POST,
+                url: self.token_url(),
+                headers: codex_auth_headers(ctx, CODEX_FORM_CONTENT_TYPE),
+                content_type: Some(CODEX_FORM_CONTENT_TYPE.to_string()),
+                json_body: None,
+                body_bytes: Some(body.into_bytes()),
+                network: ctx.network.clone(),
+                user_agent: ctx.user_agent.clone(),
+            })
+            .await;
+    }
+
     async fn exchange_grant(
         &self,
         executor: &dyn OAuthHttpExecutor,
@@ -506,6 +697,17 @@ impl GenericProviderOAuthAdapter {
         state: Option<&str>,
         pkce_verifier: Option<&str>,
     ) -> Result<ProviderOAuthTokenSet, OAuthError> {
+        if self.is_codex() {
+            return self
+                .exchange_codex_grant(
+                    executor,
+                    ctx,
+                    grant_type,
+                    code_or_refresh_token,
+                    pkce_verifier,
+                )
+                .await;
+        }
         let scopes = self.scopes();
         let scope = (!scopes.is_empty()).then(|| scopes.join(" "));
         let request_id = match grant_type {
@@ -688,10 +890,13 @@ impl ProviderOAuthAdapter for GenericProviderOAuthAdapter {
 
     fn build_authorize_url(
         &self,
-        _ctx: &ProviderOAuthTransportContext,
+        ctx: &ProviderOAuthTransportContext,
         state: &str,
         code_challenge: Option<&str>,
     ) -> Result<OAuthAuthorizeResponse, OAuthError> {
+        if self.is_codex() {
+            return self.build_codex_authorize_url(ctx, state, code_challenge);
+        }
         let mut url = url::Url::parse(self.authorize_url())
             .map_err(|_| OAuthError::invalid_request("authorize_url must be absolute"))?;
         {
@@ -1052,6 +1257,51 @@ fn validate_xai_id_token_nonce(
     Ok(())
 }
 
+const CODEX_FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
+const CODEX_JSON_CONTENT_TYPE: &str = "application/json";
+
+/// Headers codex-rs puts on auth-server calls: the explicit `Content-Type`
+/// plus the client's `originator` (a default header of its HTTP client, next
+/// to `User-Agent`, which the executor injects from `ctx.user_agent`).
+fn codex_auth_headers(
+    ctx: &ProviderOAuthTransportContext,
+    content_type: &str,
+) -> BTreeMap<String, String> {
+    let mut headers = BTreeMap::from([("content-type".to_string(), content_type.to_string())]);
+    if let Some(originator) = codex_context_originator(ctx) {
+        headers.insert("originator".to_string(), originator.to_string());
+    }
+    headers
+}
+
+fn codex_context_originator(ctx: &ProviderOAuthTransportContext) -> Option<&str> {
+    ctx.originator
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Mirrors `urlencoding::encode`, which codex-rs uses for both the authorize
+/// URL and its hand-built token bodies: every byte outside the RFC 3986
+/// unreserved set (`A-Z a-z 0-9 - _ . ~`) becomes uppercase `%XX`. A space is
+/// therefore `%20`, unlike the `+` that `form_urlencoded` would emit.
+fn codex_percent_encode(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
 fn form_headers() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -1282,6 +1532,7 @@ mod tests {
             key_config: None,
             network: crate::network::OAuthNetworkContext::provider_operation(None),
             user_agent: None,
+            originator: None,
         };
         let response = adapter
             .build_authorize_url(&ctx, "state-1", Some("challenge-1"))
@@ -1400,6 +1651,7 @@ mod tests {
             key_config: None,
             network: crate::network::OAuthNetworkContext::provider_operation(None),
             user_agent: None,
+            originator: None,
         }
     }
 
@@ -1492,6 +1744,7 @@ mod tests {
             key_config: None,
             network: crate::network::OAuthNetworkContext::provider_operation(None),
             user_agent: None,
+            originator: None,
         };
         let account = ProviderOAuthAccount {
             provider_type: "codex".to_string(),
@@ -1526,10 +1779,12 @@ mod tests {
             .expect("mutex should lock")
             .clone()
             .expect("request should be captured");
-        let form = String::from_utf8(seen.body_bytes.expect("form body should exist"))
-            .expect("form body should be utf8");
-        assert!(form.contains("grant_type=refresh_token"));
-        assert!(form.contains("refresh_token=old-refresh-token"));
+        // Codex refresh is the codex-rs JSON shape, not a form body.
+        assert!(seen.body_bytes.is_none());
+        let body = seen.json_body.expect("codex refresh body should be json");
+        assert_eq!(body["client_id"], "app_EMoamEEZ73f0CkXaXp7hrann");
+        assert_eq!(body["grant_type"], "refresh_token");
+        assert_eq!(body["refresh_token"], "old-refresh-token");
     }
 
     /// Replays a queued response per call so a multi-leg flow can be driven end

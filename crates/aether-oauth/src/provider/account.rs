@@ -42,6 +42,12 @@ pub struct ProviderOAuthTransportContext {
     /// `user-agent` header so that admin maintenance traffic carries the same
     /// client fingerprint as ordinary pool requests for this account.
     pub user_agent: Option<String>,
+    /// Account-scoped codex `originator` (the client product that performed
+    /// the login, e.g. `codex_cli_rs`). codex-rs sends it both as an
+    /// `originator` request header on every auth-server call and as the
+    /// `originator` query parameter of the authorize URL.  Providers other
+    /// than codex ignore it.
+    pub originator: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

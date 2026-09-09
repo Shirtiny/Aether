@@ -2400,7 +2400,7 @@ async fn gateway_batch_imports_admin_provider_oauth_locally_with_trusted_admin_p
                     .lock()
                     .expect("mutex should lock")
                     .push(raw_body.clone());
-                if raw_body.contains("refresh_token=batch-refresh-success") {
+                if raw_body.contains(r#""refresh_token":"batch-refresh-success""#) {
                     Json(json!({
                         "access_token": "batch-imported-codex-access-token",
                         "refresh_token": "batch-imported-codex-refresh-token",
@@ -3633,11 +3633,11 @@ async fn gateway_imports_admin_provider_oauth_refresh_token_locally_with_trusted
         .expect("mutex should lock")
         .clone()
         .expect("token request should be recorded");
-    assert_eq!(seen_token.content_type, "application/x-www-form-urlencoded");
-    assert!(seen_token.body.contains("grant_type=refresh_token"));
+    assert_eq!(seen_token.content_type, "application/json");
+    assert!(seen_token.body.contains(r#""grant_type":"refresh_token""#));
     assert!(seen_token
         .body
-        .contains("refresh_token=provider-import-refresh-token"));
+        .contains(r#""refresh_token":"provider-import-refresh-token""#));
 
     let reloaded = provider_catalog_repository
         .list_keys_by_ids(&["key-codex-import-duplicate".to_string()])
@@ -4104,11 +4104,11 @@ async fn gateway_imports_admin_provider_oauth_refresh_token_over_active_expired_
         .expect("mutex should lock")
         .clone()
         .expect("token request should be recorded");
-    assert_eq!(seen_token.content_type, "application/x-www-form-urlencoded");
-    assert!(seen_token.body.contains("grant_type=refresh_token"));
+    assert_eq!(seen_token.content_type, "application/json");
+    assert!(seen_token.body.contains(r#""grant_type":"refresh_token""#));
     assert!(seen_token
         .body
-        .contains("refresh_token=provider-import-refresh-token"));
+        .contains(r#""refresh_token":"provider-import-refresh-token""#));
 
     let reloaded = provider_catalog_repository
         .list_keys_by_ids(&["key-codex-import-expired-duplicate".to_string()])
@@ -4161,7 +4161,7 @@ async fn gateway_import_invalidate_cached_oauth_entry_before_followup_resolution
         "/oauth/token",
         post(move |body: Bytes| async move {
             let body_text = String::from_utf8(body.to_vec()).unwrap_or_default();
-            if body_text.contains("refresh_token=old-refresh-token") {
+            if body_text.contains(r#""refresh_token":"old-refresh-token""#) {
                 Json(json!({
                     "access_token": "cached-old-codex-access-token",
                     "refresh_token": "cached-old-refresh-token",
@@ -4174,7 +4174,7 @@ async fn gateway_import_invalidate_cached_oauth_entry_before_followup_resolution
                 }))
             } else {
                 assert!(
-                    body_text.contains("refresh_token=provider-import-refresh-token"),
+                    body_text.contains(r#""refresh_token":"provider-import-refresh-token""#),
                     "unexpected token request body: {body_text}"
                 );
                 Json(json!({
@@ -4398,7 +4398,7 @@ async fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtim
                     assert_eq!(plan.url, "https://oauth.example/oauth/token");
                     assert_eq!(
                         plan.headers.get("content-type").map(String::as_str),
-                        Some("application/x-www-form-urlencoded")
+                        Some("application/json")
                     );
                     assert_eq!(
                         plan.headers
@@ -6948,47 +6948,58 @@ async fn gateway_consecutive_manual_oauth_refresh_uses_rotated_refresh_token() {
                 if plan.request_id == "provider-oauth:local-refresh-token" {
                     use base64::Engine as _;
 
+                    // Codex refresh is a JSON body (codex-rs shape), which the
+                    // gateway packs as `json_body`; keep the raw-bytes fallback
+                    // for form-encoded providers.
                     let body_text = plan
                         .body
-                        .body_bytes_b64
-                        .as_deref()
-                        .and_then(|body| {
-                            base64::engine::general_purpose::STANDARD.decode(body).ok()
+                        .json_body
+                        .as_ref()
+                        .map(serde_json::Value::to_string)
+                        .or_else(|| {
+                            plan.body
+                                .body_bytes_b64
+                                .as_deref()
+                                .and_then(|body| {
+                                    base64::engine::general_purpose::STANDARD.decode(body).ok()
+                                })
+                                .and_then(|body| String::from_utf8(body).ok())
                         })
-                        .and_then(|body| String::from_utf8(body).ok())
                         .unwrap_or_default();
                     refresh_request_bodies_inner
                         .lock()
                         .expect("mutex should lock")
                         .push(body_text.clone());
 
-                    let (access_token, refresh_token) =
-                        if body_text.contains("refresh_token=old-codex-refresh-token") {
-                            (
-                                "refreshed-codex-access-token",
-                                "rotated-codex-refresh-token",
-                            )
-                        } else if body_text.contains("refresh_token=rotated-codex-refresh-token") {
-                            (
-                                "refreshed-codex-access-token-2",
-                                "rotated-codex-refresh-token-2",
-                            )
-                        } else {
-                            return Json(json!({
-                                "request_id": plan.request_id,
-                                "status_code": 401,
-                                "headers": {
-                                    "content-type": "application/json"
-                                },
-                                "body": {
-                                    "json_body": {
-                                        "error": {
-                                            "message": "unexpected refresh token"
-                                        }
+                    let (access_token, refresh_token) = if body_text
+                        .contains(r#""refresh_token":"old-codex-refresh-token""#)
+                    {
+                        (
+                            "refreshed-codex-access-token",
+                            "rotated-codex-refresh-token",
+                        )
+                    } else if body_text.contains(r#""refresh_token":"rotated-codex-refresh-token""#)
+                    {
+                        (
+                            "refreshed-codex-access-token-2",
+                            "rotated-codex-refresh-token-2",
+                        )
+                    } else {
+                        return Json(json!({
+                            "request_id": plan.request_id,
+                            "status_code": 401,
+                            "headers": {
+                                "content-type": "application/json"
+                            },
+                            "body": {
+                                "json_body": {
+                                    "error": {
+                                        "message": "unexpected refresh token"
                                     }
                                 }
-                            }));
-                        };
+                            }
+                        }));
+                    };
 
                     Json(json!({
                         "request_id": plan.request_id,
@@ -7098,12 +7109,12 @@ async fn gateway_consecutive_manual_oauth_refresh_uses_rotated_refresh_token() {
         .clone();
     assert_eq!(bodies.len(), 2);
     assert!(
-        bodies[0].contains("refresh_token=old-codex-refresh-token"),
+        bodies[0].contains(r#""refresh_token":"old-codex-refresh-token""#),
         "unexpected first refresh body: {}",
         bodies[0]
     );
     assert!(
-        bodies[1].contains("refresh_token=rotated-codex-refresh-token"),
+        bodies[1].contains(r#""refresh_token":"rotated-codex-refresh-token""#),
         "unexpected second refresh body: {}",
         bodies[1]
     );
@@ -7146,14 +7157,23 @@ async fn gateway_concurrent_manual_oauth_refresh_uses_rotated_refresh_token_afte
                 if plan.request_id == "provider-oauth:local-refresh-token" {
                     use base64::Engine as _;
 
+                    // Codex refresh is a JSON body (codex-rs shape), which the
+                    // gateway packs as `json_body`; keep the raw-bytes fallback
+                    // for form-encoded providers.
                     let body_text = plan
                         .body
-                        .body_bytes_b64
-                        .as_deref()
-                        .and_then(|body| {
-                            base64::engine::general_purpose::STANDARD.decode(body).ok()
+                        .json_body
+                        .as_ref()
+                        .map(serde_json::Value::to_string)
+                        .or_else(|| {
+                            plan.body
+                                .body_bytes_b64
+                                .as_deref()
+                                .and_then(|body| {
+                                    base64::engine::general_purpose::STANDARD.decode(body).ok()
+                                })
+                                .and_then(|body| String::from_utf8(body).ok())
                         })
-                        .and_then(|body| String::from_utf8(body).ok())
                         .unwrap_or_default();
                     refresh_request_bodies_inner
                         .lock()
@@ -7161,13 +7181,13 @@ async fn gateway_concurrent_manual_oauth_refresh_uses_rotated_refresh_token_afte
                         .push(body_text.clone());
 
                     let (access_token, refresh_token, delay_ms) =
-                        if body_text.contains("refresh_token=old-codex-refresh-token") {
+                        if body_text.contains(r#""refresh_token":"old-codex-refresh-token""#) {
                             (
                                 "refreshed-codex-access-token",
                                 "rotated-codex-refresh-token",
                                 200u64,
                             )
-                        } else if body_text.contains("refresh_token=rotated-codex-refresh-token") {
+                        } else if body_text.contains(r#""refresh_token":"rotated-codex-refresh-token""#) {
                             (
                                 "refreshed-codex-access-token-2",
                                 "rotated-codex-refresh-token-2",
@@ -7330,12 +7350,12 @@ async fn gateway_concurrent_manual_oauth_refresh_uses_rotated_refresh_token_afte
         .clone();
     assert_eq!(bodies.len(), 2);
     assert!(
-        bodies[0].contains("refresh_token=old-codex-refresh-token"),
+        bodies[0].contains(r#""refresh_token":"old-codex-refresh-token""#),
         "unexpected first refresh body: {}",
         bodies[0]
     );
     assert!(
-        bodies[1].contains("refresh_token=rotated-codex-refresh-token"),
+        bodies[1].contains(r#""refresh_token":"rotated-codex-refresh-token""#),
         "unexpected second refresh body: {}",
         bodies[1]
     );
@@ -7379,21 +7399,30 @@ async fn gateway_manual_oauth_refresh_prefers_fresher_transport_auth_config_over
                 if plan.request_id == "provider-oauth:local-refresh-token" {
                     use base64::Engine as _;
 
+                    // Codex refresh is a JSON body (codex-rs shape), which the
+                    // gateway packs as `json_body`; keep the raw-bytes fallback
+                    // for form-encoded providers.
                     let body_text = plan
                         .body
-                        .body_bytes_b64
-                        .as_deref()
-                        .and_then(|body| {
-                            base64::engine::general_purpose::STANDARD.decode(body).ok()
+                        .json_body
+                        .as_ref()
+                        .map(serde_json::Value::to_string)
+                        .or_else(|| {
+                            plan.body
+                                .body_bytes_b64
+                                .as_deref()
+                                .and_then(|body| {
+                                    base64::engine::general_purpose::STANDARD.decode(body).ok()
+                                })
+                                .and_then(|body| String::from_utf8(body).ok())
                         })
-                        .and_then(|body| String::from_utf8(body).ok())
                         .unwrap_or_default();
                     refresh_request_bodies_inner
                         .lock()
                         .expect("mutex should lock")
                         .push(body_text.clone());
 
-                    if body_text.contains("refresh_token=old-codex-refresh-token") {
+                    if body_text.contains(r#""refresh_token":"old-codex-refresh-token""#) {
                         return Json(json!({
                             "request_id": plan.request_id,
                             "status_code": 200,
@@ -7415,7 +7444,7 @@ async fn gateway_manual_oauth_refresh_prefers_fresher_transport_auth_config_over
                         }));
                     }
 
-                    if body_text.contains("refresh_token=fresh-codex-refresh-token") {
+                    if body_text.contains(r#""refresh_token":"fresh-codex-refresh-token""#) {
                         return Json(json!({
                             "request_id": plan.request_id,
                             "status_code": 200,
@@ -7576,12 +7605,12 @@ async fn gateway_manual_oauth_refresh_prefers_fresher_transport_auth_config_over
         .clone();
     assert_eq!(bodies.len(), 2);
     assert!(
-        bodies[0].contains("refresh_token=old-codex-refresh-token"),
+        bodies[0].contains(r#""refresh_token":"old-codex-refresh-token""#),
         "unexpected first refresh body: {}",
         bodies[0]
     );
     assert!(
-        bodies[1].contains("refresh_token=fresh-codex-refresh-token"),
+        bodies[1].contains(r#""refresh_token":"fresh-codex-refresh-token""#),
         "unexpected second refresh body: {}",
         bodies[1]
     );

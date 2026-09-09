@@ -1,9 +1,10 @@
 use super::super::duplicates::find_duplicate_provider_oauth_key;
 use super::super::errors::build_internal_control_error_response;
 use super::super::provisioning::{
-    build_provider_oauth_auth_config_from_token_payload, create_provider_oauth_catalog_key,
-    provider_oauth_active_api_formats, provider_oauth_key_proxy_value,
-    update_existing_provider_oauth_catalog_key,
+    build_provider_oauth_auth_config_from_token_payload,
+    create_provider_oauth_catalog_key_with_client_identity, provider_oauth_active_api_formats,
+    provider_oauth_key_proxy_value,
+    update_existing_provider_oauth_catalog_key_with_client_identity,
 };
 use super::super::runtime::{
     resolve_provider_oauth_runtime_endpoints,
@@ -11,8 +12,8 @@ use super::super::runtime::{
 };
 use super::super::state::{
     admin_provider_oauth_template, build_admin_provider_oauth_backend_unavailable_response,
-    exchange_admin_provider_oauth_refresh_token, is_fixed_provider_type_for_provider_oauth,
-    json_u64_value,
+    exchange_admin_provider_oauth_refresh_token, generate_provider_oauth_nonce,
+    is_fixed_provider_type_for_provider_oauth, json_u64_value, AdminProviderOAuthClientIdentity,
 };
 use super::helpers::admin_provider_oauth_key_name_from_auth_config;
 use super::token_import::{
@@ -219,6 +220,7 @@ fn apply_single_import_hints(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_admin_provider_oauth_single_import_tokens(
     state: &AdminAppState<'_>,
     template: Option<AdminProviderOAuthTemplate>,
@@ -227,6 +229,7 @@ async fn resolve_admin_provider_oauth_single_import_tokens(
     access_token: Option<&str>,
     imported_expires_at: Option<u64>,
     request_proxy: Option<ProxySnapshot>,
+    client_identity: Option<&AdminProviderOAuthClientIdentity>,
 ) -> Result<AdminProviderOAuthSingleImportTokens, Response<Body>> {
     if let Some(refresh_token) = refresh_token
         .map(str::trim)
@@ -263,6 +266,7 @@ async fn resolve_admin_provider_oauth_single_import_tokens(
                 template,
                 refresh_token,
                 request_proxy.clone(),
+                client_identity,
             )
             .await
         {
@@ -366,6 +370,7 @@ async fn resolve_admin_provider_oauth_windsurf_single_import_tokens(
             request_proxy.clone(),
         ),
         user_agent: None,
+        originator: None,
     };
     let executor = crate::oauth::GatewayOAuthHttpExecutor::new(*state);
     let service = ProviderOAuthService::with_builtin_adapters();
@@ -519,6 +524,14 @@ pub(super) async fn handle_admin_provider_oauth_import_refresh_token(
         )
         .await;
     let key_proxy = provider_oauth_key_proxy_value(proxy_node_id.as_deref());
+    // The account is unknown until the refresh exchange answers, so pick the
+    // codex client identity up front (seeded by a fresh nonce), authenticate
+    // with it and freeze the same pair into the key.
+    let client_identity = AdminProviderOAuthClientIdentity::for_new_codex_login(
+        &provider_type,
+        provider.config.as_ref(),
+        &generate_provider_oauth_nonce(),
+    );
 
     let resolved_import = if provider_type == "windsurf" {
         if !import_payload_has_windsurf_credentials(&raw_payload) {
@@ -555,6 +568,7 @@ pub(super) async fn handle_admin_provider_oauth_import_refresh_token(
             access_token_input.as_deref(),
             imported_expires_at,
             request_proxy.clone(),
+            client_identity.as_ref(),
         )
         .await
         {
@@ -590,17 +604,18 @@ pub(super) async fn handle_admin_provider_oauth_import_refresh_token(
 
     let replaced = duplicate.is_some();
     let persisted_key = if let Some(existing_key) = duplicate {
-        match state
-            .update_existing_provider_oauth_catalog_key(
-                &existing_key,
-                &provider_type,
-                &access_token,
-                &auth_config,
-                &api_formats,
-                key_proxy.clone(),
-                expires_at,
-            )
-            .await?
+        match update_existing_provider_oauth_catalog_key_with_client_identity(
+            state,
+            &existing_key,
+            &provider_type,
+            &access_token,
+            &auth_config,
+            &api_formats,
+            key_proxy.clone(),
+            expires_at,
+            client_identity.as_ref(),
+        )
+        .await?
         {
             Some(key) => key,
             None => {
@@ -614,18 +629,19 @@ pub(super) async fn handle_admin_provider_oauth_import_refresh_token(
         let name = name.unwrap_or_else(|| {
             admin_provider_oauth_key_name_from_auth_config(&provider_type, &auth_config, None)
         });
-        match state
-            .create_provider_oauth_catalog_key(
-                &provider_id,
-                &provider_type,
-                &name,
-                &access_token,
-                &auth_config,
-                &api_formats,
-                key_proxy.clone(),
-                expires_at,
-            )
-            .await?
+        match create_provider_oauth_catalog_key_with_client_identity(
+            state,
+            &provider_id,
+            &provider_type,
+            &name,
+            &access_token,
+            &auth_config,
+            &api_formats,
+            key_proxy.clone(),
+            expires_at,
+            client_identity.as_ref(),
+        )
+        .await?
         {
             Some(key) => key,
             None => {

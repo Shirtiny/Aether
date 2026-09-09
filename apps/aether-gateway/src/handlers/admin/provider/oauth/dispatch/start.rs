@@ -1,13 +1,16 @@
 use super::super::errors::build_internal_control_error_response;
 use super::super::state::{
     admin_provider_oauth_template, build_provider_oauth_start_response,
+    generate_codex_oauth_pkce_verifier, generate_codex_oauth_state, generate_provider_oauth_nonce,
     generate_provider_oauth_pkce_verifier, is_fixed_provider_type_for_provider_oauth,
-    provider_oauth_pkce_s256,
+    provider_oauth_pkce_s256, AdminProviderOAuthClientIdentity,
 };
 use crate::handlers::admin::provider::shared::paths::{
     admin_provider_oauth_start_key_id, admin_provider_oauth_start_provider_id,
 };
-use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
+use crate::handlers::admin::request::{
+    AdminAppState, AdminProviderOAuthTemplate, AdminRequestContext,
+};
 use crate::provider_key_auth::provider_key_is_oauth_managed;
 use crate::GatewayError;
 use axum::{
@@ -16,6 +19,25 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+
+/// Generates the `state` nonce and PKCE verifier for an OAuth start. Codex
+/// mirrors codex-rs (32 random bytes base64url for `state`, 64 random bytes
+/// base64url for the PKCE verifier); every other provider keeps its existing
+/// hex-nonce / hex-verifier shape.
+fn generate_provider_oauth_start_secrets(
+    template: &AdminProviderOAuthTemplate,
+) -> (String, Option<String>) {
+    if template.provider_type == "codex" {
+        let nonce = generate_codex_oauth_state();
+        let pkce_verifier = template.use_pkce.then(generate_codex_oauth_pkce_verifier);
+        return (nonce, pkce_verifier);
+    }
+    let nonce = generate_provider_oauth_nonce();
+    let pkce_verifier = template
+        .use_pkce
+        .then(generate_provider_oauth_pkce_verifier);
+    (nonce, pkce_verifier)
+}
 
 pub(super) async fn handle_admin_provider_oauth_start_key(
     state: &AdminAppState<'_>,
@@ -76,32 +98,39 @@ pub(super) async fn handle_admin_provider_oauth_start_key(
         ));
     };
 
-    let pkce_verifier = template
-        .use_pkce
-        .then(generate_provider_oauth_pkce_verifier);
+    let (nonce, pkce_verifier) = generate_provider_oauth_start_secrets(&template);
     let code_challenge = pkce_verifier.as_deref().map(provider_oauth_pkce_s256);
-    let nonce = match state
+    // Re-authorizing an existing key keeps the client identity its pool
+    // traffic already presents, so the login and the later API calls agree.
+    let client_identity = AdminProviderOAuthClientIdentity::for_existing_codex_key(
+        &provider_type,
+        provider.config.as_ref(),
+        key.fingerprint.as_ref(),
+        &key.id,
+    );
+    if state
         .save_provider_oauth_state(
+            &nonce,
             &key_id,
             &provider_id,
             &provider_type,
             pkce_verifier.as_deref(),
+            client_identity.as_ref(),
         )
         .await
+        .is_err()
     {
-        Ok(nonce) => nonce,
-        Err(_) => {
-            return Ok(build_internal_control_error_response(
-                http::StatusCode::SERVICE_UNAVAILABLE,
-                "provider oauth redis unavailable",
-            ));
-        }
-    };
+        return Ok(build_internal_control_error_response(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "provider oauth redis unavailable",
+        ));
+    }
 
     Ok(Json(build_provider_oauth_start_response(
         template,
         &nonce,
         code_challenge.as_deref(),
+        client_identity.as_ref(),
     ))
     .into_response())
 }
@@ -153,27 +182,38 @@ pub(super) async fn handle_admin_provider_oauth_start_provider(
         ));
     };
 
-    let pkce_verifier = template
-        .use_pkce
-        .then(generate_provider_oauth_pkce_verifier);
+    let (nonce, pkce_verifier) = generate_provider_oauth_start_secrets(&template);
     let code_challenge = pkce_verifier.as_deref().map(provider_oauth_pkce_s256);
-    let nonce = match state
-        .save_provider_oauth_state("", &provider_id, &provider_type, pkce_verifier.as_deref())
+    // The account is unknown until the callback, so pick the client identity
+    // now (seeded by the state nonce); the callback freezes it into the key.
+    let client_identity = AdminProviderOAuthClientIdentity::for_new_codex_login(
+        &provider_type,
+        provider.config.as_ref(),
+        &nonce,
+    );
+    if state
+        .save_provider_oauth_state(
+            &nonce,
+            "",
+            &provider_id,
+            &provider_type,
+            pkce_verifier.as_deref(),
+            client_identity.as_ref(),
+        )
         .await
+        .is_err()
     {
-        Ok(nonce) => nonce,
-        Err(_) => {
-            return Ok(build_internal_control_error_response(
-                http::StatusCode::SERVICE_UNAVAILABLE,
-                "provider oauth redis unavailable",
-            ));
-        }
-    };
+        return Ok(build_internal_control_error_response(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "provider oauth redis unavailable",
+        ));
+    }
 
     Ok(Json(build_provider_oauth_start_response(
         template,
         &nonce,
         code_challenge.as_deref(),
+        client_identity.as_ref(),
     ))
     .into_response())
 }

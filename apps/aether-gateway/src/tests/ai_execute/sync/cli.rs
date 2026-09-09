@@ -3598,19 +3598,12 @@ async fn gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_ref
         .expect("mutex should lock")
         .clone()
         .expect("refresh request should be captured");
+    // codex-rs `request_chatgpt_token_refresh` posts JSON in this exact field order.
+    assert_eq!(seen_refresh_request.content_type, "application/json");
     assert_eq!(
-        seen_refresh_request.content_type,
-        "application/x-www-form-urlencoded"
+        seen_refresh_request.body,
+        r#"{"client_id":"app_EMoamEEZ73f0CkXaXp7hrann","grant_type":"refresh_token","refresh_token":"rt-codex-local-123"}"#
     );
-    assert!(seen_refresh_request
-        .body
-        .contains("grant_type=refresh_token"));
-    assert!(seen_refresh_request
-        .body
-        .contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
-    assert!(seen_refresh_request
-        .body
-        .contains("refresh_token=rt-codex-local-123"));
     assert_eq!(*refresh_hits.lock().expect("mutex should lock"), 1);
 
     let seen_execution_runtime_request = seen_execution_runtime

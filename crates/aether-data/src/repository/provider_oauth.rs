@@ -44,6 +44,14 @@ pub struct StoredAdminProviderOAuthState {
     pub provider_id: String,
     pub provider_type: String,
     pub pkce_verifier: Option<String>,
+    /// Client profile chosen when the authorize URL was built (codex only).
+    /// The token exchange must present the same `User-Agent`/`originator`
+    /// the authorize URL advertised, and the created key freezes it so pool
+    /// traffic keeps the identity the account logged in with.
+    #[serde(default)]
+    pub client_user_agent: Option<String>,
+    #[serde(default)]
+    pub client_originator: Option<String>,
 }
 
 pub fn provider_oauth_device_session_storage_key(session_id: &str) -> String {

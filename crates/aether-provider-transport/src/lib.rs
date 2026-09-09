@@ -90,8 +90,9 @@ pub use network::{
     TransportTunnelAffinityLookup, TransportTunnelAttachmentOwner,
 };
 pub use oauth_refresh::{
-    resolve_oauth_maintenance_user_agent, supports_local_oauth_request_auth_resolution,
-    CachedOAuthEntry, LocalOAuthHttpExecutor, LocalOAuthHttpRequest, LocalOAuthHttpResponse,
+    resolve_oauth_maintenance_client_profile, resolve_oauth_maintenance_user_agent,
+    supports_local_oauth_request_auth_resolution, CachedOAuthEntry, CodexOAuthClientProfile,
+    LocalOAuthHttpExecutor, LocalOAuthHttpRequest, LocalOAuthHttpResponse,
     LocalOAuthRefreshCoordinator, LocalOAuthRefreshError, LocalResolvedOAuthRequestAuth,
     ReqwestLocalOAuthHttpExecutor,
 };

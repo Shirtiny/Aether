@@ -15,8 +15,9 @@ use super::progress::{
 use crate::handlers::admin::provider::oauth::duplicates::find_duplicate_provider_oauth_key;
 use crate::handlers::admin::provider::oauth::provisioning::build_provider_oauth_auth_config_from_token_payload;
 use crate::handlers::admin::provider::oauth::provisioning::{
-    create_provider_oauth_catalog_key, provider_oauth_active_api_formats,
-    provider_oauth_key_proxy_value, update_existing_provider_oauth_catalog_key,
+    create_provider_oauth_catalog_key_with_client_identity, provider_oauth_active_api_formats,
+    provider_oauth_key_proxy_value,
+    update_existing_provider_oauth_catalog_key_with_client_identity,
 };
 use crate::handlers::admin::provider::oauth::runtime::{
     resolve_provider_oauth_runtime_endpoints,
@@ -24,6 +25,7 @@ use crate::handlers::admin::provider::oauth::runtime::{
 };
 use crate::handlers::admin::provider::oauth::state::{
     admin_provider_oauth_template, exchange_admin_provider_oauth_refresh_token,
+    generate_provider_oauth_nonce, AdminProviderOAuthClientIdentity,
 };
 use crate::handlers::admin::provider::shared::support::ADMIN_PROVIDER_OAUTH_DATA_UNAVAILABLE_DETAIL;
 use crate::handlers::admin::request::{AdminAppState, AdminProviderOAuthTemplate};
@@ -101,6 +103,7 @@ async fn resolve_admin_provider_oauth_batch_import_tokens(
     provider_type: &str,
     entry: &AdminProviderOAuthBatchImportEntry,
     request_proxy: Option<ProxySnapshot>,
+    client_identity: Option<&AdminProviderOAuthClientIdentity>,
 ) -> Result<AdminProviderOAuthResolvedBatchImport, String> {
     let refresh_token = entry
         .refresh_token
@@ -130,6 +133,7 @@ async fn resolve_admin_provider_oauth_batch_import_tokens(
                 request_proxy.clone(),
             ),
             user_agent: None,
+            originator: None,
         };
         let executor = crate::oauth::GatewayOAuthHttpExecutor::new(*state);
         let result = ProviderOAuthService::with_builtin_adapters()
@@ -195,6 +199,7 @@ async fn resolve_admin_provider_oauth_batch_import_tokens(
             template,
             refresh_token,
             request_proxy.clone(),
+            client_identity,
         )
         .await
         {
@@ -360,12 +365,20 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
             continue;
         }
 
+        // Each entry is a separate account: pick its codex client identity
+        // up front, authenticate with it and freeze the same pair into the key.
+        let client_identity = AdminProviderOAuthClientIdentity::for_new_codex_login(
+            provider_type,
+            provider.config.as_ref(),
+            &generate_provider_oauth_nonce(),
+        );
         let resolved_import = match resolve_admin_provider_oauth_batch_import_tokens(
             state,
             template,
             provider_type,
             entry,
             request_proxy.clone(),
+            client_identity.as_ref(),
         )
         .await
         {
@@ -421,7 +434,7 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
 
         let replaced = duplicate.is_some();
         let (persisted_key, key_name) = if let Some(existing_key) = duplicate {
-            match update_existing_provider_oauth_catalog_key(
+            match update_existing_provider_oauth_catalog_key_with_client_identity(
                 state,
                 &existing_key,
                 provider_type,
@@ -430,6 +443,7 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
                 &api_formats,
                 key_proxy.clone(),
                 expires_at,
+                client_identity.as_ref(),
             )
             .await?
             {
@@ -459,7 +473,7 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
                 &auth_config,
                 Some(index),
             );
-            match create_provider_oauth_catalog_key(
+            match create_provider_oauth_catalog_key_with_client_identity(
                 state,
                 provider_id,
                 provider_type,
@@ -469,6 +483,7 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
                 &api_formats,
                 key_proxy.clone(),
                 expires_at,
+                client_identity.as_ref(),
             )
             .await?
             {

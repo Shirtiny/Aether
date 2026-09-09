@@ -35,6 +35,36 @@ pub fn provider_oauth_pkce_s256(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest)
 }
 
+/// OAuth `state` in the shape codex-rs `login/src/server.rs::generate_state`
+/// produces: 32 random bytes, base64url without padding (43 characters).
+pub fn generate_codex_oauth_state() -> String {
+    URL_SAFE_NO_PAD.encode(random_bytes_32(b"codex-oauth-state"))
+}
+
+/// PKCE verifier in the shape codex-rs `login/src/pkce.rs::generate_pkce`
+/// produces: 64 random bytes, base64url without padding (86 characters).
+pub fn generate_codex_oauth_pkce_verifier() -> String {
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(&random_bytes_32(b"codex-oauth-pkce-0"));
+    bytes.extend_from_slice(&random_bytes_32(b"codex-oauth-pkce-1"));
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// 32 uniformly distributed random bytes without adding an RNG dependency:
+/// three fresh v4 UUIDs (366 bits from the OS CSPRNG via `uuid`) whitened
+/// through SHA-256 so the fixed version/variant bits never reach the output.
+fn random_bytes_32(domain: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for _ in 0..3 {
+        hasher.update(Uuid::new_v4().as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 32];
+    bytes.copy_from_slice(&digest);
+    bytes
+}
+
 pub fn parse_provider_oauth_callback_params(callback_url: &str) -> BTreeMap<String, String> {
     let mut merged = BTreeMap::new();
     let raw_callback_url = callback_url.trim();
@@ -361,7 +391,10 @@ pub fn build_kiro_device_key_name(email: Option<&str>, refresh_token: Option<&st
 
 #[cfg(test)]
 mod tests {
-    use super::{enrich_admin_provider_oauth_auth_config, parse_provider_oauth_callback_params};
+    use super::{
+        enrich_admin_provider_oauth_auth_config, generate_codex_oauth_pkce_verifier,
+        generate_codex_oauth_state, parse_provider_oauth_callback_params,
+    };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use serde_json::json;
 
@@ -369,6 +402,30 @@ mod tests {
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
         let payload = URL_SAFE_NO_PAD.encode(payload.to_string());
         format!("{header}.{payload}.sig")
+    }
+
+    fn is_base64url_no_pad(value: &str) -> bool {
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    }
+
+    #[test]
+    fn codex_oauth_state_matches_codex_rs_generate_state_shape() {
+        let state = generate_codex_oauth_state();
+        assert_eq!(state.len(), 43, "{state}");
+        assert!(is_base64url_no_pad(&state), "{state}");
+        assert_eq!(URL_SAFE_NO_PAD.decode(&state).expect("decode").len(), 32);
+        assert_ne!(state, generate_codex_oauth_state());
+    }
+
+    #[test]
+    fn codex_oauth_pkce_verifier_matches_codex_rs_generate_pkce_shape() {
+        let verifier = generate_codex_oauth_pkce_verifier();
+        assert_eq!(verifier.len(), 86, "{verifier}");
+        assert!(is_base64url_no_pad(&verifier), "{verifier}");
+        assert_eq!(URL_SAFE_NO_PAD.decode(&verifier).expect("decode").len(), 64);
+        assert_ne!(verifier, generate_codex_oauth_pkce_verifier());
     }
 
     #[test]

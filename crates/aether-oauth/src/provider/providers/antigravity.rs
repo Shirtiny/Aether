@@ -138,6 +138,7 @@ mod tests {
             key_config: None,
             network: crate::network::OAuthNetworkContext::provider_operation(None),
             user_agent: None,
+            originator: None,
         };
         let account = ProviderOAuthAccount {
             provider_type: "antigravity".to_string(),

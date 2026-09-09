@@ -1,9 +1,10 @@
 use super::super::super::duplicates::find_duplicate_provider_oauth_key;
 use super::super::super::errors::build_internal_control_error_response;
 use super::super::super::provisioning::{
-    build_provider_oauth_auth_config_from_token_payload, create_provider_oauth_catalog_key,
-    provider_oauth_active_api_formats, provider_oauth_key_proxy_value,
-    update_existing_provider_oauth_catalog_key,
+    build_provider_oauth_auth_config_from_token_payload,
+    create_provider_oauth_catalog_key_with_client_identity, provider_oauth_active_api_formats,
+    provider_oauth_key_proxy_value,
+    update_existing_provider_oauth_catalog_key_with_client_identity,
 };
 use super::super::super::runtime::{
     resolve_provider_oauth_runtime_endpoints,
@@ -11,7 +12,7 @@ use super::super::super::runtime::{
 };
 use super::super::super::state::{
     admin_provider_oauth_template, build_admin_provider_oauth_backend_unavailable_response,
-    is_fixed_provider_type_for_provider_oauth,
+    is_fixed_provider_type_for_provider_oauth, AdminProviderOAuthClientIdentity,
 };
 use super::shared::{
     parse_admin_provider_oauth_complete_callback, parse_admin_provider_oauth_complete_request_body,
@@ -133,6 +134,9 @@ pub(super) async fn handle_admin_provider_oauth_complete_provider(
         )
         .await;
     let key_proxy = provider_oauth_key_proxy_value(payload.proxy_node_id.as_deref());
+    // Replay the client identity the authorize URL advertised on the token
+    // exchange, then freeze it into the key so pool traffic keeps using it.
+    let client_identity = AdminProviderOAuthClientIdentity::from_stored_state(&state_data);
 
     let token_payload = match state
         .exchange_admin_provider_oauth_code(
@@ -141,6 +145,7 @@ pub(super) async fn handle_admin_provider_oauth_complete_provider(
             &callback.state_nonce,
             state_data.pkce_verifier.as_deref(),
             request_proxy.clone(),
+            client_identity.as_ref(),
         )
         .await
     {
@@ -173,17 +178,18 @@ pub(super) async fn handle_admin_provider_oauth_complete_provider(
 
     let replaced = duplicate.is_some();
     let persisted_key = if let Some(existing_key) = duplicate {
-        match state
-            .update_existing_provider_oauth_catalog_key(
-                &existing_key,
-                &provider_type,
-                &access_token,
-                &auth_config,
-                &api_formats,
-                key_proxy.clone(),
-                expires_at,
-            )
-            .await?
+        match update_existing_provider_oauth_catalog_key_with_client_identity(
+            state,
+            &existing_key,
+            &provider_type,
+            &access_token,
+            &auth_config,
+            &api_formats,
+            key_proxy.clone(),
+            expires_at,
+            client_identity.as_ref(),
+        )
+        .await?
         {
             Some(key) => key,
             None => {
@@ -214,18 +220,19 @@ pub(super) async fn handle_admin_provider_oauth_complete_provider(
                         .unwrap_or(0)
                 )
             });
-        match state
-            .create_provider_oauth_catalog_key(
-                &provider_id,
-                &provider_type,
-                &name,
-                &access_token,
-                &auth_config,
-                &api_formats,
-                key_proxy.clone(),
-                expires_at,
-            )
-            .await?
+        match create_provider_oauth_catalog_key_with_client_identity(
+            state,
+            &provider_id,
+            &provider_type,
+            &name,
+            &access_token,
+            &auth_config,
+            &api_formats,
+            key_proxy.clone(),
+            expires_at,
+            client_identity.as_ref(),
+        )
+        .await?
         {
             Some(key) => key,
             None => {

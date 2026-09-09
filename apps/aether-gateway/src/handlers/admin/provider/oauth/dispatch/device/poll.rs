@@ -822,6 +822,7 @@ async fn handle_admin_provider_oauth_grok_device_poll(
             request_proxy.clone(),
         ),
         user_agent: None,
+        originator: None,
     };
     let Some(adapter) = GenericProviderOAuthAdapter::for_provider_type("grok") else {
         return Ok(build_internal_control_error_response(
@@ -1123,6 +1124,7 @@ async fn handle_admin_provider_oauth_windsurf_browser_device_poll(
             request_proxy.clone(),
         ),
         user_agent: None,
+        originator: None,
     };
     let executor = crate::oauth::GatewayOAuthHttpExecutor::new(*state);
     let result = match ProviderOAuthService::with_builtin_adapters()

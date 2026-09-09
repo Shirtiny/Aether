@@ -222,13 +222,25 @@ impl OAuthHttpExecutor for ProviderOAuthLocalHttpExecutor<'_> {
 pub fn resolve_oauth_maintenance_user_agent(
     transport: &GatewayProviderTransportSnapshot,
 ) -> Option<String> {
-    codex_pool_account_user_agent(transport)
+    resolve_oauth_maintenance_client_profile(transport).map(|profile| profile.user_agent)
+}
+
+/// Resolves the full client identity (`User-Agent` + `originator`) the
+/// account's codex pool profile assigns. codex-rs sends both as default headers
+/// on every auth call, so maintenance traffic must carry the pair the pool
+/// traffic uses, not just the UA.
+pub fn resolve_oauth_maintenance_client_profile(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<CodexOAuthClientProfile> {
+    codex_pool_account_client_profile(transport)
 }
 
 pub(crate) fn provider_oauth_transport_context_from_snapshot(
     transport: &GatewayProviderTransportSnapshot,
 ) -> ProviderOAuthTransportContext {
-    let user_agent = resolve_oauth_maintenance_user_agent(transport);
+    let (user_agent, originator) = resolve_oauth_maintenance_client_profile(transport)
+        .map(|profile| (Some(profile.user_agent), Some(profile.originator)))
+        .unwrap_or((None, None));
     ProviderOAuthTransportContext {
         provider_id: transport.provider.id.clone(),
         provider_type: transport.provider.provider_type.clone(),
@@ -242,6 +254,7 @@ pub(crate) fn provider_oauth_transport_context_from_snapshot(
         key_config: None,
         network: OAuthNetworkContext::provider_operation(None),
         user_agent,
+        originator,
     }
 }
 
@@ -258,13 +271,15 @@ pub(crate) fn provider_oauth_transport_context_from_snapshot(
 const DEFAULT_CODEX_POOL_CLIENT_HEADER_PROFILES_JSON: &str =
     include_str!("../../../../resources/codex-client-header-profiles.json");
 
-/// A single codex client header profile: the UA sent on the wire plus the
-/// originator used only to score/stabilize profile selection.
-#[derive(Clone)]
-struct Profile {
-    user_agent: String,
-    originator: String,
+/// A single codex client header profile: the `User-Agent` and `originator`
+/// pair sent on the wire (both also feed profile-selection scoring).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexOAuthClientProfile {
+    pub user_agent: String,
+    pub originator: String,
 }
+
+type Profile = CodexOAuthClientProfile;
 
 #[derive(serde::Deserialize)]
 struct DefaultCodexClientHeaderProfile {
@@ -296,7 +311,9 @@ fn default_codex_client_header_profiles() -> Option<Vec<Profile>> {
     (!profiles.is_empty()).then_some(profiles)
 }
 
-fn codex_pool_account_user_agent(transport: &GatewayProviderTransportSnapshot) -> Option<String> {
+fn codex_pool_account_client_profile(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<Profile> {
     use sha2::{Digest, Sha256};
 
     if !transport
@@ -370,15 +387,20 @@ fn codex_pool_account_user_agent(transport: &GatewayProviderTransportSnapshot) -
         .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .and_then(|v| {
-            ["account_id", "accountId", "chatgpt_account_id", "chatgptAccountId"]
-                .iter()
-                .find_map(|key| {
-                    v.get(*key)
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|v| !v.is_empty())
-                        .map(ToOwned::to_owned)
-                })
+            [
+                "account_id",
+                "accountId",
+                "chatgpt_account_id",
+                "chatgptAccountId",
+            ]
+            .iter()
+            .find_map(|key| {
+                v.get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(ToOwned::to_owned)
+            })
         })
         .unwrap_or_else(|| {
             let kid = transport.key.id.trim();
@@ -390,7 +412,7 @@ fn codex_pool_account_user_agent(transport: &GatewayProviderTransportSnapshot) -
         });
 
     // Pick profile by stable hash score (same algorithm as planner codex.rs).
-    let selected_user_agent = {
+    let selected_profile = {
         let best_index = profiles
             .iter()
             .enumerate()
@@ -409,26 +431,32 @@ fn codex_pool_account_user_agent(transport: &GatewayProviderTransportSnapshot) -
             .max_by(|(_, a), (_, b)| a.cmp(b))
             .map(|(i, _)| i)
             .unwrap_or(0);
-        profiles[best_index].user_agent.clone()
+        profiles[best_index].clone()
     };
 
-    // Prefer the fingerprint's persisted UA when it belongs to this account.
-    // Mirrors `resolve_codex_concrete_account_profile`: a stored profile that
-    // matches the current selection identity wins over the header-profile UA,
-    // so OAuth maintenance traffic keeps the same stable UA as requests.
-    Some(
-        codex_profile_persisted_user_agent(transport)
-            .unwrap_or_else(|| selected_user_agent),
-    )
+    // Prefer the fingerprint's persisted profile when it belongs to this
+    // account. Mirrors `resolve_codex_concrete_account_profile`: a stored
+    // profile that matches the current selection identity wins over the
+    // header-profile pick, so OAuth maintenance traffic keeps the same stable
+    // UA/originator pair as requests. A persisted UA without an originator
+    // (pre-originator fingerprints) keeps the selected originator.
+    Some(match codex_profile_persisted_client_profile(transport) {
+        Some((user_agent, originator)) => Profile {
+            user_agent,
+            originator: originator.unwrap_or(selected_profile.originator),
+        },
+        None => selected_profile,
+    })
 }
 
-/// Returns the persisted UA from the account's codex profile fingerprint, when
-/// that fingerprint's selection identity matches the current account. Mirrors
-/// the eligibility check in gateway `codex_profile.rs` so the UA used for OAuth
-/// maintenance traffic is identical to the one applied to ordinary requests.
-fn codex_profile_persisted_user_agent(
+/// Returns the persisted `(user_agent, originator)` from the account's codex
+/// profile fingerprint, when that fingerprint's selection identity matches the
+/// current account. Mirrors the eligibility check in gateway `codex_profile.rs`
+/// so the identity used for OAuth maintenance traffic is identical to the one
+/// applied to ordinary requests.
+fn codex_profile_persisted_client_profile(
     transport: &GatewayProviderTransportSnapshot,
-) -> Option<String> {
+) -> Option<(String, Option<String>)> {
     const CODEX_CLIENT_PROFILE_KEY: &str = "codex_client_profile";
 
     let fingerprint_profile = transport
@@ -456,9 +484,10 @@ fn codex_profile_persisted_user_agent(
         return None;
     }
 
-    fingerprint_profile
+    let client_headers = fingerprint_profile
         .get("client_headers")
-        .and_then(serde_json::Value::as_object)
+        .and_then(serde_json::Value::as_object);
+    let user_agent = client_headers
         .and_then(|headers| {
             headers
                 .get("user_agent")
@@ -472,7 +501,15 @@ fn codex_profile_persisted_user_agent(
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+        .map(ToOwned::to_owned)?;
+    let originator = client_headers
+        .and_then(|headers| headers.get("originator"))
+        .or_else(|| fingerprint_profile.get("originator"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    Some((user_agent, originator))
 }
 
 /// Computes the codex account selection identity (kind + hash) exactly as
@@ -499,15 +536,20 @@ fn codex_profile_selection_identity(
         .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .and_then(|v| {
-            ["account_id", "accountId", "chatgpt_account_id", "chatgptAccountId"]
-                .iter()
-                .find_map(|key| {
-                    v.get(*key)
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|v| !v.is_empty())
-                        .map(ToOwned::to_owned)
-                })
+            [
+                "account_id",
+                "accountId",
+                "chatgpt_account_id",
+                "chatgptAccountId",
+            ]
+            .iter()
+            .find_map(|key| {
+                v.get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(ToOwned::to_owned)
+            })
         });
     if let Some(account_id) = auth_account_id {
         return ("auth_account_id", digest_hex(account_id.as_bytes()));
@@ -1086,7 +1128,10 @@ mod tests {
         assert_eq!(refresh_with_entry_hits.load(Ordering::SeqCst), 1);
     }
 
-    fn codex_transport(auth_config: Option<&str>, pool_advanced: serde_json::Value) -> GatewayProviderTransportSnapshot {
+    fn codex_transport(
+        auth_config: Option<&str>,
+        pool_advanced: serde_json::Value,
+    ) -> GatewayProviderTransportSnapshot {
         let mut transport = sample_transport();
         transport.provider.provider_type = "codex".to_string();
         transport.key.decrypted_auth_config = auth_config.map(ToOwned::to_owned);
@@ -1108,7 +1153,9 @@ mod tests {
             },
         });
         let transport = codex_transport(Some(r#"{"account_id":"acc-1"}"#), pool_advanced);
-        let ua = super::codex_pool_account_user_agent(&transport).expect("profile UA should resolve");
+        let ua = super::codex_pool_account_client_profile(&transport)
+            .map(|p| p.user_agent)
+            .expect("profile UA should resolve");
         assert!(
             ua == "codex-tui/0.153.3 (Debian 13.0.0; x86_64)"
                 || ua == "Codex Desktop/0.153.1 (Windows 10.0.26100; x86_64)",
@@ -1121,11 +1168,15 @@ mod tests {
         let pool_advanced = serde_json::json!({
             "codex_client_headers": { "enabled": true, "profiles": [] },
         });
-        let transport =
-            codex_transport(Some(r#"{"chatgptAccountId":"acc-2"}"#), pool_advanced);
+        let transport = codex_transport(Some(r#"{"chatgptAccountId":"acc-2"}"#), pool_advanced);
         // Empty profiles → falls back to built-in defaults; must still resolve.
-        let ua = super::codex_pool_account_user_agent(&transport).expect("default profile UA should resolve");
-        assert!(ua.contains("codex-tui/") || ua.contains("Codex Desktop/"), "default UA {ua}");
+        let ua = super::codex_pool_account_client_profile(&transport)
+            .map(|p| p.user_agent)
+            .expect("default profile UA should resolve");
+        assert!(
+            ua.contains("codex-tui/") || ua.contains("Codex Desktop/"),
+            "default UA {ua}"
+        );
     }
 
     #[test]
@@ -1134,7 +1185,9 @@ mod tests {
             "codex_client_headers": { "enabled": false, "profiles": [] },
         });
         let transport = codex_transport(Some(r#"{"account_id":"acc-3"}"#), pool_advanced);
-        assert!(super::codex_pool_account_user_agent(&transport).is_none());
+        assert!(super::codex_pool_account_client_profile(&transport)
+            .map(|p| p.user_agent)
+            .is_none());
     }
 
     #[test]
@@ -1161,13 +1214,74 @@ mod tests {
                 },
             },
         }));
-        let ua = super::codex_pool_account_user_agent(&transport)
+        let ua = super::codex_pool_account_client_profile(&transport)
+            .map(|p| p.user_agent)
             .expect("profile UA should resolve");
         assert_eq!(
-            ua,
-            "codex-tui/0.153.4 (Windows 10.0.26200; x86_64)",
+            ua, "codex-tui/0.153.4 (Windows 10.0.26200; x86_64)",
             "matching fingerprint profile should win over header-profile UA"
         );
+    }
+
+    #[test]
+    fn codex_oauth_client_profile_carries_originator_from_fingerprint() {
+        let pool_advanced = serde_json::json!({
+            "codex_client_headers": {
+                "enabled": true,
+                "profiles": [
+                    { "user_agent": "codex-tui/0.153.3", "originator": "codex-tui" },
+                ],
+            },
+        });
+        let mut transport = codex_transport(Some(r#"{"account_id":"acc-6"}"#), pool_advanced);
+        let account_hash = super::codex_profile_selection_identity(&transport).1;
+        transport.key.fingerprint = Some(serde_json::json!({
+            "codex_client_profile": {
+                "selection_key_kind": "auth_account_id",
+                "selection_key_hash": account_hash,
+                "client_headers": {
+                    "user_agent": "Codex Desktop/0.153.1 (Windows 10.0.26100; x86_64)",
+                    "originator": "Codex Desktop",
+                },
+            },
+        }));
+        let profile = super::resolve_oauth_maintenance_client_profile(&transport)
+            .expect("profile should resolve");
+        assert_eq!(
+            profile,
+            super::CodexOAuthClientProfile {
+                user_agent: "Codex Desktop/0.153.1 (Windows 10.0.26100; x86_64)".to_string(),
+                originator: "Codex Desktop".to_string(),
+            }
+        );
+        let ctx = super::provider_oauth_transport_context_from_snapshot(&transport);
+        assert_eq!(
+            ctx.user_agent.as_deref(),
+            Some("Codex Desktop/0.153.1 (Windows 10.0.26100; x86_64)")
+        );
+        assert_eq!(ctx.originator.as_deref(), Some("Codex Desktop"));
+    }
+
+    #[test]
+    fn codex_oauth_client_profile_originator_matches_selected_user_agent() {
+        let pool_advanced = serde_json::json!({
+            "codex_client_headers": {
+                "enabled": true,
+                "profiles": [
+                    { "user_agent": "codex-tui/0.153.3 (Debian 13.0.0; x86_64)", "originator": "codex-tui" },
+                    { "user_agent": "Codex Desktop/0.153.1 (Windows 10.0.26100; x86_64)", "originator": "Codex Desktop" },
+                ],
+            },
+        });
+        let transport = codex_transport(Some(r#"{"account_id":"acc-7"}"#), pool_advanced);
+        let profile = super::resolve_oauth_maintenance_client_profile(&transport)
+            .expect("profile should resolve");
+        let expected_originator = if profile.user_agent.starts_with("codex-tui/") {
+            "codex-tui"
+        } else {
+            "Codex Desktop"
+        };
+        assert_eq!(profile.originator, expected_originator);
     }
 
     #[test]
@@ -1189,7 +1303,8 @@ mod tests {
                 "client_headers": { "user_agent": "persisted-other", "originator": "codex-tui" },
             },
         }));
-        let ua = super::codex_pool_account_user_agent(&transport)
+        let ua = super::codex_pool_account_client_profile(&transport)
+            .map(|p| p.user_agent)
             .expect("profile UA should resolve");
         assert!(
             ua == "codex-tui/0.153.3 (Debian 13.0.0; x86_64)",

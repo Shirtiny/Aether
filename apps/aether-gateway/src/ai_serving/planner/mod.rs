@@ -87,9 +87,11 @@ pub(crate) use self::standard::{
     build_local_sync_attempt_source as build_standard_family_sync_attempt_source,
     build_local_sync_plan_and_reports as build_standard_family_sync_plan_and_reports,
     build_owned_local_openai_responses_request_body as build_codex_ws_local_openai_responses_request_body,
-    materialize_codex_pool_key_fingerprint, refresh_codex_pool_key_fingerprint,
+    materialize_codex_pool_key_fingerprint,
+    materialize_codex_pool_key_fingerprint_with_client_headers, refresh_codex_pool_key_fingerprint,
     resolve_codex_pool_concrete_account_profile, resolve_codex_pool_runtime_identity_scope,
-    set_local_openai_chat_execution_exhausted_diagnostic, validate_codex_client_header_config,
+    select_codex_pool_client_header_profile, set_local_openai_chat_execution_exhausted_diagnostic,
+    validate_codex_client_header_config,
 };
 pub(crate) use self::state::{
     GatewayAuthApiKeySnapshot, GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,

@@ -25,7 +25,9 @@ pub(crate) use self::observability::{
 pub(crate) use self::provider::oauth::duplicates::find_duplicate_provider_oauth_key;
 pub(crate) use self::provider::oauth::errors::build_internal_control_error_response;
 pub(crate) use self::provider::oauth::provisioning::{
-    create_provider_oauth_catalog_key, update_existing_provider_oauth_catalog_key,
+    create_provider_oauth_catalog_key, create_provider_oauth_catalog_key_with_client_identity,
+    update_existing_provider_oauth_catalog_key,
+    update_existing_provider_oauth_catalog_key_with_client_identity,
 };
 pub(crate) use self::provider::oauth::quota::dispatch::refresh_provider_pool_quota_locally;
 pub(crate) use self::provider::oauth::quota::shared::{
@@ -36,6 +38,7 @@ pub(crate) use self::provider::oauth::runtime::{
     provider_oauth_maintenance_endpoint_for_provider, provider_oauth_runtime_endpoint_for_provider,
     refresh_provider_oauth_account_state_after_update,
 };
+pub(crate) use self::provider::oauth::state::AdminProviderOAuthClientIdentity;
 pub(crate) use self::provider::ops::providers::actions::admin_provider_ops_local_action_response;
 pub(crate) use self::provider::ops::providers::store_admin_provider_ops_balance_cache;
 pub(crate) use self::provider::pool::config::admin_provider_pool_config;

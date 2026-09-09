@@ -1115,6 +1115,11 @@ impl AppState {
                 &current_transport,
             )
             .unwrap_or_else(|| "-".to_string()),
+            codex_oauth_originator = provider_transport::resolve_oauth_maintenance_client_profile(
+                &current_transport,
+            )
+            .map(|profile| profile.originator)
+            .unwrap_or_else(|| "-".to_string()),
             "gateway manual oauth refresh starting"
         );
 

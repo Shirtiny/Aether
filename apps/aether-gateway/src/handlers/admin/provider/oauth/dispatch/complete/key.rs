@@ -7,6 +7,7 @@ use super::super::super::runtime::{
 use super::super::super::state::{
     admin_provider_oauth_template, enrich_admin_provider_oauth_auth_config,
     is_fixed_provider_type_for_provider_oauth, json_non_empty_string,
+    AdminProviderOAuthClientIdentity,
 };
 use super::shared::{
     parse_admin_provider_oauth_complete_callback, parse_admin_provider_oauth_complete_request_body,
@@ -23,6 +24,51 @@ use axum::{
 };
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Freezes the client identity a key re-authorized with into its fingerprint
+/// so pool traffic keeps presenting the same `User-Agent`/`originator` the
+/// login did. Re-reads the key after the credential write so nothing the
+/// credential update touched is overwritten with stale values.
+async fn freeze_provider_oauth_key_client_identity(
+    state: &AdminAppState<'_>,
+    key_id: &str,
+    provider_type: &str,
+    auth_config_json: &str,
+    client_identity: &AdminProviderOAuthClientIdentity,
+    now_unix_secs: u64,
+) -> Result<(), GatewayError> {
+    let Some(mut key) = state
+        .read_provider_catalog_keys_by_ids(std::slice::from_ref(&key_id.to_string()))
+        .await?
+        .into_iter()
+        .next()
+    else {
+        return Ok(());
+    };
+    let Some(outcome) =
+        crate::ai_serving::materialize_codex_pool_key_fingerprint_with_client_headers(
+            provider_type,
+            key.fingerprint.as_ref(),
+            Some(auth_config_json),
+            key.id.as_str(),
+            key.name.as_str(),
+            client_identity.user_agent.as_str(),
+            client_identity.originator.as_str(),
+            now_unix_secs,
+        )
+    else {
+        return Ok(());
+    };
+    key.fingerprint = Some(outcome.fingerprint);
+    key.updated_at_unix_secs = Some(now_unix_secs);
+    if state.update_provider_catalog_key(&key).await?.is_some() {
+        let _ = state
+            .app()
+            .invalidate_local_oauth_refresh_entry(&key.id)
+            .await;
+    }
+    Ok(())
+}
 
 pub(super) async fn handle_admin_provider_oauth_complete_key(
     state: &AdminAppState<'_>,
@@ -144,6 +190,9 @@ pub(super) async fn handle_admin_provider_oauth_complete_key(
         )
         .await;
 
+    // Replay the client identity the authorize URL advertised on the token
+    // exchange; it is frozen into the key fingerprint below.
+    let client_identity = AdminProviderOAuthClientIdentity::from_stored_state(&state_data);
     let token_payload = match state
         .exchange_admin_provider_oauth_code(
             template,
@@ -151,6 +200,7 @@ pub(super) async fn handle_admin_provider_oauth_complete_key(
             &callback.state_nonce,
             state_data.pkce_verifier.as_deref(),
             request_proxy.clone(),
+            client_identity.as_ref(),
         )
         .await
     {
@@ -219,6 +269,17 @@ pub(super) async fn handle_admin_provider_oauth_complete_key(
             http::StatusCode::NOT_FOUND,
             "Key 不存在",
         ));
+    }
+    if let Some(client_identity) = client_identity.as_ref() {
+        freeze_provider_oauth_key_client_identity(
+            state,
+            &key_id,
+            &provider_type,
+            &auth_config_json,
+            client_identity,
+            now_unix_secs,
+        )
+        .await?;
     }
 
     spawn_provider_oauth_account_state_refresh_after_update(

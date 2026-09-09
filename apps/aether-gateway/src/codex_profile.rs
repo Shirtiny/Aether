@@ -166,6 +166,23 @@ pub(crate) fn materialize_codex_key_fingerprint(
     })
 }
 
+/// Returns the `(user_agent, originator)` pair persisted in a key's codex
+/// profile fingerprint, if both are present. Unlike
+/// `resolve_codex_concrete_account_profile` this does not check the selection
+/// identity: it is used before a re-login when the account behind the key is
+/// not known yet, so the login advertises the identity the key already uses.
+pub(crate) fn codex_profile_persisted_client_headers(
+    fingerprint: Option<&Value>,
+) -> Option<(String, String)> {
+    let profile = fingerprint
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(CODEX_CLIENT_PROFILE_KEY))
+        .and_then(Value::as_object)?;
+    let user_agent = codex_profile_user_agent_from_object(profile)?;
+    let originator = codex_profile_originator_from_object(profile)?;
+    Some((user_agent, originator))
+}
+
 pub(crate) fn resolve_codex_concrete_account_profile(
     fingerprint: Option<&Value>,
     auth_config_raw: Option<&str>,
@@ -1121,7 +1138,10 @@ mod tests {
     fn identity_headers_rewrite_version_with_user_agent_and_drop_it_when_unparsable() {
         // A real client sent 0.153.4; the pool profile presents a Desktop build.
         let mut headers = BTreeMap::from([
-            ("user-agent".to_string(), "codex-tui/0.153.4 (Linux; x86_64)".to_string()),
+            (
+                "user-agent".to_string(),
+                "codex-tui/0.153.4 (Linux; x86_64)".to_string(),
+            ),
             ("originator".to_string(), "codex-tui".to_string()),
             ("Version".to_string(), "0.153.4".to_string()),
         ]);

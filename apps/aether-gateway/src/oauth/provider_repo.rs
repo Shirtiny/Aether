@@ -1,7 +1,10 @@
 use crate::admin_api::{
-    create_provider_oauth_catalog_key, find_duplicate_provider_oauth_key,
-    refresh_provider_oauth_account_state_after_update, update_existing_provider_oauth_catalog_key,
-    AdminAppState, AdminGatewayProviderTransportSnapshot, AdminLocalOAuthRefreshError,
+    create_provider_oauth_catalog_key, create_provider_oauth_catalog_key_with_client_identity,
+    find_duplicate_provider_oauth_key, refresh_provider_oauth_account_state_after_update,
+    update_existing_provider_oauth_catalog_key,
+    update_existing_provider_oauth_catalog_key_with_client_identity, AdminAppState,
+    AdminGatewayProviderTransportSnapshot, AdminLocalOAuthRefreshError,
+    AdminProviderOAuthClientIdentity,
 };
 use crate::GatewayError;
 use aether_contracts::ProxySnapshot;
@@ -102,6 +105,60 @@ impl ProviderOAuthRepository {
             api_formats,
             proxy,
             expires_at_unix_secs,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_provider_oauth_catalog_key_with_client_identity(
+        state: &AdminAppState<'_>,
+        provider_id: &str,
+        provider_type: &str,
+        name: &str,
+        access_token: &str,
+        auth_config: &serde_json::Map<String, serde_json::Value>,
+        api_formats: &[String],
+        proxy: Option<serde_json::Value>,
+        expires_at_unix_secs: Option<u64>,
+        client_identity: Option<&AdminProviderOAuthClientIdentity>,
+    ) -> Result<Option<StoredProviderCatalogKey>, GatewayError> {
+        create_provider_oauth_catalog_key_with_client_identity(
+            state,
+            provider_id,
+            provider_type,
+            name,
+            access_token,
+            auth_config,
+            api_formats,
+            proxy,
+            expires_at_unix_secs,
+            client_identity,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn update_existing_provider_oauth_catalog_key_with_client_identity(
+        state: &AdminAppState<'_>,
+        existing_key: &StoredProviderCatalogKey,
+        provider_type: &str,
+        access_token: &str,
+        auth_config: &serde_json::Map<String, serde_json::Value>,
+        api_formats: &[String],
+        proxy: Option<serde_json::Value>,
+        expires_at_unix_secs: Option<u64>,
+        client_identity: Option<&AdminProviderOAuthClientIdentity>,
+    ) -> Result<Option<StoredProviderCatalogKey>, GatewayError> {
+        update_existing_provider_oauth_catalog_key_with_client_identity(
+            state,
+            existing_key,
+            provider_type,
+            access_token,
+            auth_config,
+            api_formats,
+            proxy,
+            expires_at_unix_secs,
+            client_identity,
         )
         .await
     }

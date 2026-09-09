@@ -1,5 +1,6 @@
 use super::*;
 use crate::handlers::admin::provider::oauth::errors::build_internal_control_error_response;
+use crate::handlers::admin::provider::oauth::state::AdminProviderOAuthClientIdentity;
 use aether_contracts::{
     ExecutionPlan, ExecutionResult, ExecutionTimeouts, ProxySnapshot, RequestBody,
     EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER,
@@ -65,30 +66,37 @@ impl<'a> AdminAppState<'a> {
             .await
     }
 
+    /// Persists the OAuth `state` record under the caller-generated `nonce`
+    /// (the value that goes into the authorize URL). `client_identity` is the
+    /// codex `User-Agent`/`originator` pair the authorize URL advertised; the
+    /// callback replays it on the token exchange and freezes it into the key.
     pub(crate) async fn save_provider_oauth_state(
         &self,
+        nonce: &str,
         key_id: &str,
         provider_id: &str,
         provider_type: &str,
         pkce_verifier: Option<&str>,
-    ) -> Result<String, GatewayError> {
-        let nonce = aether_admin::provider::state::generate_provider_oauth_nonce();
+        client_identity: Option<&AdminProviderOAuthClientIdentity>,
+    ) -> Result<(), GatewayError> {
         let payload = json!({
             "nonce": nonce,
             "key_id": key_id,
             "provider_id": provider_id,
             "provider_type": provider_type,
             "pkce_verifier": pkce_verifier,
+            "client_user_agent": client_identity.map(|identity| identity.user_agent.as_str()),
+            "client_originator": client_identity.map(|identity| identity.originator.as_str()),
             "created_at": aether_admin::provider::state::current_unix_secs(),
         });
-        let key = provider_oauth_state_storage_key(&nonce);
+        let key = provider_oauth_state_storage_key(nonce);
         let value = payload.to_string();
         self.as_ref()
             .runtime_kv_setex(&key, &value, PROVIDER_OAUTH_STATE_TTL_SECS)
             .await?;
         self.as_ref()
             .save_provider_oauth_state_for_tests(&key, &value);
-        Ok(nonce)
+        Ok(())
     }
 
     pub(crate) async fn consume_provider_oauth_state(
@@ -111,6 +119,7 @@ impl<'a> AdminAppState<'a> {
         state_nonce: &str,
         pkce_verifier: Option<&str>,
         proxy: Option<ProxySnapshot>,
+        client_identity: Option<&AdminProviderOAuthClientIdentity>,
     ) -> Result<serde_json::Value, Response<Body>> {
         crate::handlers::admin::provider::oauth::state::exchange_admin_provider_oauth_code(
             self,
@@ -119,6 +128,7 @@ impl<'a> AdminAppState<'a> {
             state_nonce,
             pkce_verifier,
             proxy,
+            client_identity,
         )
         .await
     }
@@ -128,12 +138,14 @@ impl<'a> AdminAppState<'a> {
         template: AdminProviderOAuthTemplate,
         refresh_token: &str,
         proxy: Option<ProxySnapshot>,
+        client_identity: Option<&AdminProviderOAuthClientIdentity>,
     ) -> Result<serde_json::Value, Response<Body>> {
         crate::handlers::admin::provider::oauth::state::exchange_admin_provider_oauth_refresh_token(
             self,
             template,
             refresh_token,
             proxy,
+            client_identity,
         )
         .await
     }
@@ -415,6 +427,70 @@ impl<'a> AdminAppState<'a> {
             api_formats,
             proxy,
             expires_at_unix_secs,
+        )
+        .await
+    }
+
+    /// `create_provider_oauth_catalog_key` that freezes the codex client identity
+    /// the OAuth login/import authenticated with into the new key fingerprint.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_provider_oauth_catalog_key_with_client_identity(
+        &self,
+        provider_id: &str,
+        provider_type: &str,
+        name: &str,
+        access_token: &str,
+        auth_config: &serde_json::Map<String, serde_json::Value>,
+        api_formats: &[String],
+        proxy: Option<serde_json::Value>,
+        expires_at_unix_secs: Option<u64>,
+        client_identity: Option<&AdminProviderOAuthClientIdentity>,
+    ) -> Result<
+        Option<aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey>,
+        GatewayError,
+    > {
+        crate::oauth::ProviderOAuthRepository::create_provider_oauth_catalog_key_with_client_identity(
+            self,
+            provider_id,
+            provider_type,
+            name,
+            access_token,
+            auth_config,
+            api_formats,
+            proxy,
+            expires_at_unix_secs,
+            client_identity,
+        )
+        .await
+    }
+
+    /// `update_existing_provider_oauth_catalog_key` that freezes the codex
+    /// client identity the OAuth login/import authenticated with.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn update_existing_provider_oauth_catalog_key_with_client_identity(
+        &self,
+        existing_key: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey,
+        provider_type: &str,
+        access_token: &str,
+        auth_config: &serde_json::Map<String, serde_json::Value>,
+        api_formats: &[String],
+        proxy: Option<serde_json::Value>,
+        expires_at_unix_secs: Option<u64>,
+        client_identity: Option<&AdminProviderOAuthClientIdentity>,
+    ) -> Result<
+        Option<aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey>,
+        GatewayError,
+    > {
+        crate::oauth::ProviderOAuthRepository::update_existing_provider_oauth_catalog_key_with_client_identity(
+            self,
+            existing_key,
+            provider_type,
+            access_token,
+            auth_config,
+            api_formats,
+            proxy,
+            expires_at_unix_secs,
+            client_identity,
         )
         .await
     }

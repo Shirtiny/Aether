@@ -1,6 +1,6 @@
 use super::state::{
     decode_jwt_claims, enrich_admin_provider_oauth_auth_config, json_non_empty_string,
-    json_u64_value,
+    json_u64_value, AdminProviderOAuthClientIdentity,
 };
 use crate::handlers::admin::admin_provider_pool_config;
 use crate::handlers::admin::request::AdminAppState;
@@ -150,6 +150,48 @@ fn provider_oauth_env_or_default(name: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+/// Materializes the codex pool fingerprint for a key being created/updated
+/// from an OAuth result. With a `client_identity` (the `User-Agent`/`originator`
+/// the login or import authenticated with) that exact pair is frozen, replacing
+/// any previously persisted client headers; otherwise the pool's stable profile
+/// selection applies as before.
+fn provider_oauth_key_fingerprint(
+    provider_type: &str,
+    fallback_fingerprint: Option<&serde_json::Value>,
+    auth_config_json: &str,
+    key_id: &str,
+    key_name: &str,
+    client_identity: Option<&AdminProviderOAuthClientIdentity>,
+    now_unix_secs: u64,
+) -> Option<serde_json::Value> {
+    let outcome = match client_identity {
+        Some(identity) => {
+            crate::ai_serving::materialize_codex_pool_key_fingerprint_with_client_headers(
+                provider_type,
+                fallback_fingerprint,
+                Some(auth_config_json),
+                key_id,
+                key_name,
+                identity.user_agent.as_str(),
+                identity.originator.as_str(),
+                now_unix_secs,
+            )
+        }
+        None => crate::ai_serving::materialize_codex_pool_key_fingerprint(
+            provider_type,
+            None,
+            fallback_fingerprint,
+            Some(auth_config_json),
+            key_id,
+            key_name,
+            now_unix_secs,
+        ),
+    };
+    outcome
+        .map(|outcome| outcome.fingerprint)
+        .or_else(|| fallback_fingerprint.cloned())
+}
+
 pub(crate) async fn create_provider_oauth_catalog_key(
     state: &AdminAppState<'_>,
     provider_id: &str,
@@ -160,6 +202,34 @@ pub(crate) async fn create_provider_oauth_catalog_key(
     api_formats: &[String],
     proxy: Option<serde_json::Value>,
     expires_at_unix_secs: Option<u64>,
+) -> Result<Option<StoredProviderCatalogKey>, GatewayError> {
+    create_provider_oauth_catalog_key_with_client_identity(
+        state,
+        provider_id,
+        provider_type,
+        name,
+        access_token,
+        auth_config,
+        api_formats,
+        proxy,
+        expires_at_unix_secs,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_provider_oauth_catalog_key_with_client_identity(
+    state: &AdminAppState<'_>,
+    provider_id: &str,
+    provider_type: &str,
+    name: &str,
+    access_token: &str,
+    auth_config: &serde_json::Map<String, serde_json::Value>,
+    api_formats: &[String],
+    proxy: Option<serde_json::Value>,
+    expires_at_unix_secs: Option<u64>,
+    client_identity: Option<&AdminProviderOAuthClientIdentity>,
 ) -> Result<Option<StoredProviderCatalogKey>, GatewayError> {
     let Some(encrypted_api_key) = state.encrypt_catalog_secret_with_fallbacks(access_token) else {
         return Ok(None);
@@ -177,18 +247,15 @@ pub(crate) async fn create_provider_oauth_catalog_key(
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     let key_id = Uuid::new_v4().to_string();
-    let fingerprint = None;
-    let fingerprint = crate::ai_serving::materialize_codex_pool_key_fingerprint(
+    let fingerprint = provider_oauth_key_fingerprint(
         provider_type,
         None,
-        fingerprint.as_ref(),
-        Some(&auth_config_json),
+        &auth_config_json,
         key_id.as_str(),
         name,
+        client_identity,
         now_unix_secs,
-    )
-    .map(|outcome| outcome.fingerprint)
-    .or(fingerprint);
+    );
 
     let mut record = StoredProviderCatalogKey::new(
         key_id,
@@ -246,6 +313,32 @@ pub(crate) async fn update_existing_provider_oauth_catalog_key(
     proxy: Option<serde_json::Value>,
     expires_at_unix_secs: Option<u64>,
 ) -> Result<Option<StoredProviderCatalogKey>, GatewayError> {
+    update_existing_provider_oauth_catalog_key_with_client_identity(
+        state,
+        existing_key,
+        provider_type,
+        access_token,
+        auth_config,
+        api_formats,
+        proxy,
+        expires_at_unix_secs,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn update_existing_provider_oauth_catalog_key_with_client_identity(
+    state: &AdminAppState<'_>,
+    existing_key: &StoredProviderCatalogKey,
+    provider_type: &str,
+    access_token: &str,
+    auth_config: &serde_json::Map<String, serde_json::Value>,
+    api_formats: &[String],
+    proxy: Option<serde_json::Value>,
+    expires_at_unix_secs: Option<u64>,
+    client_identity: Option<&AdminProviderOAuthClientIdentity>,
+) -> Result<Option<StoredProviderCatalogKey>, GatewayError> {
     let Some(encrypted_api_key) = state.encrypt_catalog_secret_with_fallbacks(access_token) else {
         return Ok(None);
     };
@@ -276,17 +369,15 @@ pub(crate) async fn update_existing_provider_oauth_catalog_key(
     } else {
         updated.fingerprint.clone()
     };
-    updated.fingerprint = crate::ai_serving::materialize_codex_pool_key_fingerprint(
+    updated.fingerprint = provider_oauth_key_fingerprint(
         provider_type,
-        None,
         fallback_fingerprint.as_ref(),
-        Some(&auth_config_json),
+        &auth_config_json,
         updated.id.as_str(),
         updated.name.as_str(),
+        client_identity,
         now_unix_secs,
-    )
-    .map(|outcome| outcome.fingerprint)
-    .or(fallback_fingerprint);
+    );
     updated.health_by_format = Some(json!({}));
     updated.circuit_breaker_by_format = Some(json!({}));
     updated.error_count = Some(0);

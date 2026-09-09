@@ -1,6 +1,7 @@
 use super::super::errors::{
     build_internal_control_error_response, normalize_provider_oauth_refresh_error_message,
 };
+use super::AdminProviderOAuthClientIdentity;
 use crate::handlers::admin::request::{AdminAppState, AdminProviderOAuthTemplate};
 use aether_contracts::ProxySnapshot;
 use aether_oauth::provider::providers::GenericProviderOAuthAdapter;
@@ -19,6 +20,7 @@ fn provider_oauth_transport_error_detail(prefix: &str, error: &str) -> String {
 fn provider_oauth_exchange_context(
     provider_type: &str,
     proxy: Option<ProxySnapshot>,
+    client_identity: Option<&AdminProviderOAuthClientIdentity>,
 ) -> ProviderOAuthTransportContext {
     ProviderOAuthTransportContext {
         provider_id: String::new(),
@@ -32,7 +34,8 @@ fn provider_oauth_exchange_context(
         endpoint_config: None,
         key_config: None,
         network: aether_oauth::network::OAuthNetworkContext::provider_operation(proxy),
-        user_agent: None,
+        user_agent: client_identity.map(|identity| identity.user_agent.clone()),
+        originator: client_identity.map(|identity| identity.originator.clone()),
     }
 }
 
@@ -69,10 +72,11 @@ pub(crate) async fn exchange_admin_provider_oauth_code(
     state_nonce: &str,
     pkce_verifier: Option<&str>,
     proxy: Option<ProxySnapshot>,
+    client_identity: Option<&AdminProviderOAuthClientIdentity>,
 ) -> Result<serde_json::Value, Response<Body>> {
     let token_url = state.provider_oauth_token_url(template.provider_type, template.token_url);
     let service = provider_oauth_service_for_template(template, token_url)?;
-    let ctx = provider_oauth_exchange_context(template.provider_type, proxy);
+    let ctx = provider_oauth_exchange_context(template.provider_type, proxy, client_identity);
     let executor = crate::oauth::GatewayOAuthHttpExecutor::new(*state);
     let result = service
         .exchange_code(&executor, &ctx, code, state_nonce, pkce_verifier)
@@ -97,10 +101,11 @@ pub(crate) async fn exchange_admin_provider_oauth_refresh_token(
     template: AdminProviderOAuthTemplate,
     refresh_token: &str,
     proxy: Option<ProxySnapshot>,
+    client_identity: Option<&AdminProviderOAuthClientIdentity>,
 ) -> Result<serde_json::Value, Response<Body>> {
     let token_url = state.provider_oauth_token_url(template.provider_type, template.token_url);
     let service = provider_oauth_service_for_template(template, token_url)?;
-    let ctx = provider_oauth_exchange_context(template.provider_type, proxy);
+    let ctx = provider_oauth_exchange_context(template.provider_type, proxy, client_identity);
     let executor = crate::oauth::GatewayOAuthHttpExecutor::new(*state);
     let input = aether_oauth::provider::ProviderOAuthImportInput {
         provider_type: template.provider_type.to_string(),

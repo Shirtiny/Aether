@@ -235,8 +235,70 @@ pub(crate) fn refresh_codex_pool_key_fingerprint(
     key_name: &str,
     now_unix_secs: u64,
 ) -> Option<CodexProfileMaterializationOutcome> {
-    let mut refreshable_fingerprint = key_fingerprint.cloned();
-    if let Some(profile) = refreshable_fingerprint
+    let refreshable_fingerprint = strip_codex_profile_client_headers(key_fingerprint);
+    materialize_codex_pool_key_fingerprint(
+        provider_type,
+        provider_config,
+        refreshable_fingerprint.as_ref(),
+        auth_config_raw,
+        key_id,
+        key_name,
+        now_unix_secs,
+    )
+}
+
+/// Freezes an explicit `User-Agent`/`originator` pair into the key fingerprint,
+/// replacing any previously persisted client headers while keeping the
+/// installation identity. Used after an OAuth login/import so pool traffic keeps
+/// the exact client identity the account authenticated with.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn materialize_codex_pool_key_fingerprint_with_client_headers(
+    provider_type: &str,
+    key_fingerprint: Option<&Value>,
+    auth_config_raw: Option<&str>,
+    key_id: &str,
+    key_name: &str,
+    user_agent: &str,
+    originator: &str,
+    now_unix_secs: u64,
+) -> Option<CodexProfileMaterializationOutcome> {
+    let stripped_fingerprint = strip_codex_profile_client_headers(key_fingerprint);
+    materialize_codex_key_fingerprint(CodexProfileMaterializeInput {
+        provider_type,
+        fingerprint: stripped_fingerprint.as_ref(),
+        auth_config_raw,
+        key_id,
+        key_name,
+        user_agent,
+        originator,
+        now_unix_secs,
+    })
+}
+
+/// Selects the `(user_agent, originator)` pool profile for `selection_key`
+/// from the provider's `pool_advanced.codex_client_headers` (or the built-in
+/// defaults). Returns `None` when client header profiles are disabled or the
+/// provider is not codex. This is the same choice `materialize_codex_pool_key_fingerprint`
+/// makes, exposed so the OAuth login can advertise the identity up front.
+pub(crate) fn select_codex_pool_client_header_profile(
+    provider_type: &str,
+    provider_config: Option<&Value>,
+    selection_key: &str,
+) -> Option<(String, String)> {
+    if !provider_type.trim().eq_ignore_ascii_case("codex") {
+        return None;
+    }
+    let default_pool_advanced = Value::Object(Default::default());
+    let pool_advanced = provider_config
+        .and_then(|config| config.get("pool_advanced"))
+        .unwrap_or(&default_pool_advanced);
+    codex_pool_client_header_profile(pool_advanced, selection_key)
+        .map(|profile| (profile.user_agent, profile.originator))
+}
+
+fn strip_codex_profile_client_headers(key_fingerprint: Option<&Value>) -> Option<Value> {
+    let mut stripped = key_fingerprint.cloned();
+    if let Some(profile) = stripped
         .as_mut()
         .and_then(Value::as_object_mut)
         .and_then(|root| root.get_mut(crate::codex_profile::CODEX_CLIENT_PROFILE_KEY))
@@ -248,16 +310,7 @@ pub(crate) fn refresh_codex_pool_key_fingerprint(
         profile.remove("originator");
         profile.remove("frozen_at_unix_secs");
     }
-
-    materialize_codex_pool_key_fingerprint(
-        provider_type,
-        provider_config,
-        refreshable_fingerprint.as_ref(),
-        auth_config_raw,
-        key_id,
-        key_name,
-        now_unix_secs,
-    )
+    stripped
 }
 
 pub(crate) fn validate_codex_client_header_config(value: &Value) -> Result<(), String> {

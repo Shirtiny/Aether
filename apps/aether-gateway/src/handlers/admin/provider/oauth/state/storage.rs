@@ -1,3 +1,4 @@
+use super::AdminProviderOAuthClientIdentity;
 use crate::handlers::admin::request::AdminProviderOAuthTemplate;
 use aether_oauth::provider::{ProviderOAuthService, ProviderOAuthTransportContext};
 use serde_json::json;
@@ -7,11 +8,13 @@ pub(crate) fn build_provider_oauth_start_response(
     template: AdminProviderOAuthTemplate,
     nonce: &str,
     code_challenge: Option<&str>,
+    client_identity: Option<&AdminProviderOAuthClientIdentity>,
 ) -> serde_json::Value {
-    let authorization_url = build_provider_oauth_authorization_url(template, nonce, code_challenge)
-        .unwrap_or_else(|| {
-            build_provider_oauth_authorization_url_legacy(template, nonce, code_challenge)
-        });
+    let authorization_url =
+        build_provider_oauth_authorization_url(template, nonce, code_challenge, client_identity)
+            .unwrap_or_else(|| {
+                build_provider_oauth_authorization_url_legacy(template, nonce, code_challenge)
+            });
     let redirect_uri = url::Url::parse(&authorization_url)
         .ok()
         .and_then(|url| {
@@ -33,6 +36,7 @@ fn build_provider_oauth_authorization_url(
     template: AdminProviderOAuthTemplate,
     nonce: &str,
     code_challenge: Option<&str>,
+    client_identity: Option<&AdminProviderOAuthClientIdentity>,
 ) -> Option<String> {
     let ctx = ProviderOAuthTransportContext {
         provider_id: String::new(),
@@ -46,7 +50,8 @@ fn build_provider_oauth_authorization_url(
         endpoint_config: None,
         key_config: None,
         network: aether_oauth::network::OAuthNetworkContext::provider_operation(None),
-        user_agent: None,
+        user_agent: client_identity.map(|identity| identity.user_agent.clone()),
+        originator: client_identity.map(|identity| identity.originator.clone()),
     };
     ProviderOAuthService::with_builtin_adapters()
         .build_authorize_url(&ctx, nonce, code_challenge)
@@ -66,7 +71,6 @@ fn build_provider_oauth_authorization_url_legacy(
     serializer.append_pair("scope", &template.scopes.join(" "));
     serializer.append_pair("state", nonce);
     if template.provider_type == "codex" {
-        serializer.append_pair("prompt", "login");
         serializer.append_pair("id_token_add_organizations", "true");
         serializer.append_pair("codex_cli_simplified_flow", "true");
     }
@@ -78,4 +82,33 @@ fn build_provider_oauth_authorization_url_legacy(
     }
 
     format!("{}?{}", template.authorize_url, serializer.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_provider_oauth_start_response;
+    use super::AdminProviderOAuthClientIdentity;
+    use crate::handlers::admin::provider::oauth::state::admin_provider_oauth_template;
+
+    #[test]
+    fn codex_start_response_advertises_selected_originator() {
+        let template = admin_provider_oauth_template("codex").expect("codex template");
+        let identity = AdminProviderOAuthClientIdentity {
+            user_agent: "codex-tui/0.153.3 (Debian 13.0.0; x86_64)".to_string(),
+            originator: "codex-tui".to_string(),
+        };
+        let response =
+            build_provider_oauth_start_response(template, "state-1", Some("chal"), Some(&identity));
+        let url = response["authorization_url"].as_str().expect("url");
+        assert!(
+            url.ends_with("&state=state-1&originator=codex-tui"),
+            "{url}"
+        );
+        assert!(!url.contains("prompt="), "{url}");
+        assert!(url.contains("scope=openid%20profile%20email%20offline_access%20api.connectors.read%20api.connectors.invoke"), "{url}");
+        assert_eq!(
+            response["redirect_uri"].as_str(),
+            Some("http://localhost:1455/auth/callback")
+        );
+    }
 }
