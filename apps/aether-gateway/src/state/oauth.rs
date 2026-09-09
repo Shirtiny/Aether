@@ -1500,6 +1500,11 @@ impl AppState {
                 "true".to_string(),
             );
         }
+        if let Some(ua) = request.user_agent.as_deref() {
+            headers
+                .entry("user-agent".to_string())
+                .or_insert_with(|| ua.to_string());
+        }
         let plan = ExecutionPlan {
             request_id: request.request_id.to_string(),
             candidate_id: None,

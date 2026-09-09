@@ -43,6 +43,7 @@ fn admin_provider_oauth_kiro_refresh_context(
         endpoint_config: None,
         key_config: None,
         network: aether_oauth::network::OAuthNetworkContext::provider_operation(proxy),
+        user_agent: None,
     }
 }
 

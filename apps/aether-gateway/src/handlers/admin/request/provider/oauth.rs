@@ -534,6 +534,7 @@ impl<'a> AdminAppState<'a> {
             json_body,
             body_bytes,
             network,
+            user_agent: None,
         };
         let response = aether_oauth::network::OAuthHttpExecutor::execute(
             &crate::oauth::GatewayOAuthHttpExecutor::new(*self),

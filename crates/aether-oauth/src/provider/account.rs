@@ -37,6 +37,11 @@ pub struct ProviderOAuthTransportContext {
     pub endpoint_config: Option<Value>,
     pub key_config: Option<Value>,
     pub network: OAuthNetworkContext,
+    /// Account-scoped `User-Agent` to send on OAuth operations (token refresh,
+    /// quota fetch, import).  When set, the executor injects it as the
+    /// `user-agent` header so that admin maintenance traffic carries the same
+    /// client fingerprint as ordinary pool requests for this account.
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

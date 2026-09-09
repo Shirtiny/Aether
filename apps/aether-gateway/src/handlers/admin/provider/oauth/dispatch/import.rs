@@ -365,6 +365,7 @@ async fn resolve_admin_provider_oauth_windsurf_single_import_tokens(
         network: aether_oauth::network::OAuthNetworkContext::provider_operation(
             request_proxy.clone(),
         ),
+        user_agent: None,
     };
     let executor = crate::oauth::GatewayOAuthHttpExecutor::new(*state);
     let service = ProviderOAuthService::with_builtin_adapters();

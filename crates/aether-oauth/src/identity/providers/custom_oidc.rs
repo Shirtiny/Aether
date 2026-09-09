@@ -81,6 +81,7 @@ impl IdentityOAuthProvider for CustomOidcIdentityOAuthProvider {
                 json_body: None,
                 body_bytes: Some(body_bytes),
                 network: ctx.network.clone(),
+                user_agent: None,
             })
             .await?;
         if !(200..300).contains(&response.status_code) {
@@ -123,6 +124,7 @@ impl IdentityOAuthProvider for CustomOidcIdentityOAuthProvider {
                 json_body: None,
                 body_bytes: None,
                 network,
+                user_agent: None,
             })
             .await?;
         if !(200..300).contains(&response.status_code) {

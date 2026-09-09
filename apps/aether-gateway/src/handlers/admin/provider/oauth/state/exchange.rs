@@ -32,6 +32,7 @@ fn provider_oauth_exchange_context(
         endpoint_config: None,
         key_config: None,
         network: aether_oauth::network::OAuthNetworkContext::provider_operation(proxy),
+        user_agent: None,
     }
 }
 

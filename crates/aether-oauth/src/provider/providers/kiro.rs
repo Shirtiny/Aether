@@ -298,6 +298,7 @@ impl KiroProviderOAuthAdapter {
                 })),
                 body_bytes: None,
                 network: ctx.network.clone(),
+                user_agent: ctx.user_agent.clone(),
             })
             .await?;
         if !(200..300).contains(&response.status_code) {
@@ -376,6 +377,7 @@ impl KiroProviderOAuthAdapter {
                 })),
                 body_bytes: None,
                 network: ctx.network.clone(),
+                user_agent: ctx.user_agent.clone(),
             })
             .await?;
         if !(200..300).contains(&response.status_code) {
@@ -687,6 +689,7 @@ mod tests {
             endpoint_config: None,
             key_config: None,
             network: crate::network::OAuthNetworkContext::provider_operation(None),
+            user_agent: None,
         }
     }
 

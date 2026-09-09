@@ -46,6 +46,7 @@ fn build_provider_oauth_authorization_url(
         endpoint_config: None,
         key_config: None,
         network: aether_oauth::network::OAuthNetworkContext::provider_operation(None),
+        user_agent: None,
     };
     ProviderOAuthService::with_builtin_adapters()
         .build_authorize_url(&ctx, nonce, code_challenge)

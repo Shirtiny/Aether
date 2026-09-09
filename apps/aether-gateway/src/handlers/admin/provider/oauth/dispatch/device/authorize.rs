@@ -227,6 +227,7 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
             network: aether_oauth::network::OAuthNetworkContext::provider_operation(
                 request_proxy.clone(),
             ),
+            user_agent: None,
         };
         let Some(adapter) = GenericProviderOAuthAdapter::for_provider_type("grok") else {
             return Ok(build_internal_control_error_response(
@@ -333,6 +334,7 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
             network: aether_oauth::network::OAuthNetworkContext::provider_operation(
                 request_proxy.clone(),
             ),
+            user_agent: None,
         };
         let mut authorization = match ProviderOAuthService::with_builtin_adapters()
             .build_authorize_url(&ctx, &session_id, None)

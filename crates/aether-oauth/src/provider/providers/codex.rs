@@ -143,6 +143,7 @@ mod tests {
             endpoint_config: None,
             key_config: None,
             network: crate::network::OAuthNetworkContext::provider_operation(None),
+            user_agent: None,
         };
 
         let response = adapter
@@ -173,6 +174,7 @@ mod tests {
             endpoint_config: None,
             key_config: None,
             network: crate::network::OAuthNetworkContext::provider_operation(None),
+            user_agent: None,
         };
         let account = ProviderOAuthAccount {
             provider_type: "codex".to_string(),

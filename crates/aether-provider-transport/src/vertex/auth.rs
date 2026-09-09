@@ -223,6 +223,7 @@ impl LocalOAuthRefreshAdapter for VertexServiceAccountRefreshAdapter {
                     )]),
                     json_body: None,
                     body_bytes: Some(body.into_bytes()),
+                    user_agent: None,
                 },
             )
             .await?;

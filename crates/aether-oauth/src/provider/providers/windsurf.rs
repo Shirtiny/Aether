@@ -104,6 +104,7 @@ impl WindsurfProviderOAuthAdapter {
                     json_body,
                     body_bytes,
                     network: ctx.network.clone(),
+                    user_agent: ctx.user_agent.clone(),
                 })
                 .await;
             match response {
@@ -234,6 +235,7 @@ impl WindsurfProviderOAuthAdapter {
                 json_body: Some(json!({ "email": email, "password": password })),
                 body_bytes: None,
                 network: ctx.network.clone(),
+                user_agent: ctx.user_agent.clone(),
             })
             .await?;
         if !(200..300).contains(&login_response.status_code) {
@@ -266,6 +268,7 @@ impl WindsurfProviderOAuthAdapter {
                     json_body: None,
                     body_bytes: Some(Vec::new()),
                     network: ctx.network.clone(),
+                    user_agent: ctx.user_agent.clone(),
                 })
                 .await;
             match response {
@@ -1002,6 +1005,7 @@ mod tests {
             endpoint_config: None,
             key_config: None,
             network: crate::network::OAuthNetworkContext::provider_operation(None),
+            user_agent: None,
         }
     }
 

@@ -15,6 +15,10 @@ pub struct OAuthHttpRequest {
     pub json_body: Option<Value>,
     pub body_bytes: Option<Vec<u8>>,
     pub network: OAuthNetworkContext,
+    /// Account-scoped `User-Agent` carried from `ProviderOAuthTransportContext`.
+    /// The executor injects it as `user-agent` unless the headers map already
+    /// contains one.
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

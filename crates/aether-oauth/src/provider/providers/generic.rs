@@ -292,6 +292,7 @@ impl GenericProviderOAuthAdapter {
                 json_body: None,
                 body_bytes: None,
                 network: ctx.network.clone(),
+                user_agent: ctx.user_agent.clone(),
             })
             .await?;
         if !(200..300).contains(&response.status_code) {
@@ -352,6 +353,7 @@ impl GenericProviderOAuthAdapter {
                 json_body: None,
                 body_bytes: Some(form_body),
                 network: ctx.network.clone(),
+                user_agent: ctx.user_agent.clone(),
             })
             .await?;
         if !(200..300).contains(&response.status_code) {
@@ -446,6 +448,7 @@ impl GenericProviderOAuthAdapter {
                 json_body: None,
                 body_bytes: Some(form_body),
                 network: ctx.network.clone(),
+                user_agent: ctx.user_agent.clone(),
             })
             .await?;
         let payload = response
@@ -561,6 +564,7 @@ impl GenericProviderOAuthAdapter {
                     json_body: Some(Value::Object(body)),
                     body_bytes: None,
                     network: ctx.network.clone(),
+                    user_agent: ctx.user_agent.clone(),
                 })
                 .await?
         } else {
@@ -595,6 +599,7 @@ impl GenericProviderOAuthAdapter {
                     json_body: None,
                     body_bytes: Some(form_body),
                     network: ctx.network.clone(),
+                    user_agent: ctx.user_agent.clone(),
                 })
                 .await?
         };
@@ -1276,6 +1281,7 @@ mod tests {
             endpoint_config: None,
             key_config: None,
             network: crate::network::OAuthNetworkContext::provider_operation(None),
+            user_agent: None,
         };
         let response = adapter
             .build_authorize_url(&ctx, "state-1", Some("challenge-1"))
@@ -1393,6 +1399,7 @@ mod tests {
             endpoint_config: None,
             key_config: None,
             network: crate::network::OAuthNetworkContext::provider_operation(None),
+            user_agent: None,
         }
     }
 
@@ -1484,6 +1491,7 @@ mod tests {
             endpoint_config: None,
             key_config: None,
             network: crate::network::OAuthNetworkContext::provider_operation(None),
+            user_agent: None,
         };
         let account = ProviderOAuthAccount {
             provider_type: "codex".to_string(),
