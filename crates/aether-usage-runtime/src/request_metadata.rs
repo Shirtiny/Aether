@@ -200,6 +200,7 @@ fn copy_allowed_metadata_fields(source: &Map<String, Value>, target: &mut Map<St
     copy_non_null_value(source, target, "dimensions");
     copy_non_null_value(source, target, "billing_rule_snapshot");
     copy_non_null_value(source, target, "scheduling_audit");
+    copy_non_null_value(source, target, "internal_retry");
     copy_non_null_value(source, target, "tls_fingerprint");
     copy_number(source, target, "rate_multiplier");
     copy_bool(source, target, "is_free_tier");
@@ -251,6 +252,7 @@ fn move_allowed_metadata_fields(mut source: Map<String, Value>, target: &mut Map
     remove_non_null_value(&mut source, target, "dimensions");
     remove_non_null_value(&mut source, target, "billing_rule_snapshot");
     remove_non_null_value(&mut source, target, "scheduling_audit");
+    remove_non_null_value(&mut source, target, "internal_retry");
     remove_non_null_value(&mut source, target, "tls_fingerprint");
     remove_number(&mut source, target, "rate_multiplier");
     remove_bool(&mut source, target, "is_free_tier");
@@ -1185,6 +1187,20 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn internal_retry_metadata_survives_usage_sanitization_without_body_capture() {
+        let audit = json!({"version":1,"scope":"aether","kind":"same_plan_overload","retry_count":2,
+            "failures":[{"attempt":1,"status_code":503,"reason":"overloaded","planned_wait_ms":250,"wait_ms":251,"retry_started":true}],
+            "stop_reason":"budget_exhausted"});
+        let context =
+            json!({"internal_retry":audit,"original_request_body":{"text":"do not capture"}});
+        let seed = build_usage_request_metadata_seed(&sample_plan(), context.as_object()).unwrap();
+        assert_eq!(seed["internal_retry"], audit);
+        assert!(seed.get("original_request_body").is_none());
+        let owned = super::sanitize_usage_request_metadata(Some(seed)).unwrap();
+        assert_eq!(owned["internal_retry"], audit);
     }
 
     #[test]

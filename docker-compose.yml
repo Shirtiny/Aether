@@ -10,7 +10,7 @@ services:
       POSTGRES_DB: aether
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${DB_PASSWORD}
-      TZ: Asia/Shanghai
+      TZ: America/New_York
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
@@ -65,7 +65,7 @@ services:
       MYSQL_USER: ${MYSQL_USER:-aether}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-aether}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-aether_root}
-      TZ: Asia/Shanghai
+      TZ: America/New_York
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
@@ -83,6 +83,10 @@ services:
     image: ${APP_IMAGE:-ghcr.io/shirtiny/aether:latest}
     container_name: aether-app
     user: "0:0"
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 2606:4700:4700::1111
     extra_hosts:
       - host.docker.internal:host-gateway
     env_file:
@@ -90,7 +94,7 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@postgres:5432/aether
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
-      TZ: Asia/Shanghai
+      TZ: America/New_York
       AETHER_BASE_DIR: /opt/aether
       AETHER_UPDATE_STRATEGY: docker
       AETHER_DOCKER_UPDATE_COMMAND: ${AETHER_DOCKER_UPDATE_COMMAND:-./update.sh}

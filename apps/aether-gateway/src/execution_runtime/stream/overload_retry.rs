@@ -14,6 +14,7 @@ use tracing::info;
 use crate::ai_serving::api::openai_stream_terminal_error_body;
 use crate::execution_runtime::ndjson::{decode_stream_frame_ndjson, encode_stream_frame_ndjson};
 use crate::execution_runtime::overload_retry::OverloadRetry;
+use crate::execution_runtime::retry_audit::RetryAudit;
 use crate::execution_runtime::submission::{
     has_nested_error, resolve_local_sync_error_status_code,
 };
@@ -89,8 +90,28 @@ where
     F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = Result<Frames, IoError>> + Send,
 {
+    retry_opening_stream_with_audit(
+        frames,
+        reopen,
+        request_id,
+        provider_format,
+        RetryAudit::default(),
+    )
+}
+
+pub(super) fn retry_opening_stream_with_audit<F, Fut>(
+    mut frames: Frames,
+    mut reopen: F,
+    request_id: String,
+    provider_format: String,
+    audit: RetryAudit,
+) -> Frames
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Frames, IoError>> + Send,
+{
     stream! {
-        let mut retry = OverloadRetry::default();
+        let mut retry = OverloadRetry::with_audit(audit.clone());
         let mut headers_sent = false;
         'attempt: loop {
             let Some(first) = frames.next().await else {
@@ -172,6 +193,7 @@ where
                     .await
                 {
                     drop(frames);
+                    audit.dispatched();
                     frames = match reopen().await {
                         Ok(frames) => frames,
                         Err(err) => {
@@ -219,6 +241,7 @@ where
                 headers_sent = true;
             }
             if !(200..300).contains(&status_code) || !is_sse {
+                audit.close(if status_code >= 400 { "non_retryable_error" } else { "not_sse" }, None);
                 if (200..300).contains(&status_code) {
                     retry.recovered(&request_id);
                 }
@@ -261,6 +284,7 @@ where
                         continue;
                     }
                     if opening.bytes.len().saturating_add(chunk.len()) > MAX_OPENING_BYTES {
+                        audit.close("buffer_limit", None);
                         info!(
                             event_name = "upstream_overload_opening_committed",
                             request_id,
@@ -283,6 +307,7 @@ where
                                 .await
                             {
                                 drop(frames);
+                                audit.dispatched();
                                 frames = match reopen().await {
                                     Ok(frames) => frames,
                                     Err(err) => {
@@ -313,6 +338,8 @@ where
                             continue;
                         }
                         if matches!(inspection, OpeningInspection::Commit) {
+                            let (reason, event_type) = commit_record_reason(&opening.bytes[opening.commit_record_start..]);
+                            audit.close(reason, event_type.as_deref());
                             retry.recovered(&request_id);
                         }
                         if let Some(telemetry) = telemetry.take() {
@@ -321,6 +348,7 @@ where
                         yield data_frame(&opening.bytes);
                     }
                 } else {
+                    audit.close("stream_ended_before_content", None);
                     // EOF/transport failure is not proof of an explicit capacity
                     // rejection. Preserve it and never replay a possibly run job.
                     if let Some(telemetry) = telemetry.take() {
@@ -356,6 +384,7 @@ struct OpeningSse {
     scanned: usize,
     line_start: usize,
     record_start: usize,
+    commit_record_start: usize,
     saw_data_line: bool,
     raw_json_error: bool,
 }
@@ -396,12 +425,14 @@ impl OpeningSse {
                         OpeningInspection::Commit
                     )
                 {
+                    self.commit_record_start = self.record_start;
                     return OpeningInspection::Commit;
                 }
                 continue;
             }
             self.saw_data_line = false;
             let result = inspect_record(&self.bytes[self.record_start..index + 1]);
+            self.commit_record_start = self.record_start;
             self.record_start = index + 1;
             if !matches!(result, OpeningInspection::Pending) {
                 return result;
@@ -424,6 +455,95 @@ impl OpeningSse {
         self.raw_json_error = true;
         Some(error)
     }
+}
+
+// Only the first replay-closing record is summarized; never store its body.
+fn commit_record_reason(record: &[u8]) -> (&'static str, Option<String>) {
+    let Ok(text) = std::str::from_utf8(record) else {
+        return ("malformed_event", None);
+    };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut event = None;
+    let mut data = String::new();
+    for line in text.lines() {
+        if line.is_empty() && !data.is_empty() {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("event:") {
+            event = Some(value.trim().to_owned());
+        }
+        if let Some(value) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(value.trim());
+        }
+    }
+    if data.is_empty() {
+        return ("unknown_event", event);
+    }
+    if data == "[DONE]" {
+        return ("terminal_event", Some("done".into()));
+    }
+    let Ok(value) = serde_json::from_str::<Value>(&data) else {
+        return ("malformed_event", event);
+    };
+    let event = value
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or(event);
+    let kind = event.as_deref().unwrap_or("");
+    let item = value
+        .pointer("/item/type")
+        .or_else(|| value.pointer("/content_block/type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let delta = value.get("delta");
+    let delta_event = matches!(
+        kind,
+        "response.output_text.delta"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_summary_text.delta"
+    );
+    let reason = if matches!(
+        item,
+        "function_call"
+            | "web_search_call"
+            | "computer_call"
+            | "image_generation_call"
+            | "tool_use"
+    ) || matches!(
+        kind,
+        "response.function_call_arguments.delta" | "response.function_call_arguments.done"
+    ) {
+        "tool_started"
+    } else if delta_event && delta.and_then(Value::as_str).is_some_and(str::is_empty) {
+        "empty_output_event"
+    } else if (matches!(
+        kind,
+        "response.reasoning_text.delta" | "response.reasoning_summary_text.delta"
+    ) && delta.and_then(Value::as_str).is_some_and(|s| !s.is_empty()))
+        || item == "reasoning"
+        || item == "thinking"
+    {
+        "reasoning_started"
+    } else if matches!(
+        kind,
+        "response.completed" | "response.done" | "message_stop"
+    ) {
+        "terminal_event"
+    } else if (kind == "response.output_text.delta"
+        && delta.and_then(Value::as_str).is_some_and(|s| !s.is_empty()))
+        || item == "message"
+        || kind == "content_block_delta"
+        || value.get("choices").is_some()
+    {
+        "content_started"
+    } else {
+        "unknown_event"
+    };
+    (reason, event)
 }
 
 fn inspect_record(record: &[u8]) -> OpeningInspection {
@@ -537,6 +657,61 @@ mod tests {
         Arc,
     };
     use std::time::Duration;
+
+    #[test]
+    fn overload_retry_commit_diagnostics_distinguish_unknown_and_empty_output() {
+        for (body, reason) in [
+            (
+                r#"{"type":"response.output_text.delta","delta":"secret text"}"#,
+                "content_started",
+            ),
+            (
+                r#"{"type":"response.output_text.delta","delta":""}"#,
+                "empty_output_event",
+            ),
+            (
+                r#"{"type":"response.some_new_progress","data":"secret text"}"#,
+                "unknown_event",
+            ),
+            (
+                r#"{"type":"response.output_item.added","item":{"type":"function_call","arguments":"secret args"}}"#,
+                "tool_started",
+            ),
+            (
+                r#"{"type":"response.reasoning_summary_text.delta","delta":"secret reasoning"}"#,
+                "reasoning_started",
+            ),
+        ] {
+            let wire = format!("data: {body}\n\n");
+            let (actual, event) = commit_record_reason(wire.as_bytes());
+            assert_eq!(actual, reason);
+            assert!(!event.unwrap_or_default().contains("secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn overload_retry_audit_tracks_dispatch_and_window_without_altering_bytes() {
+        let audit = RetryAudit::default();
+        let mut stream = retry_opening_stream_with_audit(
+            attempt(200, sse(CREATED) + &sse(OVERLOAD)),
+            || async { Ok(attempt(200, sse(DELTA))) },
+            "audit-request".into(),
+            "openai:responses".into(),
+            audit.clone(),
+        );
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        let value = audit.snapshot();
+        assert_eq!(value["retry_count"], 1);
+        assert_eq!(value["failures"][0]["status_code"], 503);
+        assert_eq!(value["failures"][0]["retry_started"], true);
+        assert!(value["failures"][0]["wait_ms"].as_u64().unwrap() >= 250);
+        assert_eq!(value["stop_reason"], "content_started");
+        assert_eq!(value["stop_event_type"], "response.output_text.delta");
+        assert!(!value.to_string().contains("hello"));
+        assert!(!value.to_string().contains("failed-attempt-id"));
+    }
 
     const OVERLOAD: &str = r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"503","message":"Our servers are currently overloaded. Please try again later."}}}"#;
     const CREATED: &str = r#"{"type":"response.created","response":{"id":"failed-attempt-id","output":[],"status":"in_progress"}}"#;

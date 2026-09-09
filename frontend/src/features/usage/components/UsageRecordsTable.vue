@@ -965,9 +965,16 @@
                 v-if="record.has_retry"
                 data-usage-attempt-marker="retry"
                 class="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 flex-shrink-0"
-                title="此请求发生了重试"
+                :title="record.internal_retry && record.internal_retry.retry_count > 0 ? internalRetryLabel(record.internal_retry) : `此请求发生了候选重试；${internalRetryLabel(record.internal_retry)}`"
                 aria-label="发生重试"
               />
+            </div>
+            <div
+              v-if="record.internal_retry && record.internal_retry.retry_count > 0"
+              class="mt-1 text-xs text-blue-600 dark:text-blue-400"
+              data-internal-retry-badge
+            >
+              {{ internalRetryLabel(record.internal_retry) }}
             </div>
           </TableCell>
           <TableCell
@@ -1229,6 +1236,7 @@
 </template>
 
 <script setup lang="ts">
+import { internalRetryLabel } from '../utils/internalRetry'
 import { ref, computed, watch } from 'vue'
 import { useDebounceFn, useLocalStorage } from '@vueuse/core'
 import {

@@ -234,6 +234,14 @@ async fn overload_retry_missing_media_type_recovery_and_native_exhaustion() {
                         record.status,
                         if persistent { "failed" } else { "completed" }
                     );
+                    let audit =
+                        &record.request_metadata.as_ref().expect("metadata")["internal_retry"];
+                    assert_eq!(audit["retry_count"], if persistent { 2 } else { 1 });
+                    assert_eq!(audit["scope"], "aether");
+                    if persistent {
+                        assert_eq!(audit["stop_reason"], "budget_exhausted");
+                    }
+
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -356,6 +364,17 @@ async fn overload_retry_missing_terminal_emits_native_failure_without_fabricatin
                 Err(err) => panic!("terminal persistence timed out: {client} content={content}: {err:?}; last={:?}", usage.find_by_request_id(&request_id).await.unwrap()),
             };
             assert_eq!(record.status, "failed", "{client} {content}: {record:?}");
+            let audit = &record.request_metadata.as_ref().expect("metadata")["internal_retry"];
+            assert_eq!(audit["retry_count"], 0);
+            assert_eq!(
+                audit["stop_reason"],
+                if content {
+                    "content_started"
+                } else {
+                    "stream_ended_before_content"
+                }
+            );
+
             assert!(record
                 .error_message
                 .unwrap_or_default()

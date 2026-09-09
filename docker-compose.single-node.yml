@@ -6,7 +6,7 @@ services:
     env_file:
       - ${AETHER_ENV_FILE:-.env}
     environment:
-      TZ: Asia/Shanghai
+      TZ: America/New_York
       AETHER_BASE_DIR: /opt/aether
       AETHER_UPDATE_STRATEGY: docker
       AETHER_DOCKER_UPDATE_COMMAND: ${AETHER_DOCKER_UPDATE_COMMAND:-./update.sh}

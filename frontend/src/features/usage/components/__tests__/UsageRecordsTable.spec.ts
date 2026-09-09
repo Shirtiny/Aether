@@ -335,6 +335,15 @@ describe('UsageRecordsTable', () => {
     expect(onUpdateHideUnknownRecords).toHaveBeenCalledWith(true)
   })
 
+  it('shows internal retry count and authoritative final outcome', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      has_retry: true,
+      internal_retry: { version: 1, scope: 'aether', retry_count: 2, complete: true, outcome: 'failed', attempts: [] },
+    })])
+    expect(root.querySelector('[data-internal-retry-badge]')?.textContent).toContain('内部重试 2 次 · 最终失败')
+    expect(root.querySelector('[data-usage-attempt-marker="retry"]')?.getAttribute('title')).toContain('最终失败')
+  })
+
   it('shows retry and fallback markers together when both flags are set', () => {
     const root = mountUsageRecordsTable([buildRecord({
       has_fallback: true,

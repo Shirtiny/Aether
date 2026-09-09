@@ -7,6 +7,9 @@ use super::replay::{
     admin_usage_resolve_request_capture_body_for_item, build_admin_usage_curl_response,
     build_admin_usage_detail_payload, build_admin_usage_replay_response,
 };
+use super::summary_routes::{
+    admin_usage_attempt_flags_for_item, resolve_admin_usage_attempt_flags_by_usage_id,
+};
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::{attach_admin_audit_response, query_param_bool};
 use crate::GatewayError;
@@ -207,7 +210,7 @@ pub(super) async fn maybe_build_local_admin_usage_detail_response(
                 // request_body 已通过 request capture 解析；其余 detached body 在上方并行加载。
             }
             let default_headers = admin_usage_curl_headers();
-            let payload = build_admin_usage_detail_payload(
+            let mut payload = build_admin_usage_detail_payload(
                 &detail_item,
                 &users_by_id,
                 &api_key_names,
@@ -218,6 +221,17 @@ pub(super) async fn maybe_build_local_admin_usage_detail_response(
                 request_body,
                 &default_headers,
             );
+
+            let attempt_flags =
+                resolve_admin_usage_attempt_flags_by_usage_id(state, std::slice::from_ref(&item))
+                    .await?;
+            let flags = admin_usage_attempt_flags_for_item(
+                &item,
+                &attempt_flags,
+                state.has_request_candidate_data_reader(),
+            );
+            payload["has_retry"] = json!(flags.has_retry);
+            payload["internal_retry"] = json!(flags.internal_retry);
 
             return Ok(Some(attach_admin_audit_response(
                 Json(payload).into_response(),

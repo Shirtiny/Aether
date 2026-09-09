@@ -14,6 +14,7 @@ mod overload_retry;
 #[cfg(test)]
 pub(crate) mod remote_compat;
 mod response_header_rules;
+mod retry_audit;
 mod server;
 mod session_risk_control;
 pub(crate) mod stream;

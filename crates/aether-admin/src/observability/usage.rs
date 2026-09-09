@@ -6,6 +6,7 @@ use aether_billing::{
 };
 use aether_data::repository::users::StoredUserSummary;
 use aether_data_contracts::repository::{
+    candidates::StoredRequestCandidate,
     provider_catalog::{StoredProviderCatalogEndpoint, StoredProviderCatalogProvider},
     usage::{StoredRequestUsageAudit, StoredUsageAuditSummary, UsageBodyField},
 };
@@ -18,6 +19,99 @@ use axum::{
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use url::form_urlencoded;
+
+// Prefer per-candidate diagnostics so a later failover cannot hide earlier
+// internal retries. No metadata is treated as unknown, never as zero retries.
+pub fn admin_usage_internal_retry(
+    item: &StoredRequestUsageAudit,
+    candidates: &[StoredRequestCandidate],
+) -> Option<Value> {
+    let mut attempts = Vec::new();
+    let mut complete = true;
+    for candidate in candidates
+        .iter()
+        .filter(|c| c.status.is_attempted(c.started_at_unix_ms))
+    {
+        let audit = candidate
+            .extra_data
+            .as_ref()
+            .and_then(|v| v.get("internal_retry"))
+            .or_else(|| {
+                (item.routing_candidate_id() == Some(candidate.id.as_str()))
+                    .then(|| {
+                        item.request_metadata
+                            .as_ref()
+                            .and_then(|v| v.get("internal_retry"))
+                    })
+                    .flatten()
+            });
+        if let Some(mut audit) = audit.and_then(valid_internal_retry_audit) {
+            audit["candidate_index"] = json!(candidate.candidate_index);
+            audit["retry_index"] = json!(candidate.retry_index);
+            attempts.push(audit);
+        } else {
+            complete = false;
+        }
+    }
+    if attempts.is_empty() {
+        if let Some(mut audit) = item
+            .request_metadata
+            .as_ref()
+            .and_then(|v| v.get("internal_retry"))
+            .and_then(valid_internal_retry_audit)
+        {
+            audit["candidate_index"] = json!(item.routing_candidate_index());
+            audit["retry_index"] = Value::Null;
+            complete = candidates.is_empty() && item.routing_candidate_index().unwrap_or(0) == 0;
+            attempts.push(audit);
+        }
+    }
+    if attempts.is_empty() {
+        return None;
+    }
+    let count: u64 = attempts
+        .iter()
+        .filter_map(|v| v.get("retry_count").and_then(Value::as_u64))
+        .sum();
+    let outcome = if count == 0 {
+        if complete {
+            "not_retried"
+        } else {
+            "unknown"
+        }
+    } else {
+        match item.status.as_str() {
+            "completed" => "succeeded",
+            "failed" => "failed",
+            "cancelled" => "cancelled",
+            _ => "in_progress",
+        }
+    };
+    Some(
+        json!({"version":1,"scope":"aether","retry_count":count,"complete":complete,"outcome":outcome,"attempts":attempts}),
+    )
+}
+
+fn valid_internal_retry_audit(value: &Value) -> Option<Value> {
+    if value.get("version").and_then(Value::as_u64) != Some(1)
+        || value.get("scope").and_then(Value::as_str) != Some("aether")
+        || value.get("kind").and_then(Value::as_str) != Some("same_plan_overload")
+        || value
+            .get("retry_count")
+            .and_then(Value::as_u64)
+            .is_none_or(|n| n > 2)
+    {
+        return None;
+    }
+    // Response DTO uses only the documented, body-free fields.
+    let failures: Vec<_> = value.get("failures").and_then(Value::as_array).into_iter().flatten().take(3)
+        .map(|v| json!({"attempt":v.get("attempt"),"status_code":v.get("status_code"),"reason":v.get("reason"),
+            "planned_wait_ms":v.get("planned_wait_ms"),"wait_ms":v.get("wait_ms"),"retry_started":v.get("retry_started")})).collect();
+    Some(
+        json!({"retry_count":value["retry_count"],"failures":failures,
+        "stop_reason":value.get("stop_reason"),"stop_event_type":value.get("stop_event_type")}),
+    )
+}
 
 pub const ADMIN_USAGE_DATA_UNAVAILABLE_DETAIL: &str = "Admin usage data unavailable";
 
@@ -1414,6 +1508,12 @@ pub fn admin_usage_record_json(
         "provider_key_name": provider_key_name,
         "model_version": Value::Null,
     });
+    let internal_retry = admin_usage_internal_retry(item, &[]);
+    payload["has_retry"] = json!(internal_retry
+        .as_ref()
+        .and_then(|v| v["retry_count"].as_u64())
+        .is_some_and(|n| n > 0));
+    payload["internal_retry"] = json!(internal_retry);
     let object = payload
         .as_object_mut()
         .expect("admin usage record payload should be an object");
@@ -2705,6 +2805,36 @@ mod tests {
         admin_usage_upstream_is_stream, build_admin_usage_detail_payload,
     };
     use aether_data_contracts::repository::usage::{StoredRequestUsageAudit, UsageBodyField};
+
+    #[test]
+    fn internal_retry_display_uses_final_state_and_preserves_unknown_history() {
+        let mut item = sample_usage("completed", Some(200), None);
+        assert!(super::admin_usage_internal_retry(&item, &[]).is_none());
+        item.request_metadata = Some(
+            json!({"internal_retry":{"version":1,"scope":"aether","kind":"same_plan_overload",
+            "retry_count":1,"failures":[{"attempt":1,"status_code":503,"reason":"overloaded","retry_started":true,"body":"secret"}],
+            "stop_reason":"content_started","stop_event_type":"response.output_text.delta","body":"secret"}}),
+        );
+        let summary = super::admin_usage_internal_retry(&item, &[]).unwrap();
+        assert_eq!(summary["retry_count"], 1);
+        assert_eq!(summary["outcome"], "succeeded");
+        assert!(!summary.to_string().contains("secret"));
+        item.status = "failed".into();
+        assert_eq!(
+            super::admin_usage_internal_retry(&item, &[]).unwrap()["outcome"],
+            "failed"
+        );
+        item.status = "streaming".into();
+        assert_eq!(
+            super::admin_usage_internal_retry(&item, &[]).unwrap()["outcome"],
+            "in_progress"
+        );
+        item.request_metadata.as_mut().unwrap()["internal_retry"]["retry_count"] = json!(0);
+        assert_eq!(
+            super::admin_usage_internal_retry(&item, &[]).unwrap()["outcome"],
+            "not_retried"
+        );
+    }
 
     fn sample_usage(
         status: &str,

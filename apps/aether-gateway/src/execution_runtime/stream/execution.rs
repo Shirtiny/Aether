@@ -77,6 +77,7 @@ use crate::execution_runtime::kiro_web_search::maybe_execute_kiro_web_search_str
 use crate::execution_runtime::oauth_retry::refresh_oauth_plan_auth_for_retry;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::post_stream_plan_to_remote_execution_runtime;
+use crate::execution_runtime::retry_audit::{with_retry_audit, RetryAudit};
 use crate::execution_runtime::session_risk_control::should_return_and_record_session_risk_control_block_response;
 use crate::execution_runtime::stream_pump::build_direct_frame_stream;
 use crate::execution_runtime::submission::{
@@ -964,7 +965,7 @@ fn build_retrying_direct_frame_stream(
     trace_id: &str,
     report_context: Option<&Value>,
     execution: DirectUpstreamStreamExecution,
-) -> BoxStream<'static, Result<Bytes, IoError>> {
+) -> (BoxStream<'static, Result<Bytes, IoError>>, RetryAudit) {
     let inspect_wire = plan.stream
         && super::wire::public_text_stream_format(&plan.provider_api_format)
         && super::wire::public_text_stream_format(&plan.client_api_format)
@@ -975,7 +976,8 @@ fn build_retrying_direct_frame_stream(
     let trace_id = trace_id.to_owned();
     let report_context = report_context.cloned();
     let provider_format = plan.provider_api_format.clone();
-    super::overload_retry::retry_opening_stream(
+    let audit = RetryAudit::default();
+    let frames = super::overload_retry::retry_opening_stream_with_audit(
         super::wire::inspect_stream_wire(
             build_direct_frame_stream(execution, !inspect_wire).boxed(),
             inspect_wire,
@@ -1004,7 +1006,9 @@ fn build_retrying_direct_frame_stream(
         },
         request_id,
         provider_format,
-    )
+        audit.clone(),
+    );
+    (frames, audit)
 }
 
 #[allow(clippy::too_many_arguments)] // internal function, grouping would add unnecessary indirection
@@ -1266,14 +1270,14 @@ pub(crate) async fn execute_execution_runtime_stream(
                 return Ok(None);
             }
         };
-        let frame_stream = build_retrying_direct_frame_stream(
+        let (frame_stream, retry_audit) = build_retrying_direct_frame_stream(
             state,
             &plan,
             trace_id,
             report_context.as_ref(),
             execution,
         );
-        return execute_stream_from_frame_stream(
+        return execute_stream_from_frame_stream_with_retry_audit(
             state,
             plan,
             trace_id,
@@ -1285,6 +1289,7 @@ pub(crate) async fn execute_execution_runtime_stream(
             stream_started_at,
             frame_stream,
             provider_pool_in_flight_guard.take(),
+            Some(retry_audit),
         )
         .await;
     }
@@ -1337,14 +1342,14 @@ pub(crate) async fn execute_execution_runtime_stream(
                     return Ok(None);
                 }
             };
-            let frame_stream = build_retrying_direct_frame_stream(
+            let (frame_stream, retry_audit) = build_retrying_direct_frame_stream(
                 state,
                 &plan,
                 trace_id,
                 report_context.as_ref(),
                 execution,
             );
-            return execute_stream_from_frame_stream(
+            return execute_stream_from_frame_stream_with_retry_audit(
                 state,
                 plan,
                 trace_id,
@@ -1356,6 +1361,7 @@ pub(crate) async fn execute_execution_runtime_stream(
                 stream_started_at,
                 frame_stream,
                 provider_pool_in_flight_guard.take(),
+                Some(retry_audit),
             )
             .await;
         }
@@ -2475,6 +2481,37 @@ async fn execute_stream_from_frame_stream(
     frame_stream: BoxStream<'static, Result<Bytes, IoError>>,
     in_flight_guard: Option<ProviderPoolInFlightGuard>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
+    execute_stream_from_frame_stream_with_retry_audit(
+        state,
+        plan,
+        trace_id,
+        decision,
+        plan_kind,
+        report_kind,
+        report_context,
+        candidate_started_unix_secs,
+        stream_started_at,
+        frame_stream,
+        in_flight_guard,
+        None,
+    )
+    .await
+}
+
+async fn execute_stream_from_frame_stream_with_retry_audit(
+    state: &AppState,
+    plan: ExecutionPlan,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    plan_kind: &str,
+    report_kind: Option<String>,
+    report_context: Option<serde_json::Value>,
+    candidate_started_unix_secs: u64,
+    stream_started_at: Instant,
+    frame_stream: BoxStream<'static, Result<Bytes, IoError>>,
+    in_flight_guard: Option<ProviderPoolInFlightGuard>,
+    retry_audit: Option<RetryAudit>,
+) -> Result<Option<Response<Body>>, GatewayError> {
     let stream_lifecycle_timeouts = resolve_stream_lifecycle_timeouts(&plan);
     let request_id = plan.request_id.as_str();
     let request_id_for_log = short_request_id(request_id);
@@ -2513,8 +2550,10 @@ async fn execute_stream_from_frame_stream(
             "execution runtime stream must start with headers frame".to_string(),
         ));
     };
-    let mut report_context =
-        attach_provider_response_headers_to_report_context(report_context, &headers);
+    let mut report_context = attach_provider_response_headers_to_report_context(
+        with_retry_audit(report_context, retry_audit.as_ref()),
+        &headers,
+    );
     if status_code == 200 {
         seed_kiro_simulated_cache_enabled(state, &plan, &mut report_context).await;
         if kiro_simulated_cache_enabled_from_report_context(report_context.as_ref()) {
@@ -3140,7 +3179,7 @@ async fn execute_stream_from_frame_stream(
                         trace_id,
                         decision,
                         &plan,
-                        report_context,
+                        with_retry_audit(report_context, retry_audit.as_ref()),
                         request_id,
                         candidate_id,
                         report_kind,
@@ -3165,7 +3204,7 @@ async fn execute_stream_from_frame_stream(
                         trace_id,
                         decision,
                         &plan,
-                        report_context,
+                        with_retry_audit(report_context, retry_audit.as_ref()),
                         request_id,
                         candidate_id,
                         report_kind,
@@ -3208,7 +3247,7 @@ async fn execute_stream_from_frame_stream(
                                     trace_id,
                                     decision,
                                     &plan,
-                                    report_context,
+                                    with_retry_audit(report_context, retry_audit.as_ref()),
                                     request_id,
                                     candidate_id,
                                     report_kind,
@@ -3293,7 +3332,7 @@ async fn execute_stream_from_frame_stream(
                             trace_id,
                             decision,
                             &plan,
-                            report_context,
+                            with_retry_audit(report_context, retry_audit.as_ref()),
                             request_id,
                             candidate_id,
                             report_kind,
@@ -3373,7 +3412,7 @@ async fn execute_stream_from_frame_stream(
                                 trace_id,
                                 decision,
                                 &plan,
-                                report_context,
+                                with_retry_audit(report_context, retry_audit.as_ref()),
                                 request_id,
                                 candidate_id,
                                 report_kind,
@@ -3433,7 +3472,7 @@ async fn execute_stream_from_frame_stream(
                                         trace_id,
                                         decision,
                                         &plan,
-                                        report_context,
+                                        with_retry_audit(report_context, retry_audit.as_ref()),
                                         request_id,
                                         candidate_id,
                                         report_kind,
@@ -3466,7 +3505,7 @@ async fn execute_stream_from_frame_stream(
                                     trace_id,
                                     decision,
                                     &plan,
-                                    report_context,
+                                    with_retry_audit(report_context, retry_audit.as_ref()),
                                     request_id,
                                     candidate_id,
                                     report_kind,
@@ -3497,7 +3536,7 @@ async fn execute_stream_from_frame_stream(
                                     trace_id,
                                     decision,
                                     &plan,
-                                    report_context,
+                                    with_retry_audit(report_context, retry_audit.as_ref()),
                                     request_id,
                                     candidate_id,
                                     report_kind,
@@ -3550,7 +3589,7 @@ async fn execute_stream_from_frame_stream(
                         trace_id,
                         decision,
                         &plan,
-                        report_context,
+                        with_retry_audit(report_context, retry_audit.as_ref()),
                         request_id,
                         candidate_id,
                         report_kind,
@@ -3670,7 +3709,7 @@ async fn execute_stream_from_frame_stream(
     let trace_id_owned = trace_id.to_string();
     let headers_for_report = headers.clone();
     let report_kind_owned = report_kind;
-    let report_context_owned = report_context;
+    let mut report_context_owned = with_retry_audit(report_context, retry_audit.as_ref());
     let normalized_stream_report_context_owned = normalized_stream_report_context;
     let lifecycle_seed_for_report = lifecycle_seed;
     let provider_prefetched_body_for_report = provider_prefetched_body;
@@ -4781,6 +4820,18 @@ async fn execute_stream_from_frame_stream(
                 );
             }
         }
+
+        if let Some(audit) = retry_audit.as_ref() {
+            audit.close(
+                if downstream_dropped {
+                    "client_cancelled"
+                } else {
+                    "stream_ended"
+                },
+                None,
+            );
+        }
+        report_context_owned = with_retry_audit(report_context_owned, retry_audit.as_ref());
 
         remember_provider_session_risk_control_block_for_terminal_summary(
             &state_for_report,

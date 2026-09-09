@@ -1,7 +1,8 @@
 //! Bounded retries of an explicitly rejected request, never account failover.
+use super::retry_audit::RetryAudit;
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::info;
 
@@ -10,9 +11,17 @@ use crate::orchestration::{is_session_preserving_overload, LocalFailoverInput};
 #[derive(Default)]
 pub(super) struct OverloadRetry {
     attempts: usize,
+    audit: Option<RetryAudit>,
 }
 
 impl OverloadRetry {
+    pub(super) fn with_audit(audit: RetryAudit) -> Self {
+        Self {
+            attempts: 0,
+            audit: Some(audit),
+        }
+    }
+
     pub(super) async fn wait(
         &mut self,
         request_id: &str,
@@ -20,7 +29,24 @@ impl OverloadRetry {
         text: Option<&str>,
         headers: &BTreeMap<String, String>,
     ) -> bool {
-        let Some(delay) = self.delay(request_id, status, text, headers) else {
+        let delay = self.delay(request_id, status, text, headers);
+        if let Some(audit) = self.audit.as_ref() {
+            if is_session_preserving_overload(LocalFailoverInput::new(status, text)) {
+                audit.rejection(status, "overloaded", delay.map(|d| d.as_millis() as u64));
+                if delay.is_none() {
+                    let reason = if self.attempts >= 2 {
+                        "budget_exhausted"
+                    } else {
+                        "retry_after_rejected"
+                    };
+                    audit.close(reason, None);
+                }
+            } else if status >= 400 {
+                audit.rejection(status, "non_retryable_error", None);
+                audit.close("non_retryable_error", None);
+            }
+        }
+        let Some(delay) = delay else {
             return false;
         };
         self.attempts += 1;
@@ -31,7 +57,11 @@ impl OverloadRetry {
             delay_ms = delay.as_millis() as u64,
             "retrying capacity rejection on the same prepared upstream plan"
         );
+        let started = Instant::now();
         tokio::time::sleep(delay).await;
+        if let Some(audit) = self.audit.as_ref() {
+            audit.waited(started);
+        }
         true
     }
 
