@@ -266,28 +266,13 @@ async fn persist_local_request_candidate_status_record(
     }
 }
 
-fn attach_internal_retry_to_candidate(
-    record: &mut UpsertRequestCandidateRecord,
-    context: Option<&Value>,
-) {
-    let Some(audit) = context.and_then(|v| v.get("internal_retry")) else {
-        return;
-    };
-    let extra = record
-        .extra_data
-        .get_or_insert_with(|| serde_json::json!({}));
-    if let Some(extra) = extra.as_object_mut() {
-        extra.insert("internal_retry".into(), audit.clone());
-    }
-}
-
 pub(crate) async fn record_local_request_candidate_status(
     state: &(impl RequestCandidateRuntimeWriter + ?Sized),
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
     status_update: SchedulerRequestCandidateStatusUpdate,
 ) {
-    let Some(mut record) =
+    let Some(record) =
         build_local_request_candidate_status_record(LocalRequestCandidateStatusRecordInput {
             plan,
             report_context,
@@ -296,7 +281,6 @@ pub(crate) async fn record_local_request_candidate_status(
     else {
         return;
     };
-    attach_internal_retry_to_candidate(&mut record, report_context);
     persist_local_request_candidate_status_record(state, record).await;
 }
 
@@ -435,13 +419,12 @@ pub(crate) async fn record_report_request_candidate_status(
     let request_id_for_log = short_request_id(request_id.as_str());
     let candidate_index = slot.candidate_index;
     let retry_index = slot.retry_index;
-    let mut record =
+    let record =
         build_report_request_candidate_status_record(ReportRequestCandidateStatusRecordInput {
             slot,
             status_update,
             now_unix_ms: current_unix_ms(),
         });
-    attach_internal_retry_to_candidate(&mut record, report_context);
     let candidate_id = record.id.clone();
     let status = record.status;
 

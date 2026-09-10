@@ -1,4 +1,3 @@
-import type { InternalRetryInfo } from '@/types/internalRetry'
 import apiClient from './client'
 import { cachedRequest, buildCacheKey } from '@/utils/cache'
 
@@ -155,8 +154,6 @@ export interface RequestSchedulingFailure {
 }
 
 export interface RequestDetail {
-  internal_retry?: InternalRetryInfo | null
-  has_retry?: boolean
   id: string // UUID
   request_id: string
   user: {

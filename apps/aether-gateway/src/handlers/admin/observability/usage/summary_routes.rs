@@ -7,10 +7,10 @@ use crate::handlers::shared::{resolve_usage_terminal_sync_state, UsageTerminalSy
 use crate::GatewayError;
 use aether_admin::observability::usage::{
     admin_usage_bad_request_response, admin_usage_data_unavailable_response,
-    admin_usage_has_fallback, admin_usage_internal_retry, admin_usage_is_failed,
-    admin_usage_is_ping, admin_usage_is_risk_control, admin_usage_parse_ids,
-    admin_usage_parse_limit, admin_usage_parse_offset, admin_usage_provider_key_name,
-    admin_usage_record_json, build_admin_usage_active_requests_response,
+    admin_usage_has_fallback, admin_usage_is_failed, admin_usage_is_ping,
+    admin_usage_is_risk_control, admin_usage_parse_ids, admin_usage_parse_limit,
+    admin_usage_parse_offset, admin_usage_provider_key_name, admin_usage_record_json,
+    build_admin_usage_active_requests_response,
     build_admin_usage_active_requests_response_with_terminal_sync,
     build_admin_usage_records_response, build_admin_usage_summary_stats_response_from_summary,
     ADMIN_USAGE_DATA_UNAVAILABLE_DETAIL,
@@ -78,11 +78,10 @@ fn apply_admin_usage_status_filter(query: &mut UsageAuditListQuery, status: Opti
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub(super) struct AdminUsageAttemptFlags {
+#[derive(Clone, Copy, Debug, Default)]
+struct AdminUsageAttemptFlags {
     has_fallback: bool,
-    pub(super) has_retry: bool,
-    pub(super) internal_retry: Option<serde_json::Value>,
+    has_retry: bool,
     terminal_sync: UsageTerminalSyncState,
 }
 
@@ -143,17 +142,11 @@ fn admin_usage_attempt_flags_from_candidates(
                 && admin_usage_candidate_failed_before_fallback(candidate)
         })
     });
-    let internal_retry = admin_usage_internal_retry(item, candidates);
-    let has_retry = candidates.iter().any(admin_usage_candidate_was_retried)
-        || internal_retry
-            .as_ref()
-            .and_then(|v| v["retry_count"].as_u64())
-            .is_some_and(|n| n > 0);
+    let has_retry = candidates.iter().any(admin_usage_candidate_was_retried);
 
     AdminUsageAttemptFlags {
         has_fallback,
         has_retry,
-        internal_retry,
         terminal_sync: resolve_usage_terminal_sync_state(
             &item.status,
             item.created_at_unix_ms,
@@ -162,12 +155,12 @@ fn admin_usage_attempt_flags_from_candidates(
     }
 }
 
-pub(super) fn admin_usage_attempt_flags_for_item(
+fn admin_usage_attempt_flags_for_item(
     item: &StoredRequestUsageAudit,
     flags_by_usage_id: &BTreeMap<String, AdminUsageAttemptFlags>,
     request_candidate_reader_available: bool,
 ) -> AdminUsageAttemptFlags {
-    let mut flags = flags_by_usage_id.get(&item.id).cloned().unwrap_or_else(|| {
+    flags_by_usage_id.get(&item.id).copied().unwrap_or_else(|| {
         if request_candidate_reader_available {
             AdminUsageAttemptFlags::default()
         } else {
@@ -177,19 +170,10 @@ pub(super) fn admin_usage_attempt_flags_for_item(
                 ..Default::default()
             }
         }
-    });
-    if flags.internal_retry.is_none() {
-        flags.internal_retry = admin_usage_internal_retry(item, &[]);
-    }
-    flags.has_retry |= flags
-        .internal_retry
-        .as_ref()
-        .and_then(|v| v["retry_count"].as_u64())
-        .is_some_and(|n| n > 0);
-    flags
+    })
 }
 
-pub(super) async fn resolve_admin_usage_attempt_flags_by_usage_id(
+async fn resolve_admin_usage_attempt_flags_by_usage_id(
     state: &AdminAppState<'_>,
     items: &[StoredRequestUsageAudit],
 ) -> Result<BTreeMap<String, AdminUsageAttemptFlags>, GatewayError> {
@@ -472,7 +456,6 @@ fn build_admin_usage_records_response_with_attempt_flags(
             );
             record["has_fallback"] = json!(flags.has_fallback);
             record["has_retry"] = json!(flags.has_retry);
-            record["internal_retry"] = json!(flags.internal_retry);
             record["terminal_sync_pending"] = json!(flags.terminal_sync.pending);
             record["terminal_response_time_ms"] = json!(flags.terminal_sync.response_time_ms);
             record

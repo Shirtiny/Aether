@@ -182,7 +182,6 @@
               v-else-if="detail"
               class="space-y-4"
             >
-              <InternalRetryDetails :info="detail.internal_retry" />
               <!-- 执行失败原因：优先展示本地调度/运行时失败摘要 -->
               <Card
                 v-if="failureNotice"
@@ -1026,7 +1025,6 @@ import JsonContentPanel from './JsonContentPanel.vue'
 import ConversationView from './RequestDetailDrawer/ConversationView.vue'
 import HorizontalRequestTimeline from './HorizontalRequestTimeline.vue'
 import ReplayDialog from './ReplayDialog.vue'
-import InternalRetryDetails from './InternalRetryDetails.vue'
 
 // 对话解析器
 import {

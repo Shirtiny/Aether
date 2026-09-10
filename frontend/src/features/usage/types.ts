@@ -1,4 +1,3 @@
-import type { InternalRetryInfo } from '@/types/internalRetry'
 import type { ImageProgress } from '@/api/requestTrace'
 
 // 统计数据状态
@@ -140,7 +139,6 @@ export interface UsageRecord {
   created_at: string
   has_fallback?: boolean
   has_retry?: boolean
-  internal_retry?: InternalRetryInfo | null
   image_progress?: ImageProgress | null
 }
 

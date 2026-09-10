@@ -111,8 +111,7 @@ SELECT
   NULL::json AS client_response_body,
   NULL::bytea AS client_response_body_compressed,
   CASE
-    WHEN jsonb_typeof(("usage".request_metadata->'internal_retry')::jsonb) = 'object'
-      OR NULLIF(BTRIM("usage".request_metadata->>'client_ip'), '') IS NOT NULL
+    WHEN NULLIF(BTRIM("usage".request_metadata->>'client_ip'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->'client_session_affinity'->>'session_key'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->'client_session_affinity'->>'client_family'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'user_agent'), '') IS NOT NULL
@@ -143,7 +142,6 @@ SELECT
       OR NULLIF(BTRIM("usage".request_metadata->'dimensions'->>'reasoning_output_tokens'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->'dimensions'->>'reasoning_tokens'), '') IS NOT NULL
       THEN jsonb_strip_nulls(jsonb_build_object(
-        'internal_retry', "usage".request_metadata->'internal_retry',
         'client_session_affinity',
         CASE
           WHEN NULLIF(BTRIM("usage".request_metadata->'client_session_affinity'->>'session_key'), '') IS NOT NULL
