@@ -19,10 +19,21 @@ fn normalized_provider_oauth_concurrent_limit(
     provider_type: &str,
     current: Option<i32>,
 ) -> Option<i32> {
-    if !provider_type.trim().eq_ignore_ascii_case("grok") {
+    // Reauthorization must not disturb an operator's value; only a missing one
+    // is filled, so a Grok/Codex login never re-enters the pool unlimited.
+    if !provider_is_oauth_quota_account(provider_type) {
         return current;
     }
     current.or(Some(1))
+}
+
+/// Personal-quota OAuth providers whose accounts default to one in-flight
+/// request; the admin key write path shares the same predicate.
+fn provider_is_oauth_quota_account(provider_type: &str) -> bool {
+    crate::handlers::admin::provider::write::keys::provider_key_is_oauth_quota_account(
+        provider_type,
+        "oauth",
+    )
 }
 
 pub(crate) fn provider_oauth_key_proxy_value(
@@ -279,7 +290,7 @@ pub(crate) async fn create_provider_oauth_catalog_key_with_client_identity(
     )
     .map_err(|err| GatewayError::Internal(err.to_string()))?;
     record.internal_priority = 50;
-    if provider_type.trim().eq_ignore_ascii_case("grok") {
+    if provider_is_oauth_quota_account(provider_type) {
         record.concurrent_limit = Some(1);
     }
     record.cache_ttl_minutes = 5;
@@ -554,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_oauth_reauthorization_defaults_missing_concurrency_only() {
+    fn oauth_reauthorization_defaults_missing_concurrency_only() {
         assert_eq!(
             normalized_provider_oauth_concurrent_limit("grok", Some(0)),
             Some(0)
@@ -570,6 +581,14 @@ mod tests {
         assert_eq!(
             normalized_provider_oauth_concurrent_limit("codex", Some(4)),
             Some(4)
+        );
+        assert_eq!(
+            normalized_provider_oauth_concurrent_limit("codex", None),
+            Some(1)
+        );
+        assert_eq!(
+            normalized_provider_oauth_concurrent_limit("Codex", None),
+            Some(1)
         );
     }
 }

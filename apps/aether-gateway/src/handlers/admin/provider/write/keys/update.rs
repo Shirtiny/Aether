@@ -285,8 +285,8 @@ pub(crate) async fn build_admin_update_provider_key_record(
             false,
         )?;
     } else if auth_type_switch
-        && provider.provider_type.trim().eq_ignore_ascii_case("grok")
         && updated.auth_type.eq_ignore_ascii_case("oauth")
+        && super::provider_key_is_oauth_quota_account(&provider.provider_type, &updated.auth_type)
     {
         updated.concurrent_limit = Some(1);
     }

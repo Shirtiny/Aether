@@ -395,6 +395,8 @@ pub(crate) struct EnvironmentContextRewriteReport {
     pub(crate) instant_sources: [u32; 5],
     pub(crate) unknown_child_tags: u32,
     pub(crate) user_location_removed: u32,
+    /// `msg_…` / `at_…` prefix-cache ids re-derived from the outbound thread.
+    pub(crate) prefix_cache_ids_rewritten: u32,
 }
 
 impl EnvironmentContextRewriteReport {
@@ -440,6 +442,7 @@ pub(crate) fn log_environment_context_report(
             instant_source_heuristic = report.instant_sources[4],
             unknown_child_tags = report.unknown_child_tags,
             user_location_removed = report.user_location_removed,
+            prefix_cache_ids_rewritten = report.prefix_cache_ids_rewritten,
             "codex environment_context history normalized"
         );
     } else {
@@ -458,6 +461,7 @@ pub(crate) fn log_environment_context_report(
             instant_source_heuristic = report.instant_sources[4],
             unknown_child_tags = report.unknown_child_tags,
             user_location_removed = report.user_location_removed,
+            prefix_cache_ids_rewritten = report.prefix_cache_ids_rewritten,
             "codex environment_context values normalized"
         );
     }
@@ -477,6 +481,8 @@ pub(crate) fn apply_codex_environment_context(
 ) {
     let mut report = EnvironmentContextRewriteReport::default();
     strip_web_search_user_location(body, &mut report);
+    report.prefix_cache_ids_rewritten =
+        rewrite_prefix_cache_item_ids(body, input.outbound_thread_id) as u32;
     let Some(items) = body.get_mut("input") else {
         return (report, None);
     };
@@ -1601,6 +1607,72 @@ fn anchor_key(item: &Value) -> String {
         })
         .unwrap_or_default();
     format!("text:{}", hash16(&text))
+}
+
+/// Namespace the client derives its `msg_…` / `at_…` prefix-cache item ids
+/// from: `uuid5(NAMESPACE_OID, thread_id)`, exactly as `build_responses_request`
+/// does before hashing the payloads.
+fn prefix_cache_namespace(outbound_thread_id: &str) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, outbound_thread_id.as_bytes())
+}
+
+/// Re-derives the prefix-cache item ids (`msg_…` base instructions, `at_…`
+/// additional tools) from the outbound thread.
+///
+/// A client mints these once per thread — `uuid5(uuid5(NAMESPACE_OID,
+/// thread_id), payload)` — so under identity synthesis they carry the inbound
+/// thread forever: every swapped conversation ships one account a pair of ids
+/// it never generated, and two folded conversations keep two different pairs
+/// inside one thread. Only UUIDv5 suffixes are touched; the UUIDv7 ids of
+/// replayed items are the client's own and stay as they are. Returns the
+/// number of ids rewritten.
+fn rewrite_prefix_cache_item_ids(body: &mut Value, outbound_thread_id: &str) -> usize {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let namespace = prefix_cache_namespace(outbound_thread_id);
+    let mut rewritten = 0;
+    for item in items {
+        let Some(id) = item_id(item) else {
+            continue;
+        };
+        let Some((prefix, suffix)) = id.split_once('_') else {
+            continue;
+        };
+        if !matches!(prefix, "msg" | "at") {
+            continue;
+        }
+        let Ok(existing) = Uuid::parse_str(suffix) else {
+            continue;
+        };
+        if existing.get_version_num() != 5 {
+            continue;
+        }
+        // Same payloads the client hashes: the tools array for `at_…`, the
+        // base instruction text for `msg_…`. Anything else keeps the shape.
+        let payload = match prefix {
+            "at" => item
+                .get("tools")
+                .and_then(|tools| serde_json::to_string(tools).ok()),
+            _ => item
+                .get("content")
+                .and_then(message_text)
+                .filter(|text| !text.is_empty()),
+        };
+        let Some(payload) = payload else {
+            continue;
+        };
+        let derived = Uuid::new_v5(&namespace, payload.as_bytes());
+        let derived = format!("{prefix}_{derived}");
+        if derived == id {
+            continue;
+        }
+        if let Some(object) = item.as_object_mut() {
+            object.insert("id".to_string(), Value::String(derived));
+            rewritten += 1;
+        }
+    }
+    rewritten
 }
 
 /// UUIDv7 at `unix_ms`. When the previous item of the same batch shares the
@@ -2793,5 +2865,92 @@ mod tests {
             }
             eprintln!("    next: {}", neighbor(1));
         }
+    }
+
+    #[test]
+    fn prefix_cache_item_ids_follow_the_outbound_thread() {
+        let inbound_thread = "01a07550-6ae3-72c2-aeca-79892a6f0c61";
+        let instructions = "You are Codex, an agent based on GPT-6.";
+        let tools = json!([{"type": "function", "name": "exec_command"}]);
+        let client_ns = Uuid::new_v5(&Uuid::NAMESPACE_OID, inbound_thread.as_bytes());
+        let client_at = format!(
+            "at_{}",
+            Uuid::new_v5(
+                &client_ns,
+                serde_json::to_string(&tools).unwrap().as_bytes()
+            )
+        );
+        let client_msg = format!("msg_{}", Uuid::new_v5(&client_ns, instructions.as_bytes()));
+
+        let build = || {
+            json!({"input": [
+                {"type": "additional_tools", "id": client_at, "role": "developer", "tools": tools},
+                {"type": "message", "id": client_msg, "role": "developer",
+                 "content": [{"type": "input_text", "text": instructions}]},
+                {"type": "message", "id": format!("msg_{}", uuid_at(AUG12_0500_UTC, 7)),
+                 "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            ]})
+        };
+
+        let run = |thread: &str| {
+            let mut body = build();
+            let input = EnvironmentContextRewriteInput {
+                outbound_thread_id: thread,
+                ..input_for(NY, AUG12_0500_UTC, true)
+            };
+            apply_codex_environment_context(&mut body, &input);
+            body
+        };
+
+        let outbound = "01a08a94-bc76-7270-a2e0-91c745342d13";
+        let body = run(outbound);
+        let ns = Uuid::new_v5(&Uuid::NAMESPACE_OID, outbound.as_bytes());
+        for (index, payload) in [
+            (0usize, serde_json::to_string(&tools).unwrap()),
+            (1, instructions.to_string()),
+        ] {
+            let prefix = if index == 0 { "at" } else { "msg" };
+            assert_eq!(
+                body["input"][index]["id"].as_str().unwrap(),
+                format!("{prefix}_{}", Uuid::new_v5(&ns, payload.as_bytes())),
+                "re-derived from the outbound thread"
+            );
+        }
+        // A UUIDv7 replay id is the client's own and stays untouched.
+        assert_eq!(
+            body["input"][2]["id"].as_str().unwrap(),
+            format!("msg_{}", uuid_at(AUG12_0500_UTC, 7))
+        );
+
+        // Deterministic per thread, and a different thread yields a different
+        // pair — the leak the pass exists to close.
+        assert_eq!(run(outbound), body);
+        assert_ne!(run("other-thread"), body);
+    }
+
+    #[test]
+    fn prefix_cache_rewrite_leaves_items_it_cannot_derive_alone() {
+        let client_ns = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"inbound");
+        let at = format!(
+            "at_{}",
+            Uuid::new_v5(&client_ns, br#"[{"type":"function"}]"#)
+        );
+        let mut body = json!({"input": [
+            // v5 tool id but no tools payload to hash.
+            {"type": "additional_tools", "id": at, "role": "developer"},
+            // server-minted and UUIDv7 ids are never touched
+            {"type": "function_call", "id": "fc_0123", "call_id": "c1", "name": "n", "arguments": "{}"},
+            {"type": "message", "id": format!("msg_{}", uuid_at(AUG12_0500_UTC, 9)),
+             "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        ]});
+        let before = body.clone();
+        let input = EnvironmentContextRewriteInput {
+            outbound_thread_id: "thread-outbound",
+            ..input_for(NY, AUG12_0500_UTC, true)
+        };
+        apply_codex_environment_context(&mut body, &input);
+        assert_eq!(body["input"][0]["id"], before["input"][0]["id"]);
+        assert_eq!(body["input"][1]["id"], before["input"][1]["id"]);
+        assert_eq!(body["input"][2]["id"], before["input"][2]["id"]);
     }
 }

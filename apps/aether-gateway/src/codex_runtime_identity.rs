@@ -181,6 +181,8 @@ const HEADER_PASS_KEYS: &[&str] = &[
     X_CODEX_TURN_STATE,
     "x-codex-beta-features",
     "x-codex-routing-hint",
+    // Preserve the managed US residency routing hint when a Codex client sends it.
+    "x-openai-internal-codex-residency",
     "x-openai-internal-codex-responses-lite",
     "x-openai-memgen-request",
     "x-responsesapi-include-timing-metrics",
@@ -2188,27 +2190,28 @@ fn request_identity_blob(
     }
     copy_key(source, &mut blob, "workspaces");
     copy_key(source, &mut blob, "tool_namespaces_info");
-    match source.get("turn_started_at_unix_ms") {
-        Some(started_at) => {
-            blob.insert("turn_started_at_unix_ms".to_string(), started_at.clone());
+    // The client's own `turn_started_at_unix_ms` is discarded: it is the
+    // inbound real turn's start, and many real turns fold onto one outbound
+    // turn, so copying it through leaves a single synthetic turn carrying a
+    // different start on every request. A real client stamps the turn start at
+    // `Session::start_task`, and the outbound turn UUIDv7 was minted at
+    // exactly that moment, so the outbound turn id is the only source. The
+    // startup prewarm is sent before any task, so it carries no stamp.
+    if kind != CodexRequestKind::Prewarm {
+        if let Some(unix_ms) = outbound.turn_id.as_deref().and_then(uuid_v7_unix_millis) {
+            blob.insert("turn_started_at_unix_ms".to_string(), Value::from(unix_ms));
         }
-        // A real client stamps the turn start when its task starts (codex-rs
-        // `Session::start_task`), and the outbound turn UUIDv7 was minted at
-        // exactly that moment. The startup prewarm is sent before any task, so
-        // a real prewarm blob carries no stamp.
-        None if kind != CodexRequestKind::Prewarm => {
-            if let Some(unix_ms) = outbound.turn_id.as_deref().and_then(uuid_v7_unix_millis) {
-                blob.insert("turn_started_at_unix_ms".to_string(), Value::from(unix_ms));
-            }
-        }
-        None => {}
     }
     copy_key(source, &mut blob, "history_ingest_requested");
     copy_key(source, &mut blob, "compaction");
     // Flattened `extra` entries (the Desktop `workspace_kind`) and any other
-    // pass-through key serialize after the struct fields.
+    // pass-through key serialize after the struct fields. The turn stamp is
+    // excluded: it is derived above or deliberately absent, never copied.
     for (key, value) in source {
-        if !blob.contains_key(key) && BLOB_PASS_KEYS.contains(&key.as_str()) {
+        if !blob.contains_key(key)
+            && key != "turn_started_at_unix_ms"
+            && BLOB_PASS_KEYS.contains(&key.as_str())
+        {
             blob.insert(key.clone(), value.clone());
         }
     }
@@ -4273,8 +4276,8 @@ mod tests {
                 "node_repl_auto_review_required",
                 "node_repl_disabled",
                 "workspaces",
-                "turn_started_at_unix_ms",
-            ]
+            ],
+            "the client's own turn stamp is not copied; a frozen turn id is not a UUIDv7, so none is derived"
         );
         assert_eq!(blob["installation_id"], "inst", "profile pass owns it");
         assert_eq!(blob["session_id"], "out-thread");
@@ -4296,9 +4299,9 @@ mod tests {
         assert_eq!(blob["node_repl_auto_review_required"], false);
         assert_eq!(blob["node_repl_disabled"], false);
         assert_eq!(blob["workspaces"]["/w"], json!({}));
-        assert_eq!(
-            blob["turn_started_at_unix_ms"], 1_756_857_600_123u64,
-            "client's own stamp kept"
+        assert!(
+            blob.get("turn_started_at_unix_ms").is_none(),
+            "a frozen turn with no UUIDv7 outbound turn id carries no stamp"
         );
         assert!(
             blob.get("root_turn_id").is_none(),
@@ -4320,6 +4323,19 @@ mod tests {
         let filled: Value = serde_json::from_str(&filled).unwrap();
         assert_eq!(filled["turn_id"], v7_turn);
         assert_eq!(filled["turn_started_at_unix_ms"], 1_756_857_600_000u64);
+
+        // A client stamp inbound is ignored: many real turns fold onto one
+        // outbound turn, so the stamp must always come from the outbound turn
+        // id, never the client, or one synthetic turn carries many starts.
+        let overridden = rewrite_codex_turn_metadata_string(
+            r#"{"thread_id":"in","request_kind":"turn","turn_started_at_unix_ms":1756857600123}"#,
+            &stamped,
+            Some(MAC_UA),
+        )
+        .unwrap();
+        let overridden: Value = serde_json::from_str(&overridden).unwrap();
+        assert_eq!(overridden["turn_started_at_unix_ms"], 1_756_857_600_000u64);
+
         assert_eq!(
             filled["sandbox"], "seatbelt",
             "Linux tag under a macOS user-agent"
@@ -4493,6 +4509,7 @@ mod tests {
         let mut headers = btree(&[
             ("x-codex-beta-features", "a,b"),
             ("x-codex-routing-hint", "model=gpt-5;tier=x"),
+            ("x-openai-internal-codex-residency", "us"),
             ("x-openai-internal-codex-responses-lite", "true"),
             ("X-Codex-Brand-New-Header", "leak"),
             ("x-oai-attestation", "att"),
@@ -4526,6 +4543,7 @@ mod tests {
         assert_eq!(blob["window_number"], 0, "turn blob is a current client's");
         assert_eq!(headers["x-codex-beta-features"], "a,b");
         assert_eq!(headers["x-codex-routing-hint"], "model=gpt-5;tier=x");
+        assert_eq!(headers["x-openai-internal-codex-residency"], "us");
         assert_eq!(headers["x-openai-internal-codex-responses-lite"], "true");
         assert_eq!(headers["openai-beta"], "responses_websockets=2026-02-06");
         assert_eq!(headers["session-id"], "out-thread");

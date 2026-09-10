@@ -390,7 +390,7 @@ key 构造函数放在新模块 `codex_runtime_identity.rs` 内（与 sticky 的
 | `previous_response_id` | HTTP Codex 继续剥；WS 经 fence 后原样转发 |
 | 短头 `session_id` / `conversation_id` | 合成开启且有入站 root：一律删除，不论来源（7.4；v0.7.105） |
 
-`turn_started_at_unix_ms`、`workspaces`、`tool_namespaces_info`、`compaction`、`request_kind`：原样保留（memory 的 blob 形状见 7.2）。`sandbox` 自 v0.7.109 起按出站 UA 的操作系统投影；`sandbox_mode`、三个 review 标志在 turn / compaction / prewarm 上缺失时补默认值，`turn_started_at_unix_ms` 在 turn / compaction 上缺失时补出站 turn 的 UUIDv7 时间戳（§18.17）。Aether 今天不读 `request_kind`，需新增解析（11 节）。客户端自己发的 `turn_started_at_unix_ms` 不重写去「对齐」UUIDv7 时间戳。
+`turn_started_at_unix_ms`、`workspaces`、`tool_namespaces_info`、`compaction`、`request_kind`：原样保留（memory 的 blob 形状见 7.2）。`sandbox` 自 v0.7.109 起按出站 UA 的操作系统投影；`sandbox_mode`、三个 review 标志在 turn / compaction / prewarm 上缺失时补默认值，`turn_started_at_unix_ms` 在 turn / compaction 上缺失时补出站 turn 的 UUIDv7 时间戳（§18.17）。Aether 今天不读 `request_kind`，需新增解析（11 节）。~~客户端自己发的 `turn_started_at_unix_ms` 不重写去「对齐」UUIDv7 时间戳。~~ .123 候选起改为一律由出站 turn UUIDv7 推出，客户端的值丢弃（§18.19）。
 
 ### 9.1 HTTP / WS `x-client-request-id`
 
@@ -961,7 +961,7 @@ cd frontend && npm run type-check
 2. `sandbox` 在所有非 memory 形状上按出站 UA 的操作系统投影（`OutboundClientOs::project_sandbox`）：`none` / `external` 与平台无关，保持；Windows UA 下 `windows_sandbox` / `windows_elevated` 都是真实取值，保持；其余一律换成出站平台沙箱（Mac → `seatbelt`，Windows → `windows_elevated`，其它 → `seccomp`）。.105 合成请求的 `sandbox_tags_for_user_agent` 并入同一实现。
 3. 出站 UA 的来源：HTTP 表面从改写时手头的 headers 读（profile pass 已把 UA 换成池档位）；WS 握手从 `candidate.headers` 读；WS step body 没有头，由 `materialize_codex_ws_step_body` 传入账号 profile 的 UA（无 profile 时用客户端自己的）。`apply_outbound_codex_runtime_identity` / `rewrite_codex_turn_metadata_string` 各多一个 `user_agent: Option<&str>` 参数。
 
-**不做**：不按入站 `sandbox_mode` 去猜 `sandbox`（策略与后端是两个维度）；不重写客户端自己发的 `turn_started_at_unix_ms` / 标志 / 策略；不改 memory 与 None 形状；不给合成请求补 `workspaces` 等可选键；UA 之外不做别的指纹推断。
+**不做**：不按入站 `sandbox_mode` 去猜 `sandbox`（策略与后端是两个维度）；不重写客户端自己发的 ~~`turn_started_at_unix_ms` /~~ 标志 / 策略（`turn_started_at_unix_ms` 自 .123 候选起改为一律重写，见 §18.19）；不改 memory 与 None 形状；不给合成请求补 `workspaces` 等可选键；UA 之外不做别的指纹推断。
 
 **测试**：新增 `request_identity_blob_matches_current_client_shape_and_outbound_os`（0.147 形状 turn blob 重建后的完整键序与取值、缺 stamp 时从 v7 turn 补、prewarm 不补 stamp、compaction 保留 `compaction` / `workspace_kind` 位置与已发的 `read-only` / `true`、`project_sandbox` 投影表、None 形状只投影 sandbox 不补键、Headers 表面从头里读 UA）；`body_rewrite_keeps_flat_and_blob_consistent` 改为 Windows UA 下 `seatbelt → windows_elevated` 并断言补齐键；`whitelist_strips_unknown_keys_on_every_surface` 改为按键断言。线上复核见 runbook §3.5 Q11 / Q12。
 
@@ -1001,3 +1001,21 @@ cd frontend && npm run type-check
 **测试**（`codex_runtime_identity::tests`，14 项全绿；`aether-runtime-state` 契约测试通过）：`threads_mint_by_arrival_then_reuse_least_recently_active`、`account_ceilings_hold_below_the_official_thresholds`、`turn_ceiling_of_one_mints_exactly_one_turn`、`no_turn_id_revisit_within_a_thread_under_interleaved_roots`、`resolved_turn_source_gates_turn_state_forwarding`、`roster_is_a_trailing_24h_window_not_a_calendar_day`、`root_freeze_survives_day_rollover_and_turn_freeze_too`、`chained_request_continues_the_threads_open_turn`、`memory_requests_share_thread_but_carry_no_turn`、`ws_snapshot_stays_authoritative_for_its_bound_turn`、`store_unavailable_falls_back_to_passthrough_or_snapshot`、`concurrent_new_roots_never_mint_past_the_daily_bound`、`concurrent_mints_converge_on_one_identity`、`app_server_only_blob_keys_survive_only_under_an_app_server_user_agent`。
 
 **交付状态**：已在 `custom` 工作区改好并自测（`cargo test -p aether-gateway codex_runtime_identity` 40 通过 0 失败；`aether-runtime-state` 契约测试通过）。**未提交、未 tag、未发版、未上线**——tag / CI / 上线时机由操作员另行决定。
+
+### 18.19 .123 候选：turn 时间戳、前缀缓存 id 跟随出站身份；Codex OAuth 账号默认并发 1
+
+**起因**：对 Codex Plus / Codex Pro 两个号池的出站形状复审，发现两处「换了 thread / turn 却透传按入站身份派生的值」，以及新导入账号并发不设限的运维缺口。操作员对五项建议的裁定：1 `turn_started_at_unix_ms` 合成；2 前缀缓存 id 重推；3 `instructions` / `service_tier` **不改**；4 `workspaces` **不改**（用户对话内容相关，改了影响使用）；5 新导入账号并发默认 1、可手动改，其余不动。
+
+**依据（codex-rs 07f18d5f）**：`turn_started_at_unix_ms` 在 `Session::start_task` 打点、与出站 turn UUIDv7 的 mint 时刻同源，一条 turn 只有一个开始时刻；`responses_lite` 下 `core/src/client.rs:936-990` 用 `prefix_namespace = uuid5(NAMESPACE_OID, thread_id)` 给基础指令 developer 消息（`msg_` + `uuid5(ns, instructions)`）与 `additional_tools`（`at_` + `uuid5(ns, serde_json(tools))`）打 id，其余历史项 id 是 UUIDv7 或服务端非 UUID，`prepare_response_items_for_request` 只保留形如 `{prefix}_{…}` 的 id。线上 dump（Codex Pro，66 条）确认：同一 request 的 `request_body` 与 `provider_request_body` 里 `msg_` / `at_` 的 v5 id 完全相同，而 `client_metadata.thread_id` 已被换，即 id 仍指向入站 thread。
+
+**修法**：
+
+1. `codex_runtime_identity.rs` `request_identity_blob`：turn / compaction 无条件写 `turn_started_at_unix_ms = 出站 turn UUIDv7 毫秒`（prewarm 不写），`BLOB_PASS_KEYS` 透传回路显式排除该键。多个真实 turn 折到一条合成 turn 时，不再出现同一出站 `turn_id` 带多个开始时刻。
+2. `codex_environment_context.rs` `rewrite_prefix_cache_item_ids`：env pass 开头（HTTP `/responses`、`/compact` 与 WS 每步同一入口，同受 `AETHER_CODEX_ENVIRONMENT_CONTEXT_REWRITE`）把 `input[]` 中后缀为 UUIDv5 的 `msg_` / `at_` id 按出站 thread 重推为 `uuid5(uuid5(NAMESPACE_OID, outbound_thread_id), payload)`，payload 取法与官方一致；取不到 payload 或后缀不是 v5 的不动。计数进 `EnvironmentContextRewriteReport.prefix_cache_ids_rewritten` 并随 `codex_env_context_rewritten` 打出。
+3. 后台 key：`handlers/admin/provider/write/keys/mod.rs` 的 `provider_key_is_oauth_quota_account(provider_type, auth_type)` 统一判定「Grok / Codex 的 OAuth 账号」；新建（`create.rs`）、更新时切到 OAuth（`update.rs`）、OAuth 授权 / 导入 / 批量导入落库（`oauth/provisioning.rs` create 路径）默认 `concurrent_limit = Some(1)`；重新授权只补缺值不动已设值；更新接口显式传值（含 0 = 不限、清空）永远生效。
+
+**不做**：`instructions` 不覆盖、`service_tier` 不注入、`workspaces` 不改；已存在账号的并发值不回填。
+
+**测试**：`codex_runtime_identity` 40 通过（`request_identity_blob_matches_current_client_shape_and_outbound_os` 改为断言客户端 stamp 不被复制、冻结 turn 无 v7 时不带 stamp、入站带 stamp 时仍取出站 turn 值）；`codex_environment_context` 29 通过 1 ignored（新增 `prefix_cache_item_ids_follow_the_outbound_thread`、`prefix_cache_rewrite_leaves_items_it_cannot_derive_alone`）；`handlers::admin::provider::write::keys` / `oauth::provisioning` 9 通过（新增 `codex_oauth_key_defaults_to_single_concurrency_only_when_unspecified`，`oauth_reauthorization_defaults_missing_concurrency_only` 加 codex 用例）；`codex_ws::runtime` 73 通过。线上复核见运维手册 §3.5 Q12b、§3.8。
+
+**交付状态**：已在 `custom` 工作区改好并自测。**未提交、未 tag、未发版、未上线**——tag / CI / 上线时机由操作员另行决定。

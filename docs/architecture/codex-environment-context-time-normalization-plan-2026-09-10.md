@@ -69,6 +69,7 @@ Aether 用号池里的一个 Codex 账号承接多个下游用户。账号的出
 输入 `EnvironmentContextRewriteInput { tz, now_unix_ms, turn_started_at_unix_ms, outbound_thread_id, allow_tail_append, prior_state }`；输出 `(EnvironmentContextRewriteReport, Option<EnvironmentEffectiveState>)`。
 
 - `tools[]` 里 `web_search` / `web_search_preview` 的 `user_location`（含 timezone）整个删除并计数。
+- `input[]` 里 `msg_` / `at_` 且后缀为 UUIDv5 的前缀缓存 id（codex-rs `responses_lite` 的基础指令 developer 消息与 `additional_tools` 项，官方为 `uuid5(uuid5(NAMESPACE_OID, thread_id), payload)`，`core/src/client.rs:936-990`）按**出站** thread 重推并计数（`rewrite_prefix_cache_item_ids`，.123 候选）：`at_` 的 payload 是 `tools` 的 JSON 序列化，`msg_` 的是 `content` 文本；取不到 payload、后缀不是 v5（UUIDv7 的用户 / developer 消息）或非 UUID（服务端 `fc_` / `rs_`）的一律不动。
 - `input` 为字符串：只做 tz / 日期字面改写（日期取 `turn_started_at` 否则 `now`），不返回状态。
 - `input` 为数组：单次遍历，维护 `EnvironmentEffectiveState { date, timezone, shell_version, network, filesystem, subagents, last_diff_shape, carries_current_date, uses_content_item_kinds }`。`prior_state` 只在 body 里没有任何 env 块时作为初始状态（WS 增量步）。
 
@@ -101,11 +102,11 @@ Aether 用号池里的一个 Codex 账号承接多个下游用户。账号的出
 
 ### 3.6 日志
 
-`codex_env_context_rewritten`（有删除 / 插入 / 追加时 info，否则 debug；report 全零不记）字段：`surface`（`http_responses` / `http_compact` / `ws_step_body`）、`thread = hash16(outbound_thread_id)`、`blocks_seen`、`timezone_rewritten`、`date_rewritten`、`blocks_removed`、`blocks_inserted`、`blocks_appended`、`instant_source_{create_time,own_id,next_item,turn_start,heuristic}`、`unknown_child_tags`、`user_location_removed`。不记 prompt 文本、不记 cwd。
+`codex_env_context_rewritten`（有删除 / 插入 / 追加时 info，否则 debug；report 全零不记）字段：`surface`（`http_responses` / `http_compact` / `ws_step_body`）、`thread = hash16(outbound_thread_id)`、`blocks_seen`、`timezone_rewritten`、`date_rewritten`、`blocks_removed`、`blocks_inserted`、`blocks_appended`、`instant_source_{create_time,own_id,next_item,turn_start,heuristic}`、`unknown_child_tags`、`user_location_removed`、`prefix_cache_ids_rewritten`（.123 候选）。不记 prompt 文本、不记 cwd。
 
 ## 4. 测试
 
-- `codex_environment_context.rs` 内 27 个单测：时区策略（优先级、UTC 类与禁止名单全部被拒、大小写、`Europe/Amsterdam` 通过、全拒 → 保底）；解析 / 字节保真（全量含 AGENTS.md 双片段、日切 diff、`<current_date>`-only diff、`<cwd>`-only、空块、`<environments>`、`<shell_version status="unavailable" />`、Windows cwd、转义、`<subagents>`、未知子标签）；DST 边界；瞬时来源分级计数；冗余 diff 删除与 `content_item_kinds` 对齐；turn 开始插入（prompt 前 / developer 串内的位置、同批 id；AGENTS.md 批次保留客户端 diff、缺 diff 时插在 `<skills_instructions>` 之后）；中段插入与尾部追加；HttpCompact 不追加；旧形状合并；`H_n` 前缀性；合成 id 跨请求相同；`user_location` 删除；`input` 为字符串。另有 `#[ignore]` 的 `environment_context_sample_eyeball` 读本机样本打印改写结果。
+- `codex_environment_context.rs` 内 29 个单测（.123 候选加 `prefix_cache_item_ids_follow_the_outbound_thread`、`prefix_cache_rewrite_leaves_items_it_cannot_derive_alone`）：时区策略（优先级、UTC 类与禁止名单全部被拒、大小写、`Europe/Amsterdam` 通过、全拒 → 保底）；解析 / 字节保真（全量含 AGENTS.md 双片段、日切 diff、`<current_date>`-only diff、`<cwd>`-only、空块、`<environments>`、`<shell_version status="unavailable" />`、Windows cwd、转义、`<subagents>`、未知子标签）；DST 边界；瞬时来源分级计数；冗余 diff 删除与 `content_item_kinds` 对齐；turn 开始插入（prompt 前 / developer 串内的位置、同批 id；AGENTS.md 批次保留客户端 diff、缺 diff 时插在 `<skills_instructions>` 之后）；中段插入与尾部追加；HttpCompact 不追加；旧形状合并；`H_n` 前缀性；合成 id 跨请求相同；`user_location` 删除；`input` 为字符串。另有 `#[ignore]` 的 `environment_context_sample_eyeball` 读本机样本打印改写结果。
 - `planner/standard/codex/tests.rs`：`http_responses_environment_context_pass_normalizes_clock_and_appends_at_the_tail`、`http_compact_environment_context_pass_rewrites_but_never_appends`、`header_only_surfaces_skip_the_environment_context_pass`。
 - `codex_ws/runtime.rs`：`materialized_full_step_normalizes_environment_context_and_returns_state`、`materialized_incremental_step_appends_a_day_change_only_when_the_date_moved`。
 - 现有 `apply_outbound_codex_runtime_identity` 的「input untouched」断言保持不变：env pass 是独立函数不在其中。

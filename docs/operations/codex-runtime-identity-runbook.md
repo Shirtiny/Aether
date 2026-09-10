@@ -218,11 +218,16 @@ select ob->>'request_kind' kind, count(*) n,
  count(*) filter (where ob ?& array['agent_name','window_number','context_window_id','sandbox','sandbox_mode','auto_review_enabled','node_repl_auto_review_required','node_repl_disabled']) complete,
  count(*) filter (where ob ? 'turn_started_at_unix_ms') stamped
 from rv where rewritten and ob->>'request_kind' in ('turn','compaction','prewarm') group by 1 order by 2 desc;
+\echo === Q12b turn stamp derives from the outbound turn UUIDv7 (rewritten, turn / compaction)  [.123 候选]
+select ob->>'request_kind' kind, count(*) n, count(*) filter (where ob ? 'turn_started_at_unix_ms') stamped,
+ count(*) filter (where (ob->>'turn_started_at_unix_ms')::bigint
+   = ('x' || replace(left(ob->>'turn_id', 13), '-', ''))::bit(48)::bigint) stamp_matches_turn
+from rv where rewritten and ob->>'request_kind' in ('turn','compaction') group by 1 order by 2 desc;
 ```
 
 期望：Q2 里 `wn_without_ctx`、`window_id_mismatch`、`header_vs_blob_window_mismatch` 为 0；Q3 无 `leak:*` 行、`session!=thread` 为 0；Q4 无 `session_id` / `conversation_id` / `x-codex-parent-thread-id` / `x-openai-subagent` / `x-trace-id`；Q6 两列都等于 `threads`；Q8 每个 provider 的 `out_threads` 不超过 `expected_threads_per_day`×账号数量级。.105 起 Q9 中 Codex Pro 应几乎没有「no blob either side」行（无元数据请求已合成）。
 
-.109 起：Q11 每个 `ua_os` 只能出现自己平台的 `sandbox`（mac：`seatbelt` / `none` / `external`；windows：`windows_sandbox` / `windows_elevated` / `none` / `external`；other：`seccomp` / `none` / `external`），`sandbox=none` 的行 `sandbox_mode` 只能是 `danger-full-access`，非 memory 行不得出现 `<absent>`（.108 时段 3 天有 171 条 Mac / Ubuntu UA 配 Windows 沙箱标签）；Q12 每行 `complete` = `n`，turn / compaction 行 `stamped` = `n`（prewarm 官方就没有 `turn_started_at_unix_ms`，不要求）。Q2 的 `window_id_mismatch` 在 turn / compaction / prewarm 形状上必须为 0——.108 时的 22/154 全部是 codex-tui 0.146 / 0.147 入站没带 `window_number`，.109 按出站 0.153 客户端补齐；只有 `request_kind` 缺失的行（官方该形状本就没有 `window_number`，线上 3 天 10 条）仍会计入。
+.109 起：Q11 每个 `ua_os` 只能出现自己平台的 `sandbox`（mac：`seatbelt` / `none` / `external`；windows：`windows_sandbox` / `windows_elevated` / `none` / `external`；other：`seccomp` / `none` / `external`），`sandbox=none` 的行 `sandbox_mode` 只能是 `danger-full-access`，非 memory 行不得出现 `<absent>`（.108 时段 3 天有 171 条 Mac / Ubuntu UA 配 Windows 沙箱标签）；Q12 每行 `complete` = `n`，turn / compaction 行 `stamped` = `n`（prewarm 官方就没有 `turn_started_at_unix_ms`，不要求）。.123 候选起 `turn_started_at_unix_ms` 恒等于出站 `turn_id`（UUIDv7）前 48 位的毫秒数，不再复制客户端自己的值：`Q12b` 的 `stamp_matches_turn` 必须等于 `stamped`。Q2 的 `window_id_mismatch` 在 turn / compaction / prewarm 形状上必须为 0——.108 时的 22/154 全部是 codex-tui 0.146 / 0.147 入站没带 `window_number`，.109 按出站 0.153 客户端补齐；只有 `request_kind` 缺失的行（官方该形状本就没有 `window_number`，线上 3 天 10 条）仍会计入。
 
 按账号看每日出站 thread 数（.107 的抖动是否生效、忙账号是否天天停在同一个数）：
 
@@ -267,6 +272,23 @@ from (select h.provider_request_headers::jsonb oh from usage_http_audits h join 
 
 入站侧分布（用于估计改写量）仍可从 `usage_http_audits.request_body` 若落库时统计 `<timezone>` 值；没有落库时以日志计数为准。
 
+### 3.8 前缀缓存 id 与 turn 时间戳跟随出站身份（.123 候选）
+
+两处泄漏都来自「Aether 换了 thread / turn，但把客户端按**入站** thread / turn 算出来的派生值原样透传」：
+
+- **`turn_started_at_unix_ms`**：多个真实 turn 折到一条合成 turn 上，若照抄客户端的值，同一出站 `turn_id` 会在每个请求上带不同的开始时刻。现在 turn / compaction 一律写出站 turn UUIDv7 的毫秒数（prewarm 不带），客户端自己的值被丢弃（含 `BLOB_PASS_KEYS` 的透传回路）。复核用 §3.5 的 Q12b。
+- **`msg_` / `at_` 前缀缓存 id**：codex-rs `responses_lite` 下 `input[]` 里基础指令 developer 消息与 `additional_tools` 项的 id 是 `uuid5(uuid5(OID, thread_id), payload)`（`core/src/client.rs:936-990`），可以从 id 反推「这条历史属于哪个 thread」。`codex_environment_context.rs` 的 `rewrite_prefix_cache_item_ids` 在 env pass 开头把这类 id 按出站 thread 重推：只动后缀为 UUIDv5 且能拿到 payload（`at_` 取 `tools` 序列化，`msg_` 取 `content` 文本）的项；UUIDv7 的用户 / developer 消息 id、服务端 `fc_` / `rs_` id 不动。HTTP 与 WS 两个表面都走同一函数，同受 `AETHER_CODEX_ENVIRONMENT_CONTEXT_REWRITE` 开关。
+
+日志计数：
+
+```bash
+docker logs aether-app --since 30m 2>&1 | grep 'codex_env_context_rewritten' | grep -oE 'prefix_cache_ids_rewritten=[0-9]+' | sort | uniq -c | sort -rn | head
+```
+
+期望：Codex Pro 带 lite 历史的请求上该计数通常为 1–2（一条 `msg_` 基础指令 + 一条 `at_`），不带 lite 历史的请求为 0。出站 body 不落库，要逐条核对只能抓包：出站 `at_` / `msg_` 的 v5 后缀应等于 `uuid5(uuid5(NAMESPACE_OID, 出站 thread_id), payload)`，与入站请求里的值不同。
+
+**同批改动**（与本手册无观测项）：新导入 / 新建 / 重新授权后缺值的 Codex OAuth 账号 `concurrent_limit` 默认 1（与 Grok 一致），后台可手动改，显式值（含 0 = 不限）不会被覆盖；`instructions` / `service_tier` / `workspaces` 按操作员决定不改。
+
 ## 4. 日志事件与处置
 
 ```bash
@@ -286,7 +308,7 @@ docker logs aether-app --since 2026-09-05T06:40:00Z 2>&1 | grep -E 'codex_rid_' 
 | `codex_rid_unknown_metadata_key` | 客户端带了三表面白名单之外的键，已被删除；每进程每 (surface, key) 只 warn 一次 | 走 §4.1 判定 |
 | `codex_env_tz_resolved`（info，.122，每进程一次） | `<environment_context>` 归一化选定的目标时区：`tz` 与 `source`（`env_override` / `tz_env` / `localtime` / `fallback`） | 本机期望 `America/New_York` / `tz_env`。出现 `fallback` 说明 compose 没给 `TZ` 或给了非法 / 被拒值，先看同批 `codex_env_tz_rejected` |
 | `codex_env_tz_rejected`（warn，.122） | 某个时区候选被拒：`source`、`value`、`reason`（`empty` / `denied_region` / `unknown_iana_name` / `not_a_region_city_zone`） | `denied_region` = 配了中国时区，绝不能放行，改 `TZ`；`not_a_region_city_zone` = `UTC` / `Etc/*` / `EST` 之类，换成 `Region/City` 形。修完重建 `app` |
-| `codex_env_context_rewritten`（有删 / 插 / 追加时 info，否则 debug，.122） | 本请求 `<environment_context>` 改写计数：`surface`、`thread`、`blocks_seen`、`timezone_rewritten`、`date_rewritten`、`blocks_removed`、`blocks_inserted`、`blocks_appended`、`instant_source_*`、`unknown_child_tags`、`user_location_removed` | 正常行为。`instant_source_heuristic` 长期占比高说明大量无 id 旧客户端；`blocks_removed` 持续为 0 而下游时区不是目标时区，检查 kill switch 是否被关 |
+| `codex_env_context_rewritten`（有删 / 插 / 追加时 info，否则 debug，.122） | 本请求 `<environment_context>` 改写计数：`surface`、`thread`、`blocks_seen`、`timezone_rewritten`、`date_rewritten`、`blocks_removed`、`blocks_inserted`、`blocks_appended`、`instant_source_*`、`unknown_child_tags`、`user_location_removed`、`prefix_cache_ids_rewritten`（.123 候选：按出站 thread 重推的 `msg_` / `at_` UUIDv5 前缀缓存 id 数） | 正常行为。`instant_source_heuristic` 长期占比高说明大量无 id 旧客户端；`blocks_removed` 持续为 0 而下游时区不是目标时区，检查 kill switch 是否被关 |
 | `codex_env_unknown_child_tag`（首次 warn、之后 debug，.122） | `<environment_context>` 里出现解析器不认识的顶层子标签，块按「含未知」处理：只改 tz / 日期，不判重不删 | 到 codex-rs `core/src/context/world_state/environment.rs` 看新标签是否为官方新增标量；是则加进解析器与判重集合并补单测 |
 
 ### 4.1 未知键判定流程（白名单维护）
