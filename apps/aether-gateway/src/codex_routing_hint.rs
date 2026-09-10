@@ -27,7 +27,7 @@ pub(crate) fn from_body(body: &Value) -> Option<String> {
 pub(crate) fn apply_to_decision(provider_type: &str, decision: &mut AiExecutionDecision) {
     if !provider_type.trim().eq_ignore_ascii_case("codex")
         || !matches!(
-            aether_ai_formats::normalize_api_format_alias(
+            crate::ai_serving::normalize_api_format_alias(
                 decision.provider_api_format.as_deref().unwrap_or_default()
             )
             .as_str(),
