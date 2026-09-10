@@ -33,6 +33,11 @@ use crate::ai_serving::{
     build_compact_local_openai_responses_stream_plan_and_reports_for_kind_with_required_capabilities,
     AiStreamAttempt, GatewayControlDecision, OPENAI_RESPONSES_STREAM_PLAN_KIND,
 };
+use crate::codex_environment_context::{
+    apply_codex_environment_context, environment_context_rewrite_enabled,
+    log_environment_context_report, process_environment_timezone, EnvironmentContextRewriteInput,
+    EnvironmentEffectiveState,
+};
 use crate::codex_profile::{
     apply_codex_concrete_account_profile_to_body_with_policy,
     normalize_codex_turn_metadata_for_profile, CodexConcreteAccountProfile,
@@ -40,9 +45,9 @@ use crate::codex_profile::{
 };
 use crate::codex_runtime_identity::{
     apply_outbound_codex_runtime_identity, resolve_outbound_codex_runtime_identity,
-    rewrite_codex_turn_metadata_string, CodexRuntimeIdentityResolution, CodexRuntimeIdentityScope,
-    CodexRuntimeIdentityStore, CodexRuntimeIdentitySurface, InboundCodexRuntimeIdentity,
-    OutboundCodexRuntimeIdentity,
+    rewrite_codex_turn_metadata_string, unix_millis, uuid_v7_unix_millis,
+    CodexRuntimeIdentityResolution, CodexRuntimeIdentityScope, CodexRuntimeIdentityStore,
+    CodexRuntimeIdentitySurface, InboundCodexRuntimeIdentity, OutboundCodexRuntimeIdentity,
 };
 use crate::handlers::shared::provider_pool::admin_provider_pool_key_error_is_account_invalid;
 use crate::orchestration::{
@@ -222,6 +227,21 @@ pub(crate) struct CodexWsRuntimeIdentitySnapshot {
 pub(crate) struct CodexWsStepRuntimeIdentity {
     pub(crate) inbound: InboundCodexRuntimeIdentity,
     pub(crate) outbound: OutboundCodexRuntimeIdentity,
+}
+
+/// Step-scoped inputs of the `<environment_context>` host-clock pass. Present
+/// whenever the candidate carries a runtime identity snapshot (the pool's
+/// switch is on), even when this step's identity resolution fell back to
+/// passthrough: the client's zone must not leak on a Redis hiccup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexWsStepEnvironmentContext {
+    pub(crate) outbound_thread_id: String,
+    pub(crate) outbound_turn_id: Option<String>,
+    pub(crate) turn_started_at_unix_ms: Option<u64>,
+    pub(crate) now_unix_ms: u64,
+    /// Effective state left by the previous step on this connection for the
+    /// same outbound thread; incremental steps carry no block of their own.
+    pub(crate) prior_state: Option<EnvironmentEffectiveState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -708,6 +728,10 @@ pub(crate) struct GatewayCodexWsRuntime {
     usage_report_tx: tokio::sync::mpsc::Sender<CodexWsUsageCommit>,
     settlement_tx: tokio::sync::mpsc::Sender<CodexWsSettlementCommit>,
     connector: CodexWebSocketConnector,
+    /// `(outbound thread id, effective environment state)` after the last
+    /// materialized step; lets incremental `previous_response_id` steps see
+    /// the day the model currently believes in. Process-local by design.
+    env_context_state: std::sync::Mutex<Option<(String, EnvironmentEffectiveState)>>,
 }
 
 struct ConnectAttemptCancellationGuard {
@@ -859,6 +883,7 @@ impl GatewayCodexWsRuntime {
             usage_report_tx,
             settlement_tx,
             connector,
+            env_context_state: std::sync::Mutex::new(None),
         })
     }
 
@@ -994,6 +1019,54 @@ impl GatewayCodexWsRuntime {
                 Some(CodexWsStepRuntimeIdentity { inbound, outbound })
             }
             CodexRuntimeIdentityResolution::Passthrough => None,
+        }
+    }
+
+    /// Inputs for the environment-context pass of one step. The seed is the
+    /// step's outbound thread (the bound snapshot's on passthrough).
+    fn step_environment_context(
+        &self,
+        candidate: &CodexWsCandidate,
+        body: &serde_json::Value,
+        runtime_identity: Option<&CodexWsStepRuntimeIdentity>,
+    ) -> Option<CodexWsStepEnvironmentContext> {
+        let snapshot = candidate.runtime_identity.as_deref()?;
+        let (outbound_thread_id, turn_id) = match runtime_identity {
+            Some(identity) => (
+                identity.outbound.thread_id.clone(),
+                identity.outbound.turn_id.clone(),
+            ),
+            None => (
+                snapshot.outbound.thread_id.clone(),
+                InboundCodexRuntimeIdentity::from_request(Some(body), Some(&self.request_headers))
+                    .turn_id,
+            ),
+        };
+        let prior_state = self.env_context_state.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .filter(|(thread, _)| *thread == outbound_thread_id)
+                .map(|(_, state)| state.clone())
+        });
+        Some(CodexWsStepEnvironmentContext {
+            outbound_thread_id,
+            turn_started_at_unix_ms: turn_id.as_deref().and_then(uuid_v7_unix_millis),
+            outbound_turn_id: turn_id,
+            now_unix_ms: unix_millis(std::time::SystemTime::now()),
+            prior_state,
+        })
+    }
+
+    fn remember_environment_context_state(
+        &self,
+        env_context: Option<&CodexWsStepEnvironmentContext>,
+        state: Option<EnvironmentEffectiveState>,
+    ) {
+        let (Some(env_context), Some(state)) = (env_context, state) else {
+            return;
+        };
+        if let Ok(mut guard) = self.env_context_state.lock() {
+            *guard = Some((env_context.outbound_thread_id.clone(), state));
         }
     }
 
@@ -2099,6 +2172,8 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         let runtime_identity = self
             .resolve_step_runtime_identity(candidate, &step.value)
             .await;
+        let env_context =
+            self.step_environment_context(candidate, &step.value, runtime_identity.as_ref());
         let body = std::mem::take(&mut step.value);
         // The long-lived candidate template intentionally carries no payload,
         // but each settled WS step still needs its own accepted client body for
@@ -2122,6 +2197,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 let provider_type = candidate.provider_type.clone();
                 let force_body_stream_field = candidate.force_body_stream_field;
                 let enable_model_directives = candidate.enable_model_directives;
+                let env_context = env_context.clone();
                 tokio::task::spawn_blocking(move || {
                     let _materialization_cpu = materialization_cpu;
                     let original_request_body = body.clone();
@@ -2138,6 +2214,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                         adapter,
                         &provider_type,
                         runtime_identity.as_ref(),
+                        env_context.as_ref(),
                     )?;
                     Ok::<_, StepPreparationError>((materialized_body, original_request_body))
                 })
@@ -2160,9 +2237,16 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                     candidate.adapter,
                     &candidate.provider_type,
                     runtime_identity.as_ref(),
+                    env_context.as_ref(),
                 )?;
                 (materialized_body, original_request_body)
             };
+        let MaterializedCodexWsStepBody {
+            text: materialized_text,
+            json: materialized_json,
+            env_context_state,
+        } = materialized_body;
+        self.remember_environment_context_state(env_context.as_ref(), env_context_state);
         let (provider_concurrency, key_concurrency) =
             self.acquire_candidate_concurrency(candidate).await?;
         if let Err(error) = self.consume_bound_step_rpm(candidate).await {
@@ -2174,13 +2258,13 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         }
         let mut usage_plan = candidate.lifecycle.plan().clone();
         usage_plan.request_id = step_usage_request_id(step);
-        usage_plan.body = aether_contracts::RequestBody::from_json(materialized_body.json);
+        usage_plan.body = aether_contracts::RequestBody::from_json(materialized_json);
         let lifecycle_seed = aether_usage_runtime::build_lifecycle_usage_seed(
             &usage_plan,
             lifecycle_report_context.as_ref(),
         );
         Ok(PreparedStep {
-            body: materialized_body.text,
+            body: materialized_text,
             admission,
             provider_concurrency,
             key_concurrency,
@@ -3075,6 +3159,8 @@ fn step_report_context(
 struct MaterializedCodexWsStepBody {
     text: String,
     json: serde_json::Value,
+    /// Effective environment state after this step, for the next one.
+    env_context_state: Option<EnvironmentEffectiveState>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3091,6 +3177,7 @@ fn materialize_codex_ws_step_body(
     adapter: crate::orchestration::ResponsesWebSocketAdapter,
     provider_type: &str,
     runtime_identity: Option<&CodexWsStepRuntimeIdentity>,
+    env_context: Option<&CodexWsStepEnvironmentContext>,
 ) -> Result<MaterializedCodexWsStepBody, StepPreparationError> {
     let explicit_session_key =
         crate::client_session_affinity::client_session_affinity_from_request(
@@ -3191,6 +3278,23 @@ fn materialize_codex_ws_step_body(
             user_agent,
         );
     }
+    // Model-visible host clock (`<timezone>` / `<current_date>`), after the
+    // identity pass so synthesized ids are seeded by the outbound thread.
+    let mut env_context_state = None;
+    if let Some(env_context) = env_context.filter(|_| environment_context_rewrite_enabled()) {
+        let input = EnvironmentContextRewriteInput {
+            tz: process_environment_timezone().tz,
+            now_unix_ms: env_context.now_unix_ms,
+            turn_started_at_unix_ms: env_context.turn_started_at_unix_ms,
+            turn_id: env_context.outbound_turn_id.as_deref(),
+            outbound_thread_id: &env_context.outbound_thread_id,
+            allow_tail_append: true,
+            prior_state: env_context.prior_state.as_ref(),
+        };
+        let (report, state) = apply_codex_environment_context(&mut body, &input);
+        log_environment_context_report("ws_step_body", &env_context.outbound_thread_id, &report);
+        env_context_state = state;
+    }
     let body_text = serde_json::to_string(&body)
         .map_err(|_| StepPreparationError::retain("account_profile_materialization_failed"))?;
     if body_text.len() > super::protocol::MAX_PUBLIC_CLIENT_PAYLOAD_BYTES {
@@ -3199,6 +3303,7 @@ fn materialize_codex_ws_step_body(
     Ok(MaterializedCodexWsStepBody {
         text: body_text,
         json: body,
+        env_context_state,
     })
 }
 
@@ -3949,6 +4054,7 @@ mod tests {
             crate::orchestration::ResponsesWebSocketAdapter::Codex,
             "codex",
             None,
+            None,
         )
         .expect("initial body should materialize");
 
@@ -3982,6 +4088,7 @@ mod tests {
             None,
             crate::orchestration::ResponsesWebSocketAdapter::Codex,
             "codex",
+            None,
             None,
         )
         .expect("follow-up body should materialize");
@@ -4024,6 +4131,7 @@ mod tests {
             crate::orchestration::ResponsesWebSocketAdapter::Standard,
             "openai",
             None,
+            None,
         )
         .expect("standard body should materialize");
 
@@ -4032,6 +4140,216 @@ mod tests {
         assert_eq!(materialized.json["store"], true);
         assert_eq!(materialized.json["previous_response_id"], "resp-1");
         assert_eq!(materialized.json["generate"], false);
+    }
+
+    fn materialize_with_env_context(
+        body: serde_json::Value,
+        env_context: Option<&CodexWsStepEnvironmentContext>,
+    ) -> MaterializedCodexWsStepBody {
+        materialize_codex_ws_step_body(
+            body,
+            "gpt-5.6-terra",
+            false,
+            None,
+            &HeaderMap::new(),
+            false,
+            None,
+            &[],
+            None,
+            crate::orchestration::ResponsesWebSocketAdapter::Codex,
+            "codex",
+            None,
+            env_context,
+        )
+        .expect("body should materialize")
+    }
+
+    fn env_context_full_step_body(env_ms: u64) -> serde_json::Value {
+        let env_id = format!(
+            "msg_{}",
+            crate::codex_runtime_identity::uuid_v7_from_parts(env_ms, &[0x11; 16])
+        );
+        let prompt_id = format!(
+            "msg_{}",
+            crate::codex_runtime_identity::uuid_v7_from_parts(env_ms + 40, &[0x22; 16])
+        );
+        json!({
+            "type": "response.create",
+            "model": "gpt-5.6-terra",
+            "input": [
+                {
+                    "type": "message",
+                    "id": env_id,
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "<environment_context>\n  <cwd>D:\\workspace\\new-api</cwd>\n  <shell>powershell</shell>\n  <current_date>2026-08-12</current_date>\n  <timezone>Asia/Shanghai</timezone>\n  <filesystem><workspace_roots><root>D:\\workspace\\new-api</root></workspace_roots></filesystem>\n</environment_context>"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
+                },
+                {
+                    "type": "message",
+                    "id": prompt_id,
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "inspect the workspace"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn materialized_full_step_normalizes_environment_context_and_returns_state() {
+        // 2026-08-12 03:00 UTC: 08-12 in Shanghai, 08-11 in the Americas.
+        let env_ms = 1_786_503_600_000u64;
+        let policy = process_environment_timezone();
+        let expected_date = crate::codex_environment_context::date_in(policy.tz, env_ms);
+        let env_context = CodexWsStepEnvironmentContext {
+            outbound_thread_id: "thread-outbound".into(),
+            outbound_turn_id: Some("turn-1".into()),
+            turn_started_at_unix_ms: Some(env_ms + 40),
+            now_unix_ms: env_ms + 100,
+            prior_state: None,
+        };
+        let materialized =
+            materialize_with_env_context(env_context_full_step_body(env_ms), Some(&env_context));
+        let text = materialized.json["input"][0]["content"][0]["text"]
+            .as_str()
+            .expect("environment block text");
+        assert!(
+            text.contains(&format!("  <timezone>{}</timezone>\n", policy.tz.name())),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("  <current_date>{expected_date}</current_date>\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains("  <cwd>D:\\workspace\\new-api</cwd>\n"),
+            "{text}"
+        );
+        assert!(text.contains("  <shell>powershell</shell>\n"), "{text}");
+        assert!(!text.contains("Asia/Shanghai"), "{text}");
+        let state = materialized
+            .env_context_state
+            .expect("full step returns the effective state");
+        assert_eq!(state.date.as_deref(), Some(expected_date.as_str()));
+        assert_eq!(state.timezone.as_deref(), Some(policy.tz.name()));
+        assert!(state.carries_current_date);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&materialized.text)
+                .expect("materialized text should be JSON"),
+            materialized.json
+        );
+
+        // Without a runtime identity snapshot the body is left alone.
+        let untouched = materialize_with_env_context(env_context_full_step_body(env_ms), None);
+        assert!(untouched.json["input"][0]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("<timezone>Asia/Shanghai</timezone>")));
+        assert!(untouched.env_context_state.is_none());
+    }
+
+    #[test]
+    fn materialized_incremental_step_appends_a_day_change_only_when_the_date_moved() {
+        let env_ms = 1_786_503_600_000u64;
+        let policy = process_environment_timezone();
+        let full = materialize_with_env_context(
+            env_context_full_step_body(env_ms),
+            Some(&CodexWsStepEnvironmentContext {
+                outbound_thread_id: "thread-outbound".into(),
+                outbound_turn_id: Some("turn-1".into()),
+                turn_started_at_unix_ms: Some(env_ms + 40),
+                now_unix_ms: env_ms + 100,
+                prior_state: None,
+            }),
+        );
+        let prior = full.env_context_state.expect("state after the full step");
+        let prior_date = prior.date.clone().expect("date after the full step");
+        // Walk forward until the target zone's calendar day changes.
+        let mut later_ms = env_ms + 3_600_000;
+        while crate::codex_environment_context::date_in(policy.tz, later_ms) == prior_date {
+            later_ms += 3_600_000;
+        }
+        let incremental = |tool_ms: u64| {
+            json!({
+                "type": "response.create",
+                "model": "gpt-5.6-terra",
+                "previous_response_id": "resp-1",
+                "input": [{
+                    "type": "function_call_output",
+                    "id": format!(
+                        "fco_{}",
+                        crate::codex_runtime_identity::uuid_v7_from_parts(tool_ms, &[0x33; 16])
+                    ),
+                    "call_id": "call-1",
+                    "output": "tool result"
+                }]
+            })
+        };
+
+        let moved = materialize_with_env_context(
+            incremental(later_ms),
+            Some(&CodexWsStepEnvironmentContext {
+                outbound_thread_id: "thread-outbound".into(),
+                outbound_turn_id: Some("turn-1".into()),
+                turn_started_at_unix_ms: Some(env_ms + 40),
+                now_unix_ms: later_ms + 5,
+                prior_state: Some(prior.clone()),
+            }),
+        );
+        let items = moved.json["input"].as_array().expect("input array");
+        assert_eq!(items.len(), 2, "{items:#?}");
+        assert_eq!(items[0]["type"], "function_call_output");
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(
+            items[1]["internal_chat_message_metadata_passthrough"]["turn_id"],
+            "turn-1"
+        );
+        let appended = items[1]["content"][0]["text"].as_str().expect("block text");
+        let new_date = crate::codex_environment_context::date_in(policy.tz, later_ms);
+        assert_eq!(
+            appended,
+            format!(
+                "<environment_context>\n  <current_date>{new_date}</current_date>\n  <timezone>{}</timezone>\n  <filesystem><workspace_roots><root>D:\\workspace\\new-api</root></workspace_roots></filesystem>\n</environment_context>",
+                policy.tz.name()
+            )
+        );
+        assert_eq!(
+            moved
+                .env_context_state
+                .as_ref()
+                .and_then(|state| state.date.as_deref()),
+            Some(new_date.as_str())
+        );
+
+        let same_day = materialize_with_env_context(
+            incremental(env_ms + 1_000),
+            Some(&CodexWsStepEnvironmentContext {
+                outbound_thread_id: "thread-outbound".into(),
+                outbound_turn_id: Some("turn-1".into()),
+                turn_started_at_unix_ms: Some(env_ms + 40),
+                now_unix_ms: env_ms + 1_005,
+                prior_state: Some(prior.clone()),
+            }),
+        );
+        assert_eq!(same_day.json["input"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            same_day
+                .env_context_state
+                .as_ref()
+                .and_then(|state| state.date.as_deref()),
+            Some(prior_date.as_str())
+        );
+
+        let no_state = materialize_with_env_context(
+            incremental(later_ms),
+            Some(&CodexWsStepEnvironmentContext {
+                outbound_thread_id: "thread-outbound".into(),
+                outbound_turn_id: Some("turn-1".into()),
+                turn_started_at_unix_ms: None,
+                now_unix_ms: later_ms + 5,
+                prior_state: None,
+            }),
+        );
+        assert_eq!(no_state.json["input"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]

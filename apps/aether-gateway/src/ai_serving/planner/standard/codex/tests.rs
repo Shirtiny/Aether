@@ -1432,3 +1432,138 @@ fn materialized_codex_profiles_without_account_id_are_key_id_scoped() {
         second.fingerprint["codex_client_profile"]["fingerprint_hash"]
     );
 }
+
+fn environment_context_history(env_ms: u64) -> Value {
+    let env_id = format!(
+        "msg_{}",
+        crate::codex_runtime_identity::uuid_v7_from_parts(env_ms, &[0x11; 16])
+    );
+    let prompt_id = format!(
+        "msg_{}",
+        crate::codex_runtime_identity::uuid_v7_from_parts(env_ms + 40, &[0x22; 16])
+    );
+    let tool_id = format!(
+        "fco_{}",
+        crate::codex_runtime_identity::uuid_v7_from_parts(env_ms + 90_000_000, &[0x33; 16])
+    );
+    json!({
+        "model": "gpt-5.6-terra",
+        "input": [
+            {
+                "type": "message",
+                "id": env_id,
+                "role": "user",
+                "content": [{"type": "input_text", "text": "<environment_context>\n  <cwd>D:\\workspace\\new-api</cwd>\n  <shell>powershell</shell>\n  <current_date>2026-08-12</current_date>\n  <timezone>Asia/Shanghai</timezone>\n  <filesystem><workspace_roots><root>D:\\workspace\\new-api</root></workspace_roots></filesystem>\n</environment_context>"}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
+            },
+            {
+                "type": "message",
+                "id": prompt_id,
+                "role": "user",
+                "content": [{"type": "input_text", "text": "inspect the workspace"}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
+            },
+            {"type": "function_call", "id": "fc_0123", "call_id": "call-1", "name": "shell", "arguments": "{}"},
+            // 25 hours later: a new calendar day in every zone.
+            {"type": "function_call_output", "id": tool_id, "call_id": "call-1", "output": "ok"}
+        ],
+        "tools": [
+            {"type": "web_search", "user_location": {"type": "approximate", "timezone": "Asia/Shanghai"}}
+        ]
+    })
+}
+
+#[test]
+fn http_responses_environment_context_pass_normalizes_clock_and_appends_at_the_tail() {
+    use crate::codex_runtime_identity::CodexRuntimeIdentitySurface;
+
+    // 2026-08-12 03:00 UTC.
+    let env_ms = 1_786_503_600_000u64;
+    let policy = crate::codex_environment_context::process_environment_timezone();
+    let env_date = crate::codex_environment_context::date_in(policy.tz, env_ms);
+    let mut body = environment_context_history(env_ms);
+    let now = std::time::UNIX_EPOCH + std::time::Duration::from_millis(env_ms + 90_001_000);
+    super::apply_codex_pool_environment_context(
+        &mut body,
+        CodexRuntimeIdentitySurface::HttpResponses,
+        "thread-outbound",
+        None,
+        now,
+    );
+
+    let text = body["input"][0]["content"][0]["text"]
+        .as_str()
+        .expect("environment block");
+    assert_eq!(
+        text,
+        format!(
+            "<environment_context>\n  <cwd>D:\\workspace\\new-api</cwd>\n  <shell>powershell</shell>\n  <current_date>{env_date}</current_date>\n  <timezone>{}</timezone>\n  <filesystem><workspace_roots><root>D:\\workspace\\new-api</root></workspace_roots></filesystem>\n</environment_context>",
+            policy.tz.name()
+        )
+    );
+    let items = body["input"].as_array().expect("input array");
+    assert_eq!(items.len(), 5, "{items:#?}");
+    assert_eq!(items[4]["role"], "user");
+    let appended = items[4]["content"][0]["text"]
+        .as_str()
+        .expect("appended block");
+    let tail_date = crate::codex_environment_context::date_in(policy.tz, env_ms + 90_000_000);
+    assert_ne!(tail_date, env_date);
+    assert_eq!(
+        appended,
+        format!(
+            "<environment_context>\n  <current_date>{tail_date}</current_date>\n  <timezone>{}</timezone>\n  <filesystem><workspace_roots><root>D:\\workspace\\new-api</root></workspace_roots></filesystem>\n</environment_context>",
+            policy.tz.name()
+        )
+    );
+    assert_eq!(
+        items[4]["internal_chat_message_metadata_passthrough"],
+        json!({"turn_id": "turn-1"})
+    );
+    assert!(body["tools"][0].get("user_location").is_none());
+}
+
+#[test]
+fn http_compact_environment_context_pass_rewrites_but_never_appends() {
+    use crate::codex_runtime_identity::CodexRuntimeIdentitySurface;
+
+    let env_ms = 1_786_503_600_000u64;
+    let policy = crate::codex_environment_context::process_environment_timezone();
+    let mut body = environment_context_history(env_ms);
+    let now = std::time::UNIX_EPOCH + std::time::Duration::from_millis(env_ms + 90_001_000);
+    super::apply_codex_pool_environment_context(
+        &mut body,
+        CodexRuntimeIdentitySurface::HttpCompact,
+        "thread-outbound",
+        None,
+        now,
+    );
+    let items = body["input"].as_array().expect("input array");
+    assert_eq!(items.len(), 4, "{items:#?}");
+    assert!(items[0]["content"][0]["text"]
+        .as_str()
+        .is_some_and(|text| text.contains(&format!("<timezone>{}</timezone>", policy.tz.name()))));
+    assert!(body["tools"][0].get("user_location").is_none());
+}
+
+#[test]
+fn header_only_surfaces_skip_the_environment_context_pass() {
+    use crate::codex_runtime_identity::CodexRuntimeIdentitySurface;
+
+    let env_ms = 1_786_503_600_000u64;
+    let original = environment_context_history(env_ms);
+    for surface in [
+        CodexRuntimeIdentitySurface::Headers,
+        CodexRuntimeIdentitySurface::WsStepBody,
+    ] {
+        let mut body = original.clone();
+        super::apply_codex_pool_environment_context(
+            &mut body,
+            surface,
+            "thread-outbound",
+            None,
+            std::time::SystemTime::now(),
+        );
+        assert_eq!(body, original);
+    }
+}

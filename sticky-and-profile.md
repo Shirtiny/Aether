@@ -555,7 +555,7 @@ Do not read, parse, normalize, or rewrite these surfaces as part of profile v1:
 
 - top-level Responses `instructions`.
 - `input` prompt text.
-- `<environment_context>`.
+- `<environment_context>` (profile v1 itself still does not touch it. Since `backend-v0.7.122` a separate environment-context pass (not profile v1) rewrites only `<timezone>` / `<current_date>` inside `<environment_context>`; see `docs/architecture/codex-environment-context-time-normalization-plan-2026-09-10.md`.)
 - AGENTS.md/contextual fragments.
 - developer/system/tool/history messages.
 - prompt cache anchors except preserving existing behavior.
@@ -1013,7 +1013,7 @@ Sticky and cache must be tested as contracts.
 - template library changes are covered by explicit migration/versioning tests if assignment preservation is required.
 - `chatgpt-account-id` comes from selected key auth config even if inbound request sends a different value.
 - existing `prompt_cache_key` is preserved.
-- top-level `instructions`, `input`, and `<environment_context>` are byte-for-byte unchanged by profile v1.
+- top-level `instructions`, `input`, and `<environment_context>` are byte-for-byte unchanged by profile v1. Since `backend-v0.7.122` a separate environment-context pass (not profile v1) rewrites only `<timezone>` / `<current_date>` inside `<environment_context>`; see `docs/architecture/codex-environment-context-time-normalization-plan-2026-09-10.md`.
 - non-Codex requests are unchanged.
 - disabling profile flags restores current behavior.
 
@@ -1038,7 +1038,7 @@ The first implementation cut is profile v1 only: account-owned `installation_id`
 6. Apply concrete headers and installation id after selected key/account resolution.
 7. Update only existing installation-id surfaces by default; optional insertion of missing official surfaces should be behind an explicit flag.
 8. Preserve `session_id`, `thread_id`, `turn_id`, `window_id`, sticky token source, and `prompt_cache_key`.
-9. Do not parse or mutate `instructions`, `input`, or `<environment_context>`.
+9. Do not parse or mutate `instructions`, `input`, or `<environment_context>`. Since `backend-v0.7.122` a separate environment-context pass (not profile v1) rewrites only `<timezone>` / `<current_date>` inside `<environment_context>`; see `docs/architecture/codex-environment-context-time-normalization-plan-2026-09-10.md`.
 10. Add active-key collision checks for the full account-owned portrait hash.
 11. Add tests proving same key/account repeats the same profile, different active keys do not share the same full portrait hash, and transport execution still comes from `fingerprint.transport_profile`.
 12. Defer runtime identity synthesis and prompt/instructions processing until there is a separate product requirement and evidence path.

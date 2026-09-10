@@ -35,6 +35,7 @@ mod bark_push;
 mod cache;
 mod client_session_affinity;
 mod clock;
+mod codex_environment_context;
 mod codex_profile;
 mod codex_runtime_identity;
 mod codex_ws;

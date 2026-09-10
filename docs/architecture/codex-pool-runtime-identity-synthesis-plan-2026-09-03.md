@@ -64,7 +64,7 @@
 6. **缺省关闭。** 未配置或 `enabled: false` 时行为与今天完全一致。
 7. **不改 Admin 表单。** v1 只读 `pool_advanced` JSON，与 `codex_client_headers` 相同。前端高级设置 / 调度对话框今天用 `...currentConfig` 整段合并，未知键会保留；实现时不得加白名单把 `codex_runtime_identity` 丢掉。
 8. **Redis 不可用时透传入站 ID，不在进程内私自 mint。** 多实例必须看到同一 UUID。这是唯一允许透传的情形；freeze miss 不透传（见 11）。
-9. **不改 prompt / instructions / `<environment_context>`。**
+9. **不改 prompt / instructions。** `<environment_context>` 自 .122 起只由独立的 environment-context pass 改写其中的 `<timezone>` / `<current_date>`（见 `codex-environment-context-time-normalization-plan-2026-09-10.md`），其余子元素与 prompt 仍逐字节不动；身份改写本身不碰它。
 10. **本计划不授权生产启用。** 实现落地后仍需操作员显式打开某个 Codex provider 的 JSON 开关。
 11. **接续冻结优先于日切换槽。** 同一入站 root 仍有未过期的冻结快照时，出站 session/thread/window（以及该入站 turn 的出站 turn）必须复用冻结值。HTTP compact 与 WS 主 turn 共用这一快照。WS 上以候选进程内快照为准，Redis freeze 是供其它路径读取的副本。「带 `previous_response_id` 而 freeze miss」在 WS 上被 epoch fence 构造性排除，在 HTTP 上只在 operator body_rules 保留该字段时可能；若出现，按槽正常 mint 并打点，**不透传入站身份**。
 12. **配置非法时关闭合成，不静默 clamp 成 6/48。** 写路径拒绝非法类型和越界；读路径打点并当 `enabled: false`。`enabled: false` 是合法关闭，不得抄 `validate_codex_client_header_config` 把关闭当成错误。
@@ -85,7 +85,7 @@
 
 - 给非 Codex 客户端补官方运行时 ID（旧 synthetic-client mode）。
 - 在上游保留官方 subagent 树（child `thread_id` + 共享根 `session_id`）。
-- 改写 prompt 可见的 `<environment_context>`。
+- 改写 prompt 可见的 `<environment_context>`（.122 起例外：`<timezone>` / `<current_date>` 两个子元素由独立 pass 归一化，见 `codex-environment-context-time-normalization-plan-2026-09-10.md`；cwd / shell 等仍不动）。
 - 把合成 ID 写入 Postgres、`fingerprint.codex_client_profile` 或 `upstream_metadata`。
 - Admin UI 表单字段 / 批量操作 / 环境变量。v1 也不把该对象加进 `AdminProviderPoolConfig` 的 typed 字段。
 - 一天之内超出 N/M 后再滚动新 ID。
@@ -283,7 +283,7 @@ Aether 今天不解析 `request_kind`（代码里没有该键的读取）。实�
 | `guardian:{parent}` | 改写成出站合成 session（父 thread 已塌缩） |
 | 其它显式值 | 保留。禁止用 Aether API Key 身份做种子 |
 
-不要解析或改写 `instructions` / `input` / `<environment_context>`。
+不要解析或改写 `instructions` / `input`。`<environment_context>` 由 .122 起的独立 environment-context pass 处理（只改 `<timezone>` / `<current_date>`，其余逐字节不动，见 `codex-environment-context-time-normalization-plan-2026-09-10.md`）；身份改写本身仍不碰它。
 
 HTTP 兼容短头 `session_id` / `conversation_id`（`prompt_cache_key` SHA-256 前 8 字节的 16 hex）不是官方运行时身份，官方 HTTP 客户端根本不发它们（`codex-api/src/requests/headers.rs` 只有 `session-id` / `thread-id`）。WS 握手已经排除它们。不要用它们当映射输入。今天它们由 `apply_codex_openai_responses_special_headers`（`decision/request.rs:893`）在缺失时从 **入站** `prompt_cache_key` 派生，且该步骤在 profile apply（`:902`）之前；若身份改写放在 profile 之后而不处理短头，上游会收到与真实 session 一一对应的 16 hex 指纹。规则：合成开启且有入站 root 时，**删除** 这两个短头，不论是 Aether 自补还是入站显式带来（v0.7.105 前保留入站显式值；.104 线上复核发现下游中转会把 `session_id` 短头设成真实 thread 并原样到达上游，见 §18.13）。备选是按出站 cache key 重算，但没有理由保留一个官方不发的头。
 
@@ -489,7 +489,7 @@ HTTP planner 今天对 dash `session-id` / `thread-id` / `x-codex-window-id` 没
 - `client_session_affinity.rs` 提取顺序 / token 格式
 - `OfficialRequestIdentity::matches_connection_binding`
 - Aether settlement `request_id` / API Key 计费
-- prompt / instructions / `<environment_context>`
+- prompt / instructions；`<environment_context>` 只允许独立 pass 改 `<timezone>` / `<current_date>`（见 `codex-environment-context-time-normalization-plan-2026-09-10.md`）
 - `custom` 上无关脏改（`orchestration/mod.rs`、`docker-compose.yml`、未完成的 WS usage 改动）。`runtime.rs` / `session.rs` 只允许为 outbound snapshot 加最小钩子
 - HTTP Codex 对 `previous_response_id` 的剥离名单
 - WS `previous_response_id` epoch fence（`parse_response_create`）与 `rebind()` 的重置

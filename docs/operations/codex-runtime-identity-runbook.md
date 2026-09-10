@@ -250,6 +250,23 @@ from (select h.provider_request_headers::jsonb oh from usage_http_audits h join 
         and h.request_headers::jsonb ? 'thread-id' and not (h.request_headers::jsonb ? 'x-client-request-id')) s;
 ```
 
+### 3.7 `<environment_context>` 时区 / 日期归一化复核（.122）
+
+.122 起出站 `input[]` 里每个 `<environment_context>` 块的 `<timezone>` 应恒等于容器时区（本机 `America/New_York`），`<current_date>` 应等于该 item 自身 UUIDv7 瞬时（或紧随其后 item 的瞬时）在该时区下的日期；冗余日切块被删，缺失的日切块按官方 `render_diff` 形状补上。设计见 `docs/architecture/codex-environment-context-time-normalization-plan-2026-09-10.md`。
+
+出站 body 不落库，复核靠两条路：
+
+1. **日志计数**（部署后前 30 分钟）：
+   ```bash
+   docker logs aether-app --since "$(docker inspect aether-app --format '{{.State.StartedAt}}')" 2>&1 | grep -E 'codex_env_tz_(resolved|rejected)' | cut -c1-300
+   docker logs aether-app --since 30m 2>&1 | grep -c 'codex_env_context_rewritten'
+   docker logs aether-app --since 30m 2>&1 | grep 'codex_env_context_rewritten' | grep -oE 'blocks_(removed|inserted|appended)=[0-9]+' | sort | uniq -c | sort -rn | head
+   ```
+   期望：恰一条 `codex_env_tz_resolved` 且 `tz=America/New_York source=tz_env`；没有 `codex_env_tz_rejected`；`codex_env_context_rewritten` 数量与 Codex Pro 带 env 块的请求量同量级。
+2. **抓包 / 样本眼看**：按 `docs/operations/tls-fingerprint-capture.md` 抓一条出站 `/responses`，或在开发机跑 `RUST_MIN_STACK=16777216 cargo test -p aether-gateway environment_context_sample -- --ignored --nocapture`（读 `AETHER_ENV_CONTEXT_SAMPLE` 指向的入站请求 JSON），核对：所有块 `<timezone>` 为目标时区；日切块 `<current_date>` 与紧随 prompt 的 `msg_` id 时间戳换算一致（`TZ=America/New_York date -d @<秒>`）；同一线程连续两次请求的输出前者是后者的前缀。
+
+入站侧分布（用于估计改写量）仍可从 `usage_http_audits.request_body` 若落库时统计 `<timezone>` 值；没有落库时以日志计数为准。
+
 ## 4. 日志事件与处置
 
 ```bash
@@ -267,6 +284,10 @@ docker logs aether-app --since 2026-09-05T06:40:00Z 2>&1 | grep -E 'codex_rid_' 
 | `codex_rid_turn_steered`（debug 级，.110） | 同一出站 thread 上，被取代的旧入站 turn 回放时 steer 到当前 open turn（不回访旧 turn id，只刷 TTL） | 正常行为。thread 内 turn 交错时保证出站 turn id 单调向前；集中出现只说明该账号有大量乱序 / 重放请求，不需处理 |
 | `codex_rid_turn_budget_exceeded`（debug 级，.110） | 该账号最近 24h 的 turn 台账已满 `turn_bound`，本请求折回已有 thread、不再开新 turn | 正常的账号级硬顶生效。若某账号频繁触发，说明流量下该上限把可见 turn 压得偏紧，可上调 `expected_turns_per_day`（但别超约 100 的风控线）；这是把账号可见 turn 压到官方阈值以下的预期机制 |
 | `codex_rid_unknown_metadata_key` | 客户端带了三表面白名单之外的键，已被删除；每进程每 (surface, key) 只 warn 一次 | 走 §4.1 判定 |
+| `codex_env_tz_resolved`（info，.122，每进程一次） | `<environment_context>` 归一化选定的目标时区：`tz` 与 `source`（`env_override` / `tz_env` / `localtime` / `fallback`） | 本机期望 `America/New_York` / `tz_env`。出现 `fallback` 说明 compose 没给 `TZ` 或给了非法 / 被拒值，先看同批 `codex_env_tz_rejected` |
+| `codex_env_tz_rejected`（warn，.122） | 某个时区候选被拒：`source`、`value`、`reason`（`empty` / `denied_region` / `unknown_iana_name` / `not_a_region_city_zone`） | `denied_region` = 配了中国时区，绝不能放行，改 `TZ`；`not_a_region_city_zone` = `UTC` / `Etc/*` / `EST` 之类，换成 `Region/City` 形。修完重建 `app` |
+| `codex_env_context_rewritten`（有删 / 插 / 追加时 info，否则 debug，.122） | 本请求 `<environment_context>` 改写计数：`surface`、`thread`、`blocks_seen`、`timezone_rewritten`、`date_rewritten`、`blocks_removed`、`blocks_inserted`、`blocks_appended`、`instant_source_*`、`unknown_child_tags`、`user_location_removed` | 正常行为。`instant_source_heuristic` 长期占比高说明大量无 id 旧客户端；`blocks_removed` 持续为 0 而下游时区不是目标时区，检查 kill switch 是否被关 |
+| `codex_env_unknown_child_tag`（首次 warn、之后 debug，.122） | `<environment_context>` 里出现解析器不认识的顶层子标签，块按「含未知」处理：只改 tz / 日期，不判重不删 | 到 codex-rs `core/src/context/world_state/environment.rs` 看新标签是否为官方新增标量；是则加进解析器与判重集合并补单测 |
 
 ### 4.1 未知键判定流程（白名单维护）
 
@@ -363,6 +384,7 @@ from (select (h.provider_request_headers::jsonb->>'x-codex-turn-metadata')::json
 1. **关开关**（秒级，无需部署）：号池高级设置里把「会话身份合成」关掉。出站立刻回到功能前的形状（入站身份透传 + Aether 填充器的 `session_id` / `conversation_id` 短头与随机 `x-client-request-id`）。上游会看到该账号的 thread 从合成身份切回真实身份，这是可接受的一次性跳变。
 2. **镜像回滚**：按 `docs/operations/release-and-container-update-spec.md`，恢复对应 `.env.bak.<ts>_pre_vX` 的 `APP_IMAGE`，只重建 `app`，须操作员明确授权。**不要回到 .104**（带缓存回退）；.105 是含缓存修复的最低版本；再往前请回 .103 并关开关。
 3. **Redis 键**：`ap:{provider_id}:codex_rid:*` 都有 TTL，回滚后自然过期。不要手动清：清掉等于让所有活跃 thread 换身份，上游看到一批新 thread。
+4. **只关 `<environment_context>` 归一化（.122）**：给 `app` 容器加环境变量 `AETHER_CODEX_ENVIRONMENT_CONTEXT_REWRITE=off`（compose `environment:`）并只重建 `app`，秒级；身份合成不受影响。关掉后出站 `<timezone>` / `<current_date>` 立刻回到下游真实值，上游会看到该账号时区跳变一次。要换目标时区而不是关掉：改 `TZ`（或 `AETHER_CODEX_ENVIRONMENT_TIMEZONE`）后重建 `app`，中国时区会被拒绝并回退到 `America/New_York`（看 `codex_env_tz_rejected`）。
 
 ## 7. 已知限制（不需要处理，只需知道）
 
@@ -384,3 +406,5 @@ from (select h.provider_request_headers::jsonb oh from usage_http_audits h join 
 ```
 
 期望 .107 后 `has_version = version_matches_ua = n`。
+
+- **`<environment_context>` 时区 / 日期归一化（.122）的残余**：只改 `<timezone>` / `<current_date>`，`<cwd>` / `<shell>` 与出站 UA 的 OS 可能不一致（PowerShell 路径配 macOS UA），用户已接受。请求时刻本身改不了：`turn_started_at_unix_ms` 是 UTC epoch，上游始终看得到真实作息节律（14 天样本按美国时区 41–45% 落在本地 00–07 点），要治只能在调度层按账号分「活跃时段」，属独立计划。上线一刻正在进行的线程会被一次性改写历史（tz 换、部分日切块删 / 插），prompt cache 失一次后稳定。无 id 的旧客户端形状只能 best-effort。WS 增量步的状态只活在进程内：重启或换绑后的第一个增量步若正好跨午夜会漏一块，下一 turn 的全量回放会补上。宿主 `/etc/timezone` 陈旧为 `Europe/Berlin` 不影响容器（容器走 `TZ`）。详见 `docs/architecture/codex-environment-context-time-normalization-plan-2026-09-10.md` §9。

@@ -11,6 +11,10 @@ use http::HeaderMap;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::codex_environment_context::{
+    apply_codex_environment_context, environment_context_rewrite_enabled,
+    log_environment_context_report, process_environment_timezone, EnvironmentContextRewriteInput,
+};
 use crate::codex_profile::{
     apply_codex_client_identity_headers, apply_codex_concrete_account_profile_to_request,
     apply_codex_concrete_account_profile_to_request_with_body_policy,
@@ -22,9 +26,9 @@ use crate::codex_profile::{
 };
 use crate::codex_runtime_identity::{
     apply_outbound_codex_runtime_identity, codex_runtime_identity_rewrite_enabled,
-    resolve_outbound_codex_runtime_identity, CodexRuntimeIdentityResolution,
-    CodexRuntimeIdentityScope, CodexRuntimeIdentityStore, CodexRuntimeIdentitySurface,
-    InboundCodexRuntimeIdentity, OutboundCodexRuntimeIdentity,
+    resolve_outbound_codex_runtime_identity, unix_millis, uuid_v7_unix_millis,
+    CodexRuntimeIdentityResolution, CodexRuntimeIdentityScope, CodexRuntimeIdentityStore,
+    CodexRuntimeIdentitySurface, InboundCodexRuntimeIdentity, OutboundCodexRuntimeIdentity,
 };
 
 pub(crate) use crate::ai_serving::{
@@ -440,7 +444,7 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
     runtime: &RuntimeState,
     transport: &GatewayProviderTransportSnapshot,
     provider_request_headers: &mut BTreeMap<String, String>,
-    provider_request_body: Option<&mut Value>,
+    mut provider_request_body: Option<&mut Value>,
     original_headers: &HeaderMap,
     original_body: Option<&Value>,
     surface: CodexRuntimeIdentitySurface,
@@ -463,22 +467,67 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
         inbound.synthesize_missing_root(content, original_headers);
     }
     let store = CodexRuntimeIdentityStore::new(runtime);
-    match resolve_outbound_codex_runtime_identity(&store, &scope, &inbound, None, SystemTime::now())
-        .await
-    {
-        CodexRuntimeIdentityResolution::Rewrite(outbound) => {
-            apply_outbound_codex_runtime_identity(
-                provider_request_headers,
-                provider_request_body,
-                &inbound,
-                &outbound,
-                surface,
-                None,
-            );
-            Some(outbound)
-        }
-        CodexRuntimeIdentityResolution::Passthrough => None,
+    let now = SystemTime::now();
+    let outbound =
+        match resolve_outbound_codex_runtime_identity(&store, &scope, &inbound, None, now).await {
+            CodexRuntimeIdentityResolution::Rewrite(outbound) => {
+                apply_outbound_codex_runtime_identity(
+                    provider_request_headers,
+                    provider_request_body.as_deref_mut(),
+                    &inbound,
+                    &outbound,
+                    surface,
+                    None,
+                );
+                Some(outbound)
+            }
+            CodexRuntimeIdentityResolution::Passthrough => None,
+        };
+    // The model-visible host clock (`<timezone>` / `<current_date>`) is
+    // normalized after the identity pass so the seed is the outbound thread.
+    // Runs on passthrough too: a Redis outage must not leak the client's zone.
+    if let Some(body) = provider_request_body {
+        let (thread_id, turn_id) = match &outbound {
+            Some(outbound) => (outbound.thread_id.as_str(), outbound.turn_id.as_deref()),
+            None => (
+                inbound.thread_id.as_deref().unwrap_or_default(),
+                inbound.turn_id.as_deref(),
+            ),
+        };
+        apply_codex_pool_environment_context(body, surface, thread_id, turn_id, now);
     }
+    outbound
+}
+
+/// Rewrites `<environment_context>` host-clock values for the HTTP surfaces
+/// that carry `input[]`. Header-only surfaces have no body; chat/family
+/// conversions have no environment blocks and come out untouched.
+pub(crate) fn apply_codex_pool_environment_context(
+    body: &mut Value,
+    surface: CodexRuntimeIdentitySurface,
+    outbound_thread_id: &str,
+    outbound_turn_id: Option<&str>,
+    now: SystemTime,
+) {
+    if !environment_context_rewrite_enabled() {
+        return;
+    }
+    let surface_name = match surface {
+        CodexRuntimeIdentitySurface::HttpResponses => "http_responses",
+        CodexRuntimeIdentitySurface::HttpCompact => "http_compact",
+        _ => return,
+    };
+    let input = EnvironmentContextRewriteInput {
+        tz: process_environment_timezone().tz,
+        now_unix_ms: unix_millis(now),
+        turn_started_at_unix_ms: outbound_turn_id.and_then(uuid_v7_unix_millis),
+        turn_id: outbound_turn_id,
+        outbound_thread_id,
+        allow_tail_append: surface == CodexRuntimeIdentitySurface::HttpResponses,
+        prior_state: None,
+    };
+    let (report, _) = apply_codex_environment_context(body, &input);
+    log_environment_context_report(surface_name, outbound_thread_id, &report);
 }
 
 fn remove_codex_pool_upstream_leak_headers(

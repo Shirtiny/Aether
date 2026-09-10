@@ -213,7 +213,8 @@ const DOWNSTREAM_FP_DOMAIN: &[u8] = b"aether:codex:rid:downstream:v1";
 const DOWNSTREAM_IDENTITY_HEADERS: &[&str] = &["cafecode-uid", "authorization", "x-api-key"];
 /// codex-rs `prompts/templates/compact/summary_prefix.md`: compaction
 /// summaries are re-injected as user messages starting with this text.
-const COMPACT_SUMMARY_PREFIX: &str = "Another language model started to solve this problem";
+pub(crate) const COMPACT_SUMMARY_PREFIX: &str =
+    "Another language model started to solve this problem";
 const X_CODEX_INSTALLATION_ID: &str = "x-codex-installation-id";
 const USER_AGENT_HEADER: &str = "user-agent";
 const REQUEST_KIND_TURN: &str = "turn";
@@ -2258,7 +2259,7 @@ fn real_user_prompts(input: &Value) -> Vec<(usize, String)> {
 }
 
 /// Text of a Responses input message: a string or its text parts joined.
-fn message_text(content: &Value) -> Option<String> {
+pub(crate) fn message_text(content: &Value) -> Option<String> {
     match content {
         Value::String(text) => Some(text.clone()),
         Value::Array(parts) => {
@@ -2281,7 +2282,7 @@ fn message_text(content: &Value) -> Option<String> {
 /// A real prompt: non-empty, not a wrapper the client injects around
 /// instructions / environment / skills (`<tag>` first), not a compaction
 /// summary.
-fn prompt_text(text: &str) -> Option<String> {
+pub(crate) fn prompt_text(text: &str) -> Option<String> {
     let text = text.trim();
     if text.is_empty() || text.starts_with(COMPACT_SUMMARY_PREFIX) || starts_with_wrapper_tag(text)
     {
@@ -2290,7 +2291,7 @@ fn prompt_text(text: &str) -> Option<String> {
     Some(text.to_string())
 }
 
-fn starts_with_wrapper_tag(text: &str) -> bool {
+pub(crate) fn starts_with_wrapper_tag(text: &str) -> bool {
     let Some(rest) = text.strip_prefix('<') else {
         return false;
     };
@@ -2665,7 +2666,7 @@ pub(crate) fn uuid_v7_at(unix_ms: u64) -> String {
 /// Lays out a UUIDv7 from a 48-bit millisecond timestamp and 16 bytes of
 /// entropy (only bytes 6..16 are used). Single source of the byte shape so every
 /// synthetic ID, random or derived, carries the same version/variant/gap bits.
-fn uuid_v7_from_parts(unix_ms: u64, random: &[u8; 16]) -> String {
+pub(crate) fn uuid_v7_from_parts(unix_ms: u64, random: &[u8; 16]) -> String {
     let mut bytes = [0u8; 16];
     bytes[..6].copy_from_slice(&unix_ms.to_be_bytes()[2..8]);
     bytes[6] = 0x70 | (random[6] & 0x0F);
@@ -2676,7 +2677,7 @@ fn uuid_v7_from_parts(unix_ms: u64, random: &[u8; 16]) -> String {
     Uuid::from_bytes(bytes).hyphenated().to_string()
 }
 
-fn sha256(parts: &[&[u8]]) -> [u8; 32] {
+pub(crate) fn sha256(parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(part);
@@ -2710,7 +2711,7 @@ fn unix_secs(now: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-fn unix_millis(now: SystemTime) -> u64 {
+pub(crate) fn unix_millis(now: SystemTime) -> u64 {
     now.duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
@@ -2777,7 +2778,7 @@ fn project_header(
 }
 
 /// Unix milliseconds encoded in the first 48 bits of a UUIDv7 string.
-fn uuid_v7_unix_millis(id: &str) -> Option<u64> {
+pub(crate) fn uuid_v7_unix_millis(id: &str) -> Option<u64> {
     let uuid = Uuid::parse_str(id).ok()?;
     if uuid.get_version_num() != 7 {
         return None;
