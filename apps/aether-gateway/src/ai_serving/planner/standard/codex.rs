@@ -174,7 +174,12 @@ fn apply_codex_pool_concrete_account_profile_with_body_policy(
         return;
     }
     remove_codex_pool_upstream_leak_headers(provider_request_headers);
-    if body_policy == CodexProfileRequestBodyPolicy::StripClientMetadata {
+    if body_policy == CodexProfileRequestBodyPolicy::StripClientMetadata
+        && !crate::provider_transport::body_rules_handle_path(
+            transport.endpoint.body_rules.as_ref(),
+            "client_metadata",
+        )
+    {
         strip_codex_client_metadata_from_body(provider_request_body);
     }
 
@@ -449,10 +454,10 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
     original_body: Option<&Value>,
     surface: CodexRuntimeIdentitySurface,
 ) -> Option<OutboundCodexRuntimeIdentity> {
-    let scope = resolve_codex_pool_runtime_identity_scope(transport)?;
+    let scope = resolve_codex_pool_runtime_identity_scope(transport);
     let mut inbound =
         InboundCodexRuntimeIdentity::from_request(original_body, Some(original_headers));
-    if surface == CodexRuntimeIdentitySurface::HttpResponses {
+    if scope.is_some() && surface == CodexRuntimeIdentitySurface::HttpResponses {
         // A `/responses` egress without any official identity (a relay that
         // strips codex headers in front of a real client, or a chat/family
         // request converted to Responses) gets a content-derived root, so the
@@ -466,10 +471,10 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
         };
         inbound.synthesize_missing_root(content, original_headers);
     }
-    let store = CodexRuntimeIdentityStore::new(runtime);
     let now = SystemTime::now();
-    let outbound =
-        match resolve_outbound_codex_runtime_identity(&store, &scope, &inbound, None, now).await {
+    let outbound = if let Some(scope) = scope.as_ref() {
+        let store = CodexRuntimeIdentityStore::new(runtime);
+        match resolve_outbound_codex_runtime_identity(&store, scope, &inbound, None, now).await {
             CodexRuntimeIdentityResolution::Rewrite(outbound) => {
                 apply_outbound_codex_runtime_identity(
                     provider_request_headers,
@@ -482,20 +487,40 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
                 Some(outbound)
             }
             CodexRuntimeIdentityResolution::Passthrough => None,
-        };
+        }
+    } else {
+        None
+    };
     // The model-visible host clock (`<timezone>` / `<current_date>`) is
     // normalized after the identity pass so the seed is the outbound thread.
     // Runs on passthrough too: a Redis outage must not leak the client's zone.
-    if let Some(body) = provider_request_body {
-        let (thread_id, turn_id) = match &outbound {
-            Some(outbound) => (outbound.thread_id.as_str(), outbound.turn_id.as_deref()),
-            None => (
-                inbound.thread_id.as_deref().unwrap_or_default(),
-                inbound.turn_id.as_deref(),
-            ),
-        };
-        apply_codex_pool_environment_context(body, surface, thread_id, turn_id, now);
+    if scope.is_some() {
+        if let Some(body) = provider_request_body.as_deref_mut() {
+            let (thread_id, turn_id) = match &outbound {
+                Some(outbound) => (outbound.thread_id.as_str(), outbound.turn_id.as_deref()),
+                None => (
+                    inbound.thread_id.as_deref().unwrap_or_default(),
+                    inbound.turn_id.as_deref(),
+                ),
+            };
+            apply_codex_pool_environment_context(body, surface, thread_id, turn_id, now);
+        }
     }
+
+    // Endpoint request-header rules are an explicit operator override.  Apply
+    // them after Codex identity sanitation so a configured header is not
+    // silently removed by the pool's inbound-metadata filters.  Authentication
+    // and content type remain protected by the same safeguards as the initial
+    // rule pass.
+    let protected = ["authorization", "api-key", "x-api-key", "content-type"];
+    let _ = crate::provider_transport::apply_local_header_rules_with_request_headers(
+        provider_request_headers,
+        transport.endpoint.header_rules.as_ref(),
+        &protected,
+        provider_request_body.as_deref().unwrap_or(&Value::Null),
+        original_body,
+        Some(original_headers),
+    );
     outbound
 }
 
