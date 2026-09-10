@@ -1335,7 +1335,7 @@ async fn connect_candidates_for_step(
         step_usage.bind(&candidate, step);
         let connect_result = match tokio::time::timeout_at(
             connect_deadline,
-            connect_candidate_while_client_open(client, runtime, candidate),
+            connect_candidate_while_client_open(client, runtime, candidate, step),
         )
         .await
         {
@@ -1394,8 +1394,9 @@ async fn connect_candidate_while_client_open(
     client: &mut Box<dyn RelayPeer>,
     runtime: &dyn CodexWsRuntimePort,
     candidate: CodexWsCandidate,
+    step: &ResponseCreateStep,
 ) -> Option<Result<ConnectedCandidate, super::runtime::StepPreparationError>> {
-    let connect = runtime.connect(candidate);
+    let connect = runtime.connect(candidate, step);
     tokio::pin!(connect);
     loop {
         tokio::select! {
@@ -3306,6 +3307,7 @@ mod tests {
         async fn connect(
             &self,
             candidate: CodexWsCandidate,
+            _first_step: &ResponseCreateStep,
         ) -> Result<ConnectedCandidate, StepPreparationError> {
             self.started_candidates
                 .lock()
@@ -3665,6 +3667,46 @@ mod tests {
             .expect("request fixture should be an object")
             .remove("model");
         request.to_string()
+    }
+
+    #[tokio::test]
+    async fn routing_hint_is_derived_from_connecting_candidates_first_step() {
+        let mut step = parse_response_create(
+            &request_step("routing-1", None),
+            ResponseCreateContext::First,
+        )
+        .unwrap();
+        step.model = "gpt-5.6-luna-fast".to_string();
+        step.value["model"] = json!(step.model);
+        step.value["metadata"] = json!({"tier":"flex"});
+        let mut candidate = candidate(&step, "provider-selected");
+        candidate.mapped_model = "gpt-5.5".to_string();
+        candidate.enable_model_directives = true;
+        candidate.headers.insert(
+            "x-codex-routing-hint".into(),
+            "model=stale;tier=flex".into(),
+        );
+        let headers = http::HeaderMap::new();
+        assert_eq!(
+            super::super::routing_hint::for_step(&candidate, &step, &headers)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("model=gpt-5.5;tier=priority")
+        );
+
+        candidate.body_rules = Some(Arc::new(json!([
+            {"action":"set", "path":"service_tier", "value":"flex", "condition":{"path":"metadata.tier", "op":"eq", "value":"flex"}}
+        ])));
+        assert_eq!(
+            super::super::routing_hint::for_step(&candidate, &step, &headers)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("model=gpt-5.5;tier=flex")
+        );
+        assert_eq!(step.value["model"], "gpt-5.6-luna-fast");
+        assert!(step.value.get("service_tier").is_none());
     }
 
     fn candidate(step: &ResponseCreateStep, provider_id: &str) -> CodexWsCandidate {

@@ -157,6 +157,10 @@ pub(crate) fn should_skip_response_header(name: &str) -> bool {
             | "upgrade"
             | "x-aether-control-executed"
             | "x-aether-control-action"
+            // Codex internal safety-buffering hints are provider response
+            // metadata and must not be exposed to downstream clients.
+            | "x-codex-safety-buffering-enabled"
+            | "x-codex-safety-buffering-faster-model"
     )
 }
 
@@ -469,7 +473,8 @@ mod tests {
     use super::{
         decoded_request_body_bytes, normalize_request_body_headers_and_bytes,
         request_origin_from_headers, request_origin_from_headers_and_remote_addr,
-        tls_fingerprint_from_headers, RequestBodyNormalizationError, RequestOrigin,
+        should_skip_response_header, tls_fingerprint_from_headers, RequestBodyNormalizationError,
+        RequestOrigin,
     };
     use flate2::{
         write::{DeflateEncoder, GzEncoder, ZlibEncoder},
@@ -502,6 +507,17 @@ mod tests {
                 user_agent: Some("Claude-Code/1.0".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn response_filter_hides_codex_safety_buffering_headers_case_insensitively() {
+        assert!(should_skip_response_header(
+            "x-codex-safety-buffering-enabled"
+        ));
+        assert!(should_skip_response_header(
+            "X-Codex-Safety-Buffering-Faster-Model"
+        ));
+        assert!(!should_skip_response_header("x-codex-turn-state"));
     }
 
     #[test]

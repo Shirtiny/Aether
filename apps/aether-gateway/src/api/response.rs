@@ -364,7 +364,17 @@ mod tests {
     fn sse_responses_disable_proxy_buffering() {
         let response = build_client_response_from_parts(
             200,
-            &BTreeMap::from([("content-type".to_string(), "text/event-stream".to_string())]),
+            &BTreeMap::from([
+                ("content-type".to_string(), "text/event-stream".to_string()),
+                (
+                    "x-codex-safety-buffering-enabled".to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    "x-codex-safety-buffering-faster-model".to_string(),
+                    "gpt-5.6-luna".to_string(),
+                ),
+            ]),
             Body::from("data: hello\n\n"),
             "trace-sse-buffering-1",
             None,
@@ -385,5 +395,11 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("no")
         );
+        assert!(!response
+            .headers()
+            .contains_key("x-codex-safety-buffering-enabled"));
+        assert!(!response
+            .headers()
+            .contains_key("x-codex-safety-buffering-faster-model"));
     }
 }

@@ -4,6 +4,7 @@ mod cpu_budget;
 pub(crate) mod hot_state;
 mod ingress;
 mod protocol;
+mod routing_hint;
 mod runtime;
 mod session;
 mod standard_transport;

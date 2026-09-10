@@ -639,6 +639,7 @@ pub(crate) trait CodexWsRuntimePort: Send + Sync {
     async fn connect(
         &self,
         candidate: CodexWsCandidate,
+        first_step: &ResponseCreateStep,
     ) -> Result<ConnectedCandidate, StepPreparationError>;
 
     async fn activate_reused_candidate(
@@ -1082,20 +1083,7 @@ impl GatewayCodexWsRuntime {
             .into_client_request()
             .map_err(|_| PeerError("failed to build official Codex WS request".into()))?;
 
-        for name in [
-            "authorization",
-            "chatgpt-account-id",
-            "user-agent",
-            "originator",
-            "version",
-            "x-codex-installation-id",
-            "x-oai-attestation",
-            "x-openai-internal-codex-responses-lite",
-        ] {
-            if let Some(value) = case_insensitive_btree_value(&candidate.headers, name) {
-                insert_header(request.headers_mut(), name, value)?;
-            }
-        }
+        copy_official_candidate_headers(request.headers_mut(), &candidate.headers)?;
         if !request.headers().contains_key(http::header::AUTHORIZATION) {
             return Err(PeerError(
                 "selected Codex account has no materialized OAuth authorization".into(),
@@ -1744,6 +1732,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
     async fn connect(
         &self,
         mut candidate: CodexWsCandidate,
+        first_step: &ResponseCreateStep,
     ) -> Result<ConnectedCandidate, StepPreparationError> {
         let mut cancellation_guard = ConnectAttemptCancellationGuard::new(&mut candidate);
         if let Err(error) = self.validate_candidate_current_state(&candidate).await {
@@ -1761,6 +1750,34 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         let official_request = if candidate.adapter
             == crate::orchestration::ResponsesWebSocketAdapter::Codex
         {
+            let hint = match super::routing_hint::for_step(
+                &candidate,
+                first_step,
+                &self.request_headers,
+            )
+            .await
+            {
+                Ok(hint) => hint,
+                Err(error) => {
+                    self.finish_aborted_candidate(
+                        &candidate,
+                        aether_data_contracts::repository::candidates::RequestCandidateStatus::Failed,
+                        "codex_ws_request_materialization_failed",
+                        error.reason,
+                        false,
+                    ).await;
+                    cancellation_guard.disarm();
+                    return Err(error);
+                }
+            };
+            candidate
+                .headers
+                .retain(|name, _| !name.eq_ignore_ascii_case(crate::codex_routing_hint::HEADER));
+            if let Some(hint) = hint {
+                candidate
+                    .headers
+                    .insert(crate::codex_routing_hint::HEADER.to_string(), hint);
+            }
             match self.official_request(&candidate) {
                 Ok(request) => Some(request),
                 Err(error) => {
@@ -3199,26 +3216,39 @@ fn materialize_codex_ws_step_body(
             "codex_ws_background_response_unsupported",
         ));
     }
-    let mut body = crate::ai_serving::build_codex_ws_local_openai_responses_request_body(
-        body,
-        mapped_model,
-        true,
-        force_body_stream_field,
-        provider_type,
-        "openai:responses",
-        body_rules,
-        None,
-        request_headers,
-        enable_model_directives,
-    )
-    .ok_or(StepPreparationError::retain(
-        "provider_request_body_materialization_failed",
-    ))?;
-    if let Some(mapping) = model_directive_mapping {
-        crate::ai_serving::apply_model_directive_mapping_patch(&mut body, mapping);
-    }
-    aether_routing_core::apply_json_patch_operations(&mut body, provider_body_patch)
-        .map_err(|_| StepPreparationError::retain("provider_request_body_patch_failed"))?;
+    let mut body = if adapter == crate::orchestration::ResponsesWebSocketAdapter::Codex {
+        super::routing_hint::normalize_body(
+            body,
+            mapped_model,
+            body_rules,
+            request_headers,
+            enable_model_directives,
+            model_directive_mapping,
+            provider_body_patch,
+        )?
+    } else {
+        let mut body = crate::ai_serving::build_codex_ws_local_openai_responses_request_body(
+            body,
+            mapped_model,
+            true,
+            force_body_stream_field,
+            provider_type,
+            "openai:responses",
+            body_rules,
+            None,
+            request_headers,
+            enable_model_directives,
+        )
+        .ok_or(StepPreparationError::retain(
+            "provider_request_body_materialization_failed",
+        ))?;
+        if let Some(mapping) = model_directive_mapping {
+            crate::ai_serving::apply_model_directive_mapping_patch(&mut body, mapping);
+        }
+        aether_routing_core::apply_json_patch_operations(&mut body, provider_body_patch)
+            .map_err(|_| StepPreparationError::retain("provider_request_body_patch_failed"))?;
+        body
+    };
     if let Some(profile) = account_profile {
         apply_codex_concrete_account_profile_to_body_with_policy(
             &mut body,
@@ -3311,6 +3341,29 @@ fn normalize_concurrent_limit(limit: Option<i32>) -> Option<usize> {
     limit
         .filter(|limit| *limit > 0)
         .and_then(|limit| usize::try_from(limit).ok())
+}
+
+fn copy_official_candidate_headers(
+    headers: &mut HeaderMap,
+    candidate_headers: &BTreeMap<String, String>,
+) -> Result<(), PeerError> {
+    for name in [
+        "authorization",
+        "chatgpt-account-id",
+        "user-agent",
+        "originator",
+        "version",
+        "x-codex-installation-id",
+        "x-oai-attestation",
+        "x-codex-routing-hint",
+        "x-openai-internal-codex-residency",
+        "x-openai-internal-codex-responses-lite",
+    ] {
+        if let Some(value) = case_insensitive_btree_value(candidate_headers, name) {
+            insert_header(headers, name, value)?;
+        }
+    }
+    Ok(())
 }
 
 fn upstream_binding_identity(
@@ -4553,6 +4606,81 @@ mod tests {
             Some("Bearer selected")
         );
         assert!(case_insensitive_btree_value(&candidate_headers, "x-aether-nope").is_none());
+    }
+
+    #[test]
+    fn routing_hint_and_residency_reach_official_ws_handshake() {
+        let candidate_headers = BTreeMap::from([
+            ("Authorization".into(), "Bearer selected".into()),
+            (
+                "X-Codex-Routing-Hint".into(),
+                "model=gpt-5.5;tier=priority".into(),
+            ),
+            ("X-OpenAI-Internal-Codex-Residency".into(), "us".into()),
+            ("x-aether-ws-control".into(), "route-v1".into()),
+        ]);
+        let mut request = OFFICIAL_CODEX_RESPONSES_WS_URL
+            .into_client_request()
+            .unwrap();
+        copy_official_candidate_headers(request.headers_mut(), &candidate_headers).unwrap();
+        assert_eq!(
+            request.headers()["x-codex-routing-hint"],
+            "model=gpt-5.5;tier=priority"
+        );
+        assert_eq!(request.headers()["x-openai-internal-codex-residency"], "us");
+        assert!(!request.headers().contains_key("x-aether-ws-control"));
+        let mut empty = HeaderMap::new();
+        copy_official_candidate_headers(&mut empty, &BTreeMap::new()).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn routing_hint_matches_materialized_ws_body_after_all_rules() {
+        let body = json!({"model":"gpt-5.6-luna-fast", "input":[], "metadata":{"tier":"flex"}});
+        let rules = json!([
+            {"action":"set", "path":"service_tier", "value":"flex", "condition":{"path":"metadata.tier", "op":"eq", "value":"flex"}}
+        ]);
+        let mapping = json!({"service_tier":"default"});
+        let patches: Vec<RoutingJsonPatchOperation> = serde_json::from_value(json!([
+            {"op":"replace", "path":"/model", "value":"gpt-5.6-sol"},
+            {"op":"replace", "path":"/service_tier", "value":"priority"}
+        ]))
+        .unwrap();
+        let headers = HeaderMap::new();
+        let hint_body = super::super::routing_hint::normalize_body(
+            body.clone(),
+            "gpt-5.5",
+            Some(&rules),
+            &headers,
+            true,
+            Some(&mapping),
+            &patches,
+        )
+        .unwrap();
+        let materialized = materialize_codex_ws_step_body(
+            body,
+            "gpt-5.5",
+            true,
+            Some(&rules),
+            &headers,
+            true,
+            Some(&mapping),
+            &patches,
+            None,
+            crate::orchestration::ResponsesWebSocketAdapter::Codex,
+            "codex",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::codex_routing_hint::from_body(&hint_body),
+            crate::codex_routing_hint::from_body(&materialized.json)
+        );
+        assert_eq!(
+            crate::codex_routing_hint::from_body(&hint_body).as_deref(),
+            Some("model=gpt-5.6-sol;tier=priority")
+        );
     }
 
     #[test]

@@ -235,6 +235,7 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
         auth_context: input.auth_context.clone(),
     });
     apply_provider_request_routing_policy_to_decision(input, &mut decision)?;
+    crate::codex_routing_hint::apply_to_decision(&transport.provider.provider_type, &mut decision);
     Ok(Some(decision))
 }
 

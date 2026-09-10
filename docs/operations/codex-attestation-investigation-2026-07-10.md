@@ -28,6 +28,39 @@
   目标范围。
   [provider gate](https://github.com/openai/codex/blob/1f0566d3f59298d1bb88820a0d35294f1eeb07ea/codex-rs/model-provider/src/provider.rs#L255-L260)
 
+### 什么叫“客户端没有证明能力”
+
+这里的“没有能力”不是账号没有 Plus/Pro 权限，而是**当前连接的宿主没有实现并声明
+`requestAttestation` 能力**。当前源码中可以确认以下情况：
+
+- Codex TUI 收到 `attestation/generate` 时明确返回“不支持”；
+- `codex exec` 也明确返回“不支持”；
+- app-server 客户端初始化时若没有设置
+  `capabilities.requestAttestation = true`，该连接不会被登记为证明宿主；
+- 即使连接声明了能力，如果当前线程没有对应的活动连接，app-server 也找不到可用
+  宿主，因而不生成有效头；
+- 宿主请求超时、取消、返回错误或返回格式非法时，得到的是失败状态封装，而不是
+  有效设备证明。
+
+因此，以下做法都不能制造真实 attestation：
+
+- 固定一个 `x-oai-attestation` 字符串；
+- 复制另一个账号、线程或设备的 token；
+- 只修改 `User-Agent`、`originator`、`installation_id`、Session/Thread/Turn；
+- 将 TUI/exec 伪装成 Desktop 后再发送该头。
+
+### PR 后续维护状态（2026-09-10 补充）
+
+PR #20619 已于 2026-05-08 合并。后续主线仍保留同一设计：证明由连接的宿主生成，
+`codex-rs` 只负责按线程请求并转发；没有把 DeviceCheck/平台证明算法移入开源
+`codex-rs`。2026-08-21 合并的 [PR #39993](https://github.com/openai/codex/pull/39993)
+继续处理 attestation token 的日志脱敏，说明该 token 仍被当作凭据处理，而不是普通
+客户端标识。
+
+当前结论：Aether 会话身份合成可以长期稳定维护每个池账号的客户端 Profile、
+Session/Thread/Turn 和窗口状态；但在没有同账号、真实且已声明能力的 Desktop 宿主时，
+应省略 `x-oai-attestation`，不能用网关合成一个“看起来一样”的值。
+
 公开源码没有服务端验签策略、强制启用日期或账户处罚逻辑。因此不能由此推断“没有
 该头就会封号”或“检测尚未启用”。
 

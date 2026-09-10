@@ -833,6 +833,36 @@ mod tests {
     }
 
     #[test]
+    fn codex_routing_hint_uses_final_provider_routing_patch() {
+        let mut input = sample_decision_input();
+        set_provider_request_rules(
+            &mut input,
+            json!([
+                {"type":"json_patch_body", "patch":[
+                    {"op":"replace", "path":"/model", "value":"gpt-5.5"},
+                    {"op":"add", "path":"/service_tier", "value":"flex"}
+                ]},
+                {"type":"patch_headers", "patch":[
+                    {"op":"set", "name":"x-codex-routing-hint", "value":"model=stale"}
+                ]}
+            ]),
+        );
+        let mut decision = sample_decision();
+        decision.provider_api_format = Some("openai:responses".into());
+        apply_provider_request_routing_policy_to_decision(&input, &mut decision).unwrap();
+        crate::codex_routing_hint::apply_to_decision("codex", &mut decision);
+        assert_eq!(
+            decision.provider_request_headers[crate::codex_routing_hint::HEADER],
+            "model=gpt-5.5;tier=flex"
+        );
+        assert_eq!(
+            decision.report_context.as_ref().unwrap()["provider_request_headers"]
+                [crate::codex_routing_hint::HEADER],
+            "model=gpt-5.5;tier=flex"
+        );
+    }
+
+    #[test]
     fn provider_request_routing_policy_rejects_body_patch_without_json_body() {
         let input = sample_decision_input();
         let mut decision = sample_decision();
