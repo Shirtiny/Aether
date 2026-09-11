@@ -180,6 +180,11 @@ pub(crate) struct CodexWsCandidate {
     pub(crate) headers: BTreeMap<String, String>,
     pub(crate) response_headers: BTreeMap<String, String>,
     pub(crate) account_profile: Option<Arc<CodexConcreteAccountProfile>>,
+    /// Effective user-agent of the handshake headers when the client-release
+    /// follow moved the account's frozen profile build forward. `None` means
+    /// the frozen profile user-agent stands. The step bodies need it so their
+    /// identity blob names the same build the handshake announced.
+    pub(crate) handshake_user_agent: Option<String>,
     /// Outbound runtime identity snapshot negotiated at selection when the
     /// pool's `codex_runtime_identity` switch is on. `None` keeps the inbound
     /// official identity on the wire unchanged. Never part of the binding
@@ -1663,6 +1668,15 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 } else {
                     None
                 };
+            // The handshake headers already carry the effective user-agent: the
+            // account profile pass pinned it and the client-release follow may
+            // have moved its version token forward. The step bodies copy it so
+            // their identity blob names the build the handshake announced.
+            let handshake_user_agent = (adapter
+                == crate::orchestration::ResponsesWebSocketAdapter::Codex)
+                .then(|| case_insensitive_btree_value(&headers, "user-agent"))
+                .flatten()
+                .map(str::to_owned);
             let body_rules = transport.endpoint.body_rules.clone().map(Arc::new);
             let force_body_stream_field =
                 crate::ai_serving::endpoint_config_forces_upstream_stream_policy(
@@ -1696,6 +1710,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 headers,
                 response_headers: BTreeMap::new(),
                 account_profile,
+                handshake_user_agent: handshake_user_agent.clone(),
                 runtime_identity,
                 report_kind,
                 binding_identity,
@@ -2210,6 +2225,11 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 let model_directive_mapping = candidate.model_directive_mapping.clone();
                 let request_headers = self.request_headers.clone();
                 let account_profile = candidate.account_profile.clone();
+                // Owned so the materialization closure stays `'static`; the
+                // candidate outlives this method but not the blocking task.
+                let handshake_user_agent =
+                    case_insensitive_btree_value(&candidate.headers, "user-agent")
+                        .map(str::to_owned);
                 let adapter = candidate.adapter;
                 let provider_type = candidate.provider_type.clone();
                 let force_body_stream_field = candidate.force_body_stream_field;
@@ -2228,6 +2248,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                         model_directive_mapping.as_deref(),
                         provider_body_patch.as_ref(),
                         account_profile.as_deref(),
+                        handshake_user_agent.as_deref(),
                         adapter,
                         &provider_type,
                         runtime_identity.as_ref(),
@@ -2251,6 +2272,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                     candidate.model_directive_mapping.as_deref(),
                     candidate.provider_body_patch.as_ref(),
                     candidate.account_profile.as_deref(),
+                    candidate.handshake_user_agent.as_deref(),
                     candidate.adapter,
                     &candidate.provider_type,
                     runtime_identity.as_ref(),
@@ -3191,6 +3213,7 @@ fn materialize_codex_ws_step_body(
     model_directive_mapping: Option<&serde_json::Value>,
     provider_body_patch: &[RoutingJsonPatchOperation],
     account_profile: Option<&CodexConcreteAccountProfile>,
+    handshake_user_agent: Option<&str>,
     adapter: crate::orchestration::ResponsesWebSocketAdapter,
     provider_type: &str,
     runtime_identity: Option<&CodexWsStepRuntimeIdentity>,
@@ -3289,23 +3312,24 @@ fn materialize_codex_ws_step_body(
     // profile normalization and the prompt_cache_key filler above are already
     // in their final shape. Handshake headers are composed by the runtime.
     if let Some(identity) = runtime_identity {
-        // The step body carries no headers; its blob must match the client
-        // the handshake user-agent names (the account profile's, else the
-        // client's own).
-        let user_agent = account_profile
-            .map(|profile| profile.user_agent.as_str())
-            .or_else(|| {
-                request_headers
-                    .get(http::header::USER_AGENT)
-                    .and_then(|value| value.to_str().ok())
-            });
+        // The step body carries no headers; its blob must match the client the
+        // handshake user-agent names, which is the account's frozen profile
+        // build with the version token the client-release follow moved
+        // forward. Fall back to the client's own user-agent only when the
+        // candidate somehow carries none.
+        let user_agent = handshake_user_agent.map(str::to_owned).or_else(|| {
+            request_headers
+                .get(http::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        });
         apply_outbound_codex_runtime_identity(
             &mut BTreeMap::new(),
             Some(&mut body),
             &identity.inbound,
             &identity.outbound,
             CodexRuntimeIdentitySurface::WsStepBody,
-            user_agent,
+            user_agent.as_deref(),
         );
     }
     // Model-visible host clock (`<timezone>` / `<current_date>`), after the
@@ -4104,6 +4128,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
             crate::orchestration::ResponsesWebSocketAdapter::Codex,
             "codex",
             None,
@@ -4138,6 +4163,7 @@ mod tests {
             false,
             None,
             &[],
+            None,
             None,
             crate::orchestration::ResponsesWebSocketAdapter::Codex,
             "codex",
@@ -4181,6 +4207,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
             crate::orchestration::ResponsesWebSocketAdapter::Standard,
             "openai",
             None,
@@ -4193,6 +4220,123 @@ mod tests {
         assert_eq!(materialized.json["store"], true);
         assert_eq!(materialized.json["previous_response_id"], "resp-1");
         assert_eq!(materialized.json["generate"], false);
+    }
+
+    fn step_body_with_client_metadata() -> serde_json::Value {
+        json!({
+            "type": "response.create",
+            "model": "gpt-5.6-terra",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "inspect the workspace"}]
+            }],
+            "client_metadata": {
+                "x-codex-installation-id": "inst",
+                "session_id": "in-session",
+                "thread_id": "in-thread",
+                "x-codex-window-id": "in-thread:0",
+                "turn_id": "in-turn",
+                "x-codex-turn-metadata": json!({
+                    "installation_id": "inst",
+                    "session_id": "in-session",
+                    "thread_id": "in-thread",
+                    "turn_id": "in-turn",
+                    "window_id": "in-thread:0",
+                    "request_kind": "turn",
+                    "sandbox": "seatbelt",
+                    "workspaces": ["/tmp/项目"]
+                }).to_string()
+            }
+        })
+    }
+
+    fn step_runtime_identity(body: &serde_json::Value) -> CodexWsStepRuntimeIdentity {
+        use crate::codex_runtime_identity::OutboundTurnSource;
+        CodexWsStepRuntimeIdentity {
+            inbound: InboundCodexRuntimeIdentity::from_request(Some(body), None),
+            outbound: OutboundCodexRuntimeIdentity {
+                session_id: "out-thread".to_string(),
+                thread_id: "out-thread".to_string(),
+                window_id: "out-thread:0".to_string(),
+                window_number: 0,
+                context_window_id: None,
+                turn_id: Some("out-turn".to_string()),
+                turn_source: OutboundTurnSource::Frozen,
+                inbound_root: "in-session".to_string(),
+                inbound_turn_key: Some("in-turn".to_string()),
+            },
+        }
+    }
+
+    #[test]
+    fn step_body_blob_follows_the_handshake_user_agent_over_the_client_header() {
+        // The handshake is what the upstream saw connect; the step body carries
+        // no headers of its own, so its blob must name the handshake's client.
+        // The client's own header says Linux, the moved handshake says Windows.
+        let client_headers = http::HeaderMap::from_iter([(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_static("codex_cli_rs/0.153.4 (Ubuntu 24.4.0; x86_64) unknown"),
+        )]);
+        let body = step_body_with_client_metadata();
+        let identity = step_runtime_identity(&body);
+        let materialized = materialize_codex_ws_step_body(
+            body,
+            "gpt-5.6-terra",
+            false,
+            None,
+            &client_headers,
+            false,
+            None,
+            &[],
+            None,
+            Some("codex_cli_rs/0.154.0 (Windows 10.0.26100; x86_64) WindowsTerminal"),
+            crate::orchestration::ResponsesWebSocketAdapter::Codex,
+            "codex",
+            Some(&identity),
+            None,
+        )
+        .expect("body should materialize");
+
+        let raw = materialized.json["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("turn metadata blob");
+        let blob: serde_json::Value = serde_json::from_str(raw).expect("blob is JSON");
+        assert_eq!(blob["sandbox"], "windows_elevated");
+        assert_eq!(blob["thread_id"], "out-thread");
+    }
+
+    #[test]
+    fn step_body_blob_falls_back_to_the_client_header_without_a_handshake_user_agent() {
+        let client_headers = http::HeaderMap::from_iter([(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_static("codex_cli_rs/0.153.4 (Ubuntu 24.4.0; x86_64) unknown"),
+        )]);
+        let body = step_body_with_client_metadata();
+        let identity = step_runtime_identity(&body);
+        let materialized = materialize_codex_ws_step_body(
+            body,
+            "gpt-5.6-terra",
+            false,
+            None,
+            &client_headers,
+            false,
+            None,
+            &[],
+            None,
+            None,
+            crate::orchestration::ResponsesWebSocketAdapter::Codex,
+            "codex",
+            Some(&identity),
+            None,
+        )
+        .expect("body should materialize");
+
+        let raw = materialized.json["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("turn metadata blob");
+        let blob: serde_json::Value = serde_json::from_str(raw).expect("blob is JSON");
+        assert_eq!(blob["sandbox"], "seccomp");
     }
 
     fn materialize_with_env_context(
@@ -4208,6 +4352,7 @@ mod tests {
             false,
             None,
             &[],
+            None,
             None,
             crate::orchestration::ResponsesWebSocketAdapter::Codex,
             "codex",
@@ -4666,6 +4811,7 @@ mod tests {
             true,
             Some(&mapping),
             &patches,
+            None,
             None,
             crate::orchestration::ResponsesWebSocketAdapter::Codex,
             "codex",

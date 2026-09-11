@@ -11,6 +11,10 @@ use http::HeaderMap;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::codex_client_release::{
+    observe_codex_client_release, resolve_codex_client_user_agent, unix_now_secs,
+    ClientReleaseStore,
+};
 use crate::codex_environment_context::{
     apply_codex_environment_context, environment_context_rewrite_enabled,
     log_environment_context_report, process_environment_timezone, EnvironmentContextRewriteInput,
@@ -109,6 +113,103 @@ pub(crate) fn apply_codex_pool_stable_client_headers(
         &header_profile.user_agent,
         &header_profile.originator,
     );
+}
+
+/// Client-release follow for one selected pool account, for the surfaces that
+/// only carry headers (a Responses WebSocket handshake, whose step bodies get
+/// their client identity from the frozen headers the runtime composes).
+/// Returns the effective user-agent when it moved off the frozen one.
+pub(crate) async fn apply_codex_pool_client_release_headers(
+    runtime: &RuntimeState,
+    transport: &GatewayProviderTransportSnapshot,
+    provider_request_headers: &mut BTreeMap<String, String>,
+    original_headers: &HeaderMap,
+) -> Option<String> {
+    let now_unix_secs = unix_now_secs();
+    apply_codex_pool_client_release(
+        runtime,
+        transport,
+        provider_request_headers,
+        original_headers,
+        now_unix_secs,
+    )
+    .await
+}
+
+/// Client-release follow for one selected pool account: records the stable
+/// Codex version the inbound client is running, then moves this account's
+/// frozen `user-agent` and `version` header up to the newest build that has
+/// been out for at least the account's per-account lag. Best-effort: any
+/// registry failure leaves the frozen user-agent in place.
+///
+/// The originator is never touched: it comes from the profile, not from the
+/// build, and the profile pass wrote it moments earlier.
+async fn apply_codex_pool_client_release(
+    runtime: &RuntimeState,
+    transport: &GatewayProviderTransportSnapshot,
+    provider_request_headers: &mut BTreeMap<String, String>,
+    original_headers: &HeaderMap,
+    now_unix_secs: u64,
+) -> Option<String> {
+    if !transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("codex")
+    {
+        return None;
+    }
+    let store = ClientReleaseStore::new(runtime, transport.provider.id.as_str());
+    observe_codex_client_release(
+        &store,
+        original_headers
+            .get(http::header::USER_AGENT)
+            .and_then(|value| value.to_str().ok()),
+        now_unix_secs,
+    )
+    .await;
+    let Some((_, frozen_user_agent)) = header_entry(provider_request_headers, "user-agent") else {
+        return None;
+    };
+    let frozen_user_agent = frozen_user_agent.to_string();
+    let selection_key = codex_pool_client_profile_selection_key(transport);
+    let selection_fp = crate::codex_runtime_identity::codex_selection_fingerprint(&selection_key);
+    let effective_user_agent =
+        resolve_codex_client_user_agent(&store, &frozen_user_agent, &selection_fp, now_unix_secs)
+            .await;
+    if effective_user_agent == frozen_user_agent {
+        return None;
+    }
+    let originator = header_entry(provider_request_headers, "originator")
+        .map(|(_, value)| value.to_string())
+        .unwrap_or_default();
+    apply_codex_client_identity_headers(
+        provider_request_headers,
+        &effective_user_agent,
+        &originator,
+    );
+    log_codex_client_release_follow(&frozen_user_agent, &effective_user_agent);
+    Some(effective_user_agent)
+}
+
+fn log_codex_client_release_follow(frozen_user_agent: &str, effective_user_agent: &str) {
+    tracing::debug!(
+        target: "aether_gateway::codex_client_release",
+        frozen_user_agent,
+        effective_user_agent,
+        "codex pool client release follow"
+    );
+}
+
+/// Case-insensitive lookup into the outbound header map, matching the
+/// profile module's own convention.
+fn header_entry<'a>(
+    headers: &'a BTreeMap<String, String>,
+    name: &str,
+) -> Option<(&'a String, &'a String)> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
 }
 
 pub(crate) fn apply_codex_pool_search_account_profile(
@@ -455,6 +556,23 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
     surface: CodexRuntimeIdentitySurface,
 ) -> Option<OutboundCodexRuntimeIdentity> {
     let scope = resolve_codex_pool_runtime_identity_scope(transport);
+    let now = SystemTime::now();
+    let now_unix_secs = unix_now_secs();
+    // Client-release follow: the frozen user-agent names one build forever, so
+    // the pool drifts behind every codex-rs release. Observe what real clients
+    // are running (inbound, before any Aether rewrite) and let this account's
+    // frozen user-agent move up to a build that has been out long enough for
+    // it. Runs whether or not the runtime-identity switch is on: it only ever
+    // rewrites the version tokens of the user-agent plus the `version` header,
+    // and both already come from the pool profile.
+    let _ = apply_codex_pool_client_release(
+        runtime,
+        transport,
+        provider_request_headers,
+        original_headers,
+        now_unix_secs,
+    )
+    .await;
     let mut inbound =
         InboundCodexRuntimeIdentity::from_request(original_body, Some(original_headers));
     if scope.is_some() && surface == CodexRuntimeIdentitySurface::HttpResponses {
@@ -471,7 +589,6 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
         };
         inbound.synthesize_missing_root(content, original_headers);
     }
-    let now = SystemTime::now();
     let outbound = if let Some(scope) = scope.as_ref() {
         let store = CodexRuntimeIdentityStore::new(runtime);
         match resolve_outbound_codex_runtime_identity(&store, scope, &inbound, None, now).await {

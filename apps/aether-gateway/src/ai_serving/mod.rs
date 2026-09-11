@@ -21,7 +21,8 @@ pub(crate) use self::finalize::internal::{
     SyncToStreamBridgeOutcome,
 };
 pub(crate) use self::planner::{
-    apply_codex_official_ws_handshake_headers, apply_codex_pool_concrete_account_profile,
+    apply_codex_official_ws_handshake_headers, apply_codex_pool_client_release_headers,
+    apply_codex_pool_concrete_account_profile,
     apply_codex_pool_concrete_account_profile_for_api_format, apply_codex_pool_runtime_identity,
     apply_codex_pool_stable_client_headers, apply_local_runtime_candidate_terminal_reason,
     build_codex_ws_local_openai_responses_request_body,

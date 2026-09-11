@@ -334,6 +334,14 @@ pub(crate) fn codex_runtime_identity_rewrite_enabled(
 // Scope: fixed once the pool account is selected
 // ---------------------------------------------------------------------------
 
+/// Selection fingerprint of one pool account's selection key:
+/// `hex(SHA256("aether:codex:rid:sel:v1" || selection_key)[0..16])`. Shared by
+/// the runtime-identity scope and by surfaces that need a stable per-account
+/// value without building a scope (the client-release adoption lag).
+pub(crate) fn codex_selection_fingerprint(selection_key: &str) -> String {
+    hex_lower(&sha256(&[SELECTION_FP_DOMAIN, selection_key.as_bytes()])[..16])
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CodexRuntimeIdentityScope {
     pub(crate) provider_id: String,
@@ -350,8 +358,7 @@ impl CodexRuntimeIdentityScope {
         selection_key: &str,
         config: CodexRuntimeIdentityConfig,
     ) -> Self {
-        let selection_fp =
-            hex_lower(&sha256(&[SELECTION_FP_DOMAIN, selection_key.as_bytes()])[..16]);
+        let selection_fp = codex_selection_fingerprint(selection_key);
         let account_jitter_secs =
             u64_prefix(&sha256(&[JITTER_DOMAIN, selection_key.as_bytes()])) % DAY_WINDOW_SECS;
         Self {
@@ -2372,14 +2379,14 @@ impl OutboundClient {
 /// `none` when its policy needs no platform sandbox (`danger-full-access`) and
 /// `external` with an external sandbox, on every OS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutboundClientOs {
+pub(crate) enum OutboundClientOs {
     MacOs,
     Windows,
     Other,
 }
 
 impl OutboundClientOs {
-    fn from_user_agent(user_agent: Option<&str>) -> Self {
+    pub(crate) fn from_user_agent(user_agent: Option<&str>) -> Self {
         match user_agent {
             Some(agent) if agent.contains("Mac OS") => Self::MacOs,
             Some(agent) if agent.contains("Windows") => Self::Windows,

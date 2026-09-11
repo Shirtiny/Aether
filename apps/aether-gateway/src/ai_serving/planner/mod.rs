@@ -69,7 +69,8 @@ pub(crate) use self::specialized::{
     set_local_openai_image_execution_exhausted_diagnostic,
 };
 pub(crate) use self::standard::{
-    apply_codex_official_ws_handshake_headers, apply_codex_pool_concrete_account_profile,
+    apply_codex_official_ws_handshake_headers, apply_codex_pool_client_release_headers,
+    apply_codex_pool_concrete_account_profile,
     apply_codex_pool_concrete_account_profile_for_api_format, apply_codex_pool_runtime_identity,
     apply_codex_pool_stable_client_headers,
     build_compact_local_openai_responses_stream_plan_and_reports_for_kind_with_required_capabilities,

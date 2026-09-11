@@ -530,7 +530,11 @@ Be explicit about the boundary:
 - `sub2api` as `client_ip` means Aether did not receive the request directly
   from the end user.
 - Codex `originator` and `x-codex-turn-metadata.workspaces` mean the session
-  was produced by a local Codex client, not by the Aether web UI.
+  was produced by a local Codex client, not by the Aether web UI. Since `.127`
+  the `workspaces` values stored in `request_headers` are still the customer's
+  real paths (Aether records what it accepted); the outbound blob replaces them
+  with the pool account's synthetic developer, so outbound observation needs a
+  capture, not this table.
 
 ## 9. OpenAI Responses Non-Stream Regression Note
 

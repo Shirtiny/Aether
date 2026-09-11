@@ -390,7 +390,7 @@ key 构造函数放在新模块 `codex_runtime_identity.rs` 内（与 sticky 的
 | `previous_response_id` | HTTP Codex 继续剥；WS 经 fence 后原样转发 |
 | 短头 `session_id` / `conversation_id` | 合成开启且有入站 root：一律删除，不论来源（7.4；v0.7.105） |
 
-`turn_started_at_unix_ms`、`workspaces`、`tool_namespaces_info`、`compaction`、`request_kind`：原样保留（memory 的 blob 形状见 7.2）。`sandbox` 自 v0.7.109 起按出站 UA 的操作系统投影；`sandbox_mode`、三个 review 标志在 turn / compaction / prewarm 上缺失时补默认值，`turn_started_at_unix_ms` 在 turn / compaction 上缺失时补出站 turn 的 UUIDv7 时间戳（§18.17）。Aether 今天不读 `request_kind`，需新增解析（11 节）。~~客户端自己发的 `turn_started_at_unix_ms` 不重写去「对齐」UUIDv7 时间戳。~~ .123 候选起改为一律由出站 turn UUIDv7 推出，客户端的值丢弃（§18.19）。
+`turn_started_at_unix_ms`、`tool_namespaces_info`、`compaction`、`request_kind`：原样保留（memory 的 blob 形状见 7.2）。**`workspaces` 自 `.127` 起由 profile pass 合成**（§18.20），身份功能只看到已经合成好的键、按名单原样搬。`sandbox` 自 v0.7.109 起按出站 UA 的操作系统投影；`sandbox_mode`、三个 review 标志在 turn / compaction / prewarm 上缺失时补默认值，`turn_started_at_unix_ms` 在 turn / compaction 上缺失时补出站 turn 的 UUIDv7 时间戳（§18.17）。Aether 今天不读 `request_kind`，需新增解析（11 节）。~~客户端自己发的 `turn_started_at_unix_ms` 不重写去「对齐」UUIDv7 时间戳。~~ .123 候选起改为一律由出站 turn UUIDv7 推出，客户端的值丢弃（§18.19）。
 
 ### 9.1 HTTP / WS `x-client-request-id`
 
@@ -412,7 +412,7 @@ HTTP planner 今天对 dash `session-id` / `thread-id` / `x-codex-window-id` 没
 
 | 表面 | 改写 | 归一化 | 删除（不上报） | 原样转发 |
 |---|---|---|---|---|
-| blob `x-codex-turn-metadata` | installation_id（profile）、session_id、thread_id、turn_id、window_id、window_number、context_window_id | agent_name → `/root`；thread_source → `user`（memory 保持）；root_turn_id → 出站 turn；sandbox → 出站 UA 操作系统的平台沙箱（`none` / `external` 保持，Windows 保留 `windows_sandbox`；v0.7.109） | forked_from_thread_id、forked_from_ordinal_exclusive、parent_thread_id、parent_turn_id、subagent_kind | request_kind、compaction、turn_trigger、sandbox_mode、auto_review_enabled、node_repl_auto_review_required、node_repl_disabled、workspaces、workspace_kind、tool_namespaces_info、turn_started_at_unix_ms、history_ingest_requested（turn / compaction / prewarm 上 sandbox_mode 与三个标志缺失时补默认值，turn / compaction 上 turn_started_at_unix_ms 缺失时补出站 turn 的 v7 时间戳；§18.17） |
+| blob `x-codex-turn-metadata` | installation_id（profile）、**workspaces（profile，§18.20）**、session_id、thread_id、turn_id、window_id、window_number、context_window_id | agent_name → `/root`；thread_source → `user`（memory 保持）；root_turn_id → 出站 turn；sandbox → 出站 UA 操作系统的平台沙箱（`none` / `external` 保持，Windows 保留 `windows_sandbox`；v0.7.109） | forked_from_thread_id、forked_from_ordinal_exclusive、parent_thread_id、parent_turn_id、subagent_kind | request_kind、compaction、turn_trigger、sandbox_mode、auto_review_enabled、node_repl_auto_review_required、node_repl_disabled、tool_namespaces_info、turn_started_at_unix_ms、history_ingest_requested（turn / compaction / prewarm 上 sandbox_mode 与三个标志缺失时补默认值，turn / compaction 上 turn_started_at_unix_ms 缺失时补出站 turn 的 v7 时间戳；§18.17） |
 | 扁平 `client_metadata` | x-codex-installation-id（profile）、session_id、thread_id、turn_id、root_turn_id、x-codex-window-id、x-codex-turn-metadata、x-codex-turn-state（按 7.6） | — | x-codex-parent-thread-id、x-openai-subagent、parent_thread_id、forked_from_thread_id、parent_turn_id、subagent_kind、thread_source | ws_request_header_x_openai_internal_codex_responses_lite、x-codex-ws-stream-request-start-ms、guardian_ticket、guardian_ticket_requested；Aether 自身的 `sub2api_*` / `aether.*` 控制键 |
 | HTTP 请求头（仅 `x-codex-` / `x-openai-` / `x-oai-` / `x-responsesapi-` 前缀） | x-codex-window-id、x-codex-turn-metadata、x-codex-turn-state（按 7.6） | — | x-codex-parent-thread-id、x-openai-subagent、x-oai-attestation | x-codex-installation-id、x-codex-beta-features、x-codex-routing-hint、x-openai-internal-codex-responses-lite、x-openai-memgen-request、x-responsesapi-include-timing-metrics |
 
@@ -1018,4 +1018,43 @@ cd frontend && npm run type-check
 
 **测试**：`codex_runtime_identity` 40 通过（`request_identity_blob_matches_current_client_shape_and_outbound_os` 改为断言客户端 stamp 不被复制、冻结 turn 无 v7 时不带 stamp、入站带 stamp 时仍取出站 turn 值）；`codex_environment_context` 29 通过 1 ignored（新增 `prefix_cache_item_ids_follow_the_outbound_thread`、`prefix_cache_rewrite_leaves_items_it_cannot_derive_alone`）；`handlers::admin::provider::write::keys` / `oauth::provisioning` 9 通过（新增 `codex_oauth_key_defaults_to_single_concurrency_only_when_unspecified`，`oauth_reauthorization_defaults_missing_concurrency_only` 加 codex 用例）；`codex_ws::runtime` 73 通过。线上复核见运维手册 §3.5 Q12b、§3.8。
 
-**交付状态**：已在 `custom` 工作区改好并自测。**未提交、未 tag、未发版、未上线**——tag / CI / 上线时机由操作员另行决定。
+**交付状态**：已提交（`ab5c0df9f`，tag `backend-v0.7.123`），随 `backend-v0.7.126` 于 2026-09-11 上线。
+
+### 18.20 `.127` 候选：`workspaces` 按账号合成，邮箱取 Codex 授权文件
+
+**起因**：操作员在线上入站样本里看到 `x-codex-turn-metadata.workspaces`：键是 downstream 用户的真实仓库根路径（`/Users/<开发者>/Projects/<仓库>`），值是 `associated_remote_urls.origin` 的真私有仓库地址（`git@github.com:<owner>/<私有仓库>.git`）、`latest_git_commit_hash` 的真实 commit 与 `has_changes`。头与 body `client_metadata` 两处都带，官方账号上「一个账号永远同一个开发者、同一批私有仓库」是极强的分发特征。§18.19 的裁定 4（`workspaces` 不改）就此撤回：内容相关的用途只是「让上游看到工作目录」，不需要看到真人路径与私有仓库。
+
+**修法**（`codex_profile.rs`，profile pass；身份功能、freeze、window、UA / originator / version 不动）：
+
+1. **`CodexConcreteAccountProfile` 增加 `workspace_identity`**：`user_name`（`/Users/<u>` / `C:\Users\<u>` 里的本地账号名）与 `remote_owner`（每个合成 `origin` 的 GitHub owner），落 `codex_client_profile.workspace_identity.{user_name,remote_owner,source}`。**`user_name` / `remote_owner` 由该 key 的 Codex OAuth 授权文件里的邮箱派生**（`auth_config.email`，导入别名 `oauth_email`）：本地部分去 `+tag`、转小写，`user_name` 只留 `[a-z0-9]` 截 20，`remote_owner` 非字母数字折成 `-`、去首尾、截 39（GitHub 上限）。邮箱无本地字母（纯数字邮箱、非 ASCII）时退回按选择键哈希挑的名字，`source=fallback`；**落库后不再变**——唯一允许的迁移是 fallback → 邮箱名，出现在授权文件后补上邮箱（导入未富化、之后重新登录）时，`codex_profile_workspace_identity_from_object` 按 `source` 判定。
+2. **合成仓库身份按账号冻结**（种子 = `installation_id`，域 `aether:codex:workspace:v1`）：OS 布局由 profile 的 UA 决定（`OutboundClientOs`：Mac `/Users/<u>/…`、Windows `C:\Users\<u>\…`、其它 `/home/<u>/…`），每账号 3–8 个仓库槽、仓库名从内置常见名列表按哈希取、仓库根下的父目录固定、`origin` 在 SSH（`git@github.com:<owner>/<repo>.git`）与 HTTPS 间按哈希二选一。**入站每个仓库根映射到同一个槽**（哈希(种子, 入站根路径)），所以一条 downstream thread 跨 turn 看到的是同一个合成仓库。`latest_git_commit_hash` 是 40 位十六进制，按「仓库 + epoch」哈希推出，epoch 每 1–3 天（每账号固定周期与相位）翻一次：不提交的开发者和每请求都提交的开发者一样异常。字段 presence 镜像入站条目（codex-rs 只序列化收到的字段），键序按 `TurnMetadataWorkspace` 字段顺序、映射按 BTreeMap 排序；入站没有 `workspaces`（prewarm、老客户端）不新造，空对象 / 非对象原样放过——没有可泄漏的内容。
+3. **改写点合并进 profile 的 blob 改写**：`rewrite_turn_metadata_installation_id_string` / `_value` 扩成 `rewrite_turn_metadata_for_profile_string` / `_value`（`installation_id` + `workspaces` 一起），HTTP 头、body `client_metadata`、Search 头、WS 握手头、WS step body 五个表面自动同时生效。头的 blob 与 body 的 blob 用同一次时钟读数（`apply_*_at(..., now_unix_secs)`），两边字节相同。`codex_concrete_profile_hash` 域升 v3 并把 workspace identity 计入。
+
+**不做**：不改 `tool_namespaces_info`（无用户信息）；不给合成请求补 `workspaces`；不改 `<environment_context>` 的 `<cwd>`（§18.19 裁定 3，操作员锁定）；不按入站 `has_changes` 推提交历史。
+
+**残留**：`<environment_context>` 的 `<cwd>` / `<filesystem>` 仍带 downstream 真实路径（操作员明确不改）；`tool_namespaces_info` 原样转发；仓库名列表全账号共享（槽选择、父目录、owner、commit 都是每账号的）。
+
+**测试**：`codex_profile` 新增 `workspace_identity_derives_home_and_owner_from_auth_email`、`fallback_workspace_identity_is_deterministic_per_selection`、`materialization_persists_workspace_identity_and_upgrades_fallback_once`、`rewrites_workspaces_with_the_account_developer_on_every_os_layout`（Mac / Windows / Linux 三种 UA 下对线上抓到的原始 blob 断言无泄漏且字段序正确）、`synthetic_workspace_layout_is_per_account_and_bounded`、`synthetic_commit_hash_is_stable_within_a_period_and_moves_after_it`、`workspaces_rewrite_mirrors_inbound_field_presence_and_skips_absent_maps`、`request_pass_rewrites_workspaces_in_header_and_body_blobs_consistently`（五表面一致）。
+
+**交付状态**：已提交到 `custom` 并打 tag `backend-v0.7.127`（CI 自动构建镜像）。**未上线**——`update.sh` 上线时机由操作员另行决定。
+
+### 18.21 `.127` 候选：冻结 UA 跟随客户端发版（按账号错峰），WS step body 与握手同一身份
+
+**起因**（操作员裁定 1：「冻结 UA 与 body 版本漂移 做」）：池里每个账号的 `user-agent` 是 profile pass 冻结的，永远同一个 build；但出站请求体里的元数据是入站客户端按**它自己**的 build 生成的（§18.19 / §18.20 只改了身份与 `workspaces`，没有动版本语义）。`codex-rs` 稳定版每 2–4 天一个 minor、其间若干 patch，于是两件相反的事同时发生：
+
+1. 池账号长期停在导入时挑中的那个 build，越落越远，看起来像「几个人几个月都没更新过 Codex」——一个真实用户群不会长这样。
+2. 一旦哪天手工改池 profile 换 build，同一账号的 header 与 body 会来自两个不同 build（body 的形状、`instructions`、字段 presence 都按旧 build）。
+
+**修法**（新模块 `codex_client_release.rs`；只动版本 token，身份其余部分全冻结）：
+
+1. **按 originator family 观测入站真实 build**：入站请求的原始 `user-agent`（Aether 改写之前）里，产品段在第一个 `(` 之前且含 `codex` 的才计入，family 取产品名小写（`codex-tui`、`codex_cli_rs`、`Codex Desktop`、`codex_vscode`…），版本取产品段第一个 `/` 之后的 token。预发布（`-alpha.N` / `-beta`）不入册；`curl` / `Go-http-client` 这类「产品/版本」形状但版本其实是协议版本的一律无视——这条闸门对 family 与 version 两个入口都生效，因为调用方分别问这两个问题（`Go-http-client/2.0` 若只过 version 入口会被解成 `2.0.0` 混进注册表）。观测有进程内节流（同 family+version 每 300s 最多落一次 Redis）。
+2. **每 family 一张 Redis 有序集**：键 `aether:codex:client_release:v1:{provider_id}:{family}`，成员 `{version}:{first_seen}:{last_seen}`，score 是 `last_seen` 秒。`first_seen` 首次写入后不再变（错峰窗口从它起算），`last_seen` 每次观测前移（很久没客户端发的版本自然出册，不会被自己的历史钉住）。清理：超 30 天的按 score 删、超过 24 个版本的按 rank 删（rank 0 = 最不活跃）、键 TTL 45 天且每次观测滑动。
+3. **按账号错峰采纳**：错峰秒数 = `sha256("aether:codex:client_release:lag:v1", 选择指纹) % 4 天`，同一账号恒定。该账号采纳「`first_seen` 已过去 ≥ 错峰秒」的最新版本，且**只升不降**（不采纳低于冻结 build 的版本；注册表追平账号自己时也不动）。任何一步失败（Redis 不可用、family/版本解析不出、注册表无记录）都退回冻结 UA。
+4. **只换版本 token，换两处**：产品段 `codex-tui/0.153.4` 与末尾构建后缀 `(codex-tui; 0.153.4)` 同时前移。后缀只在**它等于冻结版本**时才跟着换：`(VS Code; 26.901.22334)` 这种客户端真实 build 号（同样三段数字、能解析成版本）是另一回事，改了就是替客户端编造它没发过的 build。产品段与 `(...)` 之间的分隔空格只保留一个（改写后不得多出一个空格）。OS、arch、终端（`iTerm.app/…`、`WindowsTerminal`）、`originator`、`installation_id`、合成 thread/turn/window、`workspaces` 全部保持冻结——一个账号始终是同一台机器上的同一个人，只是「更新了 Codex」。`version` 头由 `apply_codex_client_identity_headers` 跟随新 UA 重新派生，不会出现版本头与 UA 对不上的形状。
+5. **落点**：HTTP 面在 `apply_codex_pool_runtime_identity` 开头（无论 runtime-identity 开关是否打开都跑，因为它只改版本 token）；WS 面在 `resolve_local_openai_responses_codex_ws_candidate_parts` 的 Codex 分支里，紧接 profile pass 之后、`codex_routing_hint` 之前，改的是握手 headers。WS step body 自己没有 headers，运行时把候选上的 `handshake_user_agent`（即已跟随后的有效 UA）抄给 step body 的身份改写，因此**握手 announced 的 build 与每步 body blob 里的 build 是同一个**；候选没有该值时退回客户端自己的 UA。
+
+**不做**：不改 `originator`；不合成客户端缺失的 `instructions` / `tools`（裁定 2 的兜底由 §18.20 之前的 profile 面处理，这里是版本面）；不新建 `workspaces`；不因为「账号很久没更新」就强制跳版（错峰窗口封顶 4 天）；不给非 codex provider 记账。
+
+**测试**：`codex_client_release` 11 项（版本解析 / 只换两处 token / 错峰按账号且封顶 / 采纳需过窗口且不降级 / 记录往返 / 观测节流 / 注册表按活跃度解析有效 UA / 冻结版本不后退 / 注册表不可用退回冻结 UA / 只记稳定版）。`codex_ws::runtime` 新增 `step_body_blob_follows_the_handshake_user_agent_over_the_client_header`（客户端头说 Linux、跟随后的握手说 Windows → blob `sandbox = windows_elevated`）与 `step_body_blob_falls_back_to_the_client_header_without_a_handshake_user_agent`（无握手 UA 时退回客户端 UA → `seccomp`）。`ai_serving::planner::standard::codex::tests` 新增 `client_release_follow_moves_the_frozen_build_and_its_version_header`（HTTP/握手入口：UA 与 `version` 头同时前移到 0.154.0，`originator` 与其它头不动）与 `client_release_follow_leaves_a_non_codex_provider_alone`。
+
+**交付状态**：已提交到 `custom` 并打 tag `backend-v0.7.127`（CI 自动构建镜像）。**未上线**——`update.sh` 上线时机由操作员另行决定。

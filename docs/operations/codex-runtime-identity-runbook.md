@@ -287,7 +287,81 @@ docker logs aether-app --since 30m 2>&1 | grep 'codex_env_context_rewritten' | g
 
 期望：Codex Pro 带 lite 历史的请求上该计数通常为 1–2（一条 `msg_` 基础指令 + 一条 `at_`），不带 lite 历史的请求为 0。出站 body 不落库，要逐条核对只能抓包：出站 `at_` / `msg_` 的 v5 后缀应等于 `uuid5(uuid5(NAMESPACE_OID, 出站 thread_id), payload)`，与入站请求里的值不同。
 
-**同批改动**（与本手册无观测项）：新导入 / 新建 / 重新授权后缺值的 Codex OAuth 账号 `concurrent_limit` 默认 1（与 Grok 一致），后台可手动改，显式值（含 0 = 不限）不会被覆盖；`instructions` / `service_tier` / `workspaces` 按操作员决定不改。
+**同批改动**（与本手册无观测项）：新导入 / 新建 / 重新授权后缺值的 Codex OAuth 账号 `concurrent_limit` 默认 1（与 Grok 一致），后台可手动改，显式值（含 0 = 不限）不会被覆盖；`instructions` / `service_tier` 按操作员决定不改。~~`workspaces` 不改~~ **`.127` 候选起 `workspaces` 由 profile pass 按账号合成**（见下）。
+
+### 3.9 `workspaces` 合成（`.127`）
+
+出站 blob 的 `workspaces` 不再是 downstream 的真实仓库根 / 私有仓库 / 真实 commit：profile pass 把每个入站仓库根换成该账号自己的合成仓库（home 目录名与 GitHub owner 由 key 的 Codex 授权文件邮箱派生，OS 布局由 profile UA 决定，仓库名与 commit 按账号哈希 + 时间周期推出）。五个表面（HTTP 头、body `client_metadata`、Search 头、WS 握手头、WS step body）同时生效，头和 body 的 blob 字节相同。判定方法：
+
+```bash
+# 入站（request_headers）里仍是真实路径；出站（provider_request_headers）才是合成后的
+# 注：出站头只在 body capture 打开、且该请求是 HTTP 时才落行；WS 请求没有 audits 行。
+docker exec -i aether-postgres psql -U postgres -d aether -x -c "
+select
+  (request_headers::jsonb->>'x-codex-turn-metadata')::jsonb->'workspaces' as inbound_workspaces,
+  (provider_request_headers::jsonb->>'x-codex-turn-metadata')::jsonb->'workspaces' as outbound_workspaces
+from usage_http_audits
+where jsonb_typeof(provider_request_headers::jsonb) = 'object'
+  and provider_request_headers::jsonb ? 'x-codex-turn-metadata'
+order by created_at desc limit 1;"
+```
+
+```bash
+# 账号的合成身份：邮箱来源与 home / owner
+docker exec -i aether-postgres psql -U postgres -d aether -x -c "
+select id, name, fingerprint->'codex_client_profile'->'workspace_identity' as workspace_identity
+from provider_api_keys
+where provider_id = '<codex pool provider id>';"
+```
+
+期望：`user_name` / `remote_owner` 与该 key 授权文件里的邮箱一致（本地部分去 `+tag` 后转小写，`user_name` 只留字母数字、`remote_owner` 非字母数字变 `-`）；`source=auth_email`。出现 `source=fallback` 说明授权文件里没有可用邮箱——重新授权 / 导入带邮箱的授权文件后，**下一次批量刷新**（或下次 profile materialize）会升级成邮箱名；已落库的身份不会被后续邮箱变更改写。若 `workspace_identity` 整个缺失（旧 profile，没有 `source` 字段就会按 `auth_email` 处理）：解析时按邮箱实时派生，与刷新后落库的值一致。出站 blob 里应看不到 `/Users/<真实用户>`、真实 owner / 仓库名或 40 位真实 commit；合成 commit 会在每账号固定的 1–3 天周期边界换一次，这是预期，不是异常。
+
+**残留**：`<environment_context>` 的 `<cwd>` / `<filesystem>` 仍带真实路径（操作员明确不改）；`tool_namespaces_info` 原样转发。
+
+### 3.10 客户端发版跟随（`.127`）
+
+池账号的冻结 `user-agent` 不再永久停在导入时的 build：注册表按 originator family 记录入站真实客户端跑过的稳定版本，每个账号按自己的错峰窗口（≤4 天，由选择指纹决定）采纳最新版本，**只换版本 token 两处**（产品段与末尾构建后缀），OS / arch / 终端 / originator / `installation_id` / 合成 thread 全冻结。末尾后缀只在它**等于冻结版本**时跟随（`(VS Code; 26.901.22334)` 这类客户端真实 build 号不动）。WS 握手的有效 UA 会抄给同一连接的每步 body，握手与 step body 的 build 一致。
+
+```bash
+# 1. 注册表：每个 family 有哪些版本，各自最近一次被真实客户端用到的时间
+docker exec -i aether-redis redis-cli --scan --pattern 'aether:codex:client_release:v1:*'
+docker exec -i aether-redis redis-cli zrange 'aether:codex:client_release:v1:<provider_id>:codex-tui' 0 -1 WITHSCORES
+```
+
+成员形如 `0.154.0:1789094091:1789150000`（版本:首见秒:末见秒），score 是末见秒。期望：成员数在个位数（上限 24），最新版本的首见秒 ≤ 现在；某个版本末见秒超过 30 天会被条目清理自动删掉。
+
+```bash
+# 2. 跟随是否发生（每次跟一条 debug，注意日志级别）
+docker logs aether-app --since 30m 2>&1 | grep 'codex pool client release follow' | tail
+```
+
+事件字段 `frozen_user_agent` / `effective_user_agent` 应只差版本 token（产品段与后缀同时前移）。同一条 connection 的 WS step body 与握手 build 若不一致，属于 bug，不是配置问题。
+
+```bash
+# 3. 版本分布：池账号当前各报什么 build（后台 key 行）
+docker exec -i aether-postgres psql -U postgres -d aether -c "
+select fingerprint->'codex_client_profile'->>'user_agent' as frozen_user_agent, count(*)
+from provider_api_keys
+where provider_id = '<codex pool provider id>'
+group by 1 order by 2 desc;"
+```
+
+注：第 3 条查的是**落库的冻结 profile**，不包含运行时的跟随结果——跟随只改单次出站请求，不回写数据库。要看出站真实 UA 只能看 debug 日志（上一条）或抓包。期望分布是集中在最近几个 build 上、彼此相差 1–2 个 patch/minor，而不是全体同一个 build（说明错峰没生效）或散落十几个版本（说明注册表没在收敛）。
+
+```bash
+# 4. 账号的合成仓库集合（裁定 4：一个账号一天最多 2 个仓库）
+docker exec -i aether-postgres psql -U postgres -d aether -c "
+select id, name,
+       fingerprint->'codex_client_profile'->'workspace_identity' as workspace_identity
+from provider_api_keys
+where provider_id = '<codex pool provider id>';"
+```
+
+「一天最多 2 个仓库」是**合成侧**的不变量，不在库里有现成列：每个账号有一个 3–8 个仓库的集合（`WORKSPACE_MIN_REPOS` / `WORKSPACE_MAX_REPOS`），任意一个「开发者日」（本地凌晨 03:00–06:00 之间随机起点，`WORKSPACE_DAY_START_*`）内只启用其中两个——主项目（周期 3–10 天）与副项目（1–3 天），入站仓库根按「哈希(种子, 入站根路径)」映射到这两条 lane 中的一条（主:副 = 2:1，`WORKSPACE_PRIMARY_LANE_WEIGHT`）。所以：
+
+- 同一 downstream thread 的多个不同仓库根会落在同一条 lane 上，整条对话只显示一个合成仓库；不同入站仓库根才可能跨到另一条 lane，因此**一个开发者日**最多两个不同合成仓库根。
+- 直接按**自然日**从出站 blob 去重计数可能看到 4 个：日界不是本地午夜，而是 03:00–06:00 之间，一个自然日能横跨两个开发者日。要精确核对得按开发者日口径（本地时间减去约 3–6 小时后按日切片），或直接看代码不变量 `synthetic_workspace_layout_is_per_account_and_bounded`（单测里滚动 60 个开发者日、每步断言当日不同仓库根 ≤2）。
+- 出站 blob 里应看不到 `/Users/<真实用户>`、真实 owner / 仓库名或 40 位真实 commit；合成 commit 会在每账号每仓库自己的 3h–2d 周期边界换一次（`WORKSPACE_COMMIT_PERIODS_SECS`），这是预期，不是异常。
 
 ## 4. 日志事件与处置
 

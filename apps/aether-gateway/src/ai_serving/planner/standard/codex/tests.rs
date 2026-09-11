@@ -1567,3 +1567,103 @@ fn header_only_surfaces_skip_the_environment_context_pass() {
         assert_eq!(body, original);
     }
 }
+
+#[tokio::test]
+async fn client_release_follow_moves_the_frozen_build_and_its_version_header() {
+    use crate::codex_client_release::{observe_codex_client_release, ClientReleaseStore};
+
+    let runtime = aether_runtime_state::RuntimeState::memory(
+        aether_runtime_state::MemoryRuntimeStateConfig::default(),
+    );
+    let transport = sample_transport(
+        "codex",
+        Some(json!({
+            "pool_advanced": {
+                "codex_client_headers": {
+                    "profiles": [{"user_agent": "codex-tui/0.153.0 stable", "originator": "codex-tui"}]
+                }
+            }
+        })),
+    );
+
+    // Seed exactly what the followed user-agent resolves to: the same build
+    // this account would compose after the release follow.
+    let store = ClientReleaseStore::new(&runtime, transport.provider.id.as_str());
+    observe_codex_client_release(
+        &store,
+        Some("codex-tui/0.154.0 (Mac OS 26.5.1; arm64) iTerm.app/3.7.0 (codex-tui; 0.154.0)"),
+        codex_client_release_seed_secs(),
+    )
+    .await;
+
+    let mut headers = BTreeMap::from([
+        (
+            "user-agent".to_string(),
+            "codex-tui/0.153.0 (Mac OS 26.5.1; arm64) iTerm.app/3.7.0 (codex-tui; 0.153.0)"
+                .to_string(),
+        ),
+        ("originator".to_string(), "codex-tui".to_string()),
+        ("version".to_string(), "0.153.0".to_string()),
+        ("x-client-request-id".to_string(), "trace-123".to_string()),
+    ]);
+    let effective = super::apply_codex_pool_client_release_headers(
+        &runtime,
+        &transport,
+        &mut headers,
+        &HeaderMap::new(),
+    )
+    .await
+    .expect("the seeded build is older than any account's adoption lag");
+
+    assert_eq!(headers.get("user-agent"), Some(&effective));
+    assert_eq!(
+        headers.get("user-agent"),
+        Some(
+            &"codex-tui/0.154.0 (Mac OS 26.5.1; arm64) iTerm.app/3.7.0 (codex-tui; 0.154.0)"
+                .to_string()
+        )
+    );
+    // The version header follows the user-agent, and only the version moved.
+    assert_eq!(headers.get("version"), Some(&"0.154.0".to_string()));
+    assert_eq!(headers.get("originator"), Some(&"codex-tui".to_string()));
+    assert_eq!(
+        headers.get("x-client-request-id"),
+        Some(&"trace-123".to_string())
+    );
+}
+
+#[tokio::test]
+async fn client_release_follow_leaves_a_non_codex_provider_alone() {
+    let runtime = aether_runtime_state::RuntimeState::memory(
+        aether_runtime_state::MemoryRuntimeStateConfig::default(),
+    );
+    let transport = sample_transport("openai", None);
+    let mut headers = BTreeMap::from([(
+        "user-agent".to_string(),
+        "codex-tui/0.153.0 (Mac OS 26.5.1; arm64) iTerm.app/3.7.0 (codex-tui; 0.153.0)".to_string(),
+    )]);
+
+    let effective = super::apply_codex_pool_client_release_headers(
+        &runtime,
+        &transport,
+        &mut headers,
+        &HeaderMap::new(),
+    )
+    .await;
+
+    assert_eq!(effective, None);
+    assert_eq!(
+        headers.get("user-agent"),
+        Some(
+            &"codex-tui/0.153.0 (Mac OS 26.5.1; arm64) iTerm.app/3.7.0 (codex-tui; 0.153.0)"
+                .to_string()
+        )
+    );
+}
+
+/// A first-seen stamp old enough that every account's per-account adoption lag
+/// (at most four days) has already elapsed.
+fn codex_client_release_seed_secs() -> u64 {
+    crate::codex_client_release::unix_now_secs()
+        .saturating_sub(crate::codex_client_release::CLIENT_RELEASE_MAX_AGE_SECS / 2)
+}

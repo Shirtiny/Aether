@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write as _};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use chrono::{Offset, TimeZone};
+use chrono_tz::Tz;
 
 use aether_contracts::{
     codex_default_transport_profile_extra, CODEX_DEFAULT_TLS_JA3, CODEX_DEFAULT_TLS_JA3_HASH,
@@ -11,6 +15,9 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+use crate::codex_environment_context::process_environment_timezone;
+use crate::codex_runtime_identity::OutboundClientOs;
 
 pub(crate) const CODEX_CLIENT_PROFILE_KEY: &str = "codex_client_profile";
 pub(crate) const CODEX_TRANSPORT_PROFILE_KEY: &str = "transport_profile";
@@ -25,7 +32,54 @@ pub(crate) struct CodexConcreteAccountProfile {
     pub(crate) user_agent: String,
     pub(crate) originator: String,
     pub(crate) installation_id: String,
+    pub(crate) workspace_identity: CodexWorkspaceIdentity,
     pub(crate) fingerprint_hash: String,
+}
+
+/// The developer one pool account presents behind the `workspaces` map of the
+/// turn metadata blob.
+///
+/// codex-rs (`core/src/turn_metadata.rs` `git_workspaces`) keys the map by the
+/// repository root path and fills `associated_remote_urls`,
+/// `latest_git_commit_hash` and `has_changes` from the local checkout. All of
+/// it names the downstream user (home directory, private GitHub owner and
+/// repository, exact commit), so the pool replaces it with one stable
+/// developer per account: the user name and remote owner below, the OS layout
+/// of the profile user-agent and a small per-account set of repositories, of
+/// which at most two are worked on during any one developer-day.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexWorkspaceIdentity {
+    /// Local account name: `<user>` in `/Users/<user>/…` or `C:\Users\<user>\…`.
+    pub(crate) user_name: String,
+    /// GitHub owner of every synthetic `origin` remote.
+    pub(crate) remote_owner: String,
+    pub(crate) source: CodexWorkspaceIdentitySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexWorkspaceIdentitySource {
+    /// Derived from the e-mail stored in the key's Codex OAuth auth config.
+    AuthEmail,
+    /// The auth config carries no usable e-mail; a name picked by the
+    /// selection hash. Upgraded to `AuthEmail` once an e-mail appears.
+    Fallback,
+}
+
+impl CodexWorkspaceIdentitySource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthEmail => "auth_email",
+            Self::Fallback => "fallback",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "auth_email" => Some(Self::AuthEmail),
+            "fallback" => Some(Self::Fallback),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +157,11 @@ pub(crate) fn materialize_codex_key_fingerprint(
     let materialized_originator = reusable_existing_profile
         .and_then(codex_profile_originator_from_object)
         .unwrap_or_else(|| originator.to_string());
+    let workspace_identity = select_codex_workspace_identity(
+        reusable_existing_profile.and_then(codex_profile_workspace_identity_from_object),
+        codex_auth_email(input.auth_config_raw).as_deref(),
+        &selection,
+    );
     normalize_codex_default_transport_profile(&mut root);
     let transport_profile_id = root
         .get(CODEX_TRANSPORT_PROFILE_KEY)
@@ -114,6 +173,7 @@ pub(crate) fn materialize_codex_key_fingerprint(
         &materialized_user_agent,
         &materialized_originator,
         &installation_id,
+        &workspace_identity,
         transport_profile_id,
         transport_tls_fingerprint_hash.as_deref(),
     );
@@ -147,6 +207,11 @@ pub(crate) fn materialize_codex_key_fingerprint(
             },
             "install_identity": {
                 "installation_id": installation_id,
+            },
+            "workspace_identity": {
+                "user_name": workspace_identity.user_name,
+                "remote_owner": workspace_identity.remote_owner,
+                "source": workspace_identity.source.as_str(),
             },
             "transport_profile_id": transport_profile_id,
             "transport_tls_fingerprint_hash": transport_tls_fingerprint_hash,
@@ -212,6 +277,13 @@ pub(crate) fn resolve_codex_concrete_account_profile(
     let materialized_originator = reusable_profile
         .and_then(codex_profile_originator_from_object)
         .unwrap_or_else(|| originator.to_string());
+    // Same rule as materialization, so a legacy profile without a persisted
+    // workspace identity presents the value its next refresh will persist.
+    let workspace_identity = select_codex_workspace_identity(
+        reusable_profile.and_then(codex_profile_workspace_identity_from_object),
+        codex_auth_email(auth_config_raw).as_deref(),
+        &selection,
+    );
     let transport_profile_id = fingerprint
         .and_then(Value::as_object)
         .and_then(|object| object.get(CODEX_TRANSPORT_PROFILE_KEY))
@@ -224,6 +296,7 @@ pub(crate) fn resolve_codex_concrete_account_profile(
         &materialized_user_agent,
         &materialized_originator,
         &installation_id,
+        &workspace_identity,
         transport_profile_id,
         transport_tls_fingerprint_hash.as_deref(),
     );
@@ -232,6 +305,7 @@ pub(crate) fn resolve_codex_concrete_account_profile(
         user_agent: materialized_user_agent,
         originator: materialized_originator,
         installation_id,
+        workspace_identity,
         fingerprint_hash,
     })
 }
@@ -255,16 +329,35 @@ pub(crate) fn apply_codex_concrete_account_profile_to_request_with_body_policy(
     profile: &CodexConcreteAccountProfile,
     body_policy: CodexProfileRequestBodyPolicy,
 ) {
+    apply_codex_concrete_account_profile_to_request_at(
+        provider_request_headers,
+        provider_request_body,
+        profile,
+        body_policy,
+        unix_now_secs(),
+    );
+}
+
+/// One clock reading per request: the header blob and the body blob must
+/// carry the same synthetic commit hash, exactly like a client that
+/// serializes one payload into both places.
+fn apply_codex_concrete_account_profile_to_request_at(
+    provider_request_headers: &mut BTreeMap<String, String>,
+    provider_request_body: &mut Value,
+    profile: &CodexConcreteAccountProfile,
+    body_policy: CodexProfileRequestBodyPolicy,
+    now_unix_secs: u64,
+) {
     apply_codex_client_identity_headers(
         provider_request_headers,
         &profile.user_agent,
         &profile.originator,
     );
 
-    normalize_installation_id_in_headers(provider_request_headers, &profile.installation_id);
+    normalize_turn_metadata_in_headers(provider_request_headers, profile, now_unix_secs);
     match body_policy {
         CodexProfileRequestBodyPolicy::NormalizeClientMetadata => {
-            normalize_installation_id_in_body(provider_request_body, &profile.installation_id);
+            normalize_turn_metadata_in_body(provider_request_body, profile, now_unix_secs);
         }
         CodexProfileRequestBodyPolicy::StripClientMetadata => {
             strip_codex_client_metadata_from_body(provider_request_body);
@@ -276,6 +369,18 @@ pub(crate) fn apply_codex_concrete_account_profile_to_search_headers(
     provider_request_headers: &mut BTreeMap<String, String>,
     profile: &CodexConcreteAccountProfile,
 ) {
+    apply_codex_concrete_account_profile_to_search_headers_at(
+        provider_request_headers,
+        profile,
+        unix_now_secs(),
+    );
+}
+
+fn apply_codex_concrete_account_profile_to_search_headers_at(
+    provider_request_headers: &mut BTreeMap<String, String>,
+    profile: &CodexConcreteAccountProfile,
+    now_unix_secs: u64,
+) {
     apply_codex_client_identity_headers(
         provider_request_headers,
         &profile.user_agent,
@@ -285,12 +390,13 @@ pub(crate) fn apply_codex_concrete_account_profile_to_search_headers(
 
     // Standalone Search carries turn metadata as a header and does not use the
     // Responses client_metadata body contract. Preserve the Search payload while
-    // keeping its installation identity aligned with the selected pool account.
+    // keeping its installation and workspace identity aligned with the
+    // selected pool account.
     if let Some((header_name, metadata)) =
         remove_header_case_insensitive(provider_request_headers, X_CODEX_TURN_METADATA)
     {
         if let Some(rewritten) =
-            rewrite_turn_metadata_installation_id_string(&metadata, &profile.installation_id)
+            rewrite_turn_metadata_for_profile_string(&metadata, profile, now_unix_secs)
         {
             provider_request_headers.insert(header_name, rewritten);
         }
@@ -341,7 +447,7 @@ pub(crate) fn apply_codex_concrete_account_profile_to_body_with_policy(
 ) {
     match body_policy {
         CodexProfileRequestBodyPolicy::NormalizeClientMetadata => {
-            normalize_installation_id_in_body(provider_request_body, &profile.installation_id);
+            normalize_turn_metadata_in_body(provider_request_body, profile, unix_now_secs());
         }
         CodexProfileRequestBodyPolicy::StripClientMetadata => {
             strip_codex_client_metadata_from_body(provider_request_body);
@@ -349,19 +455,27 @@ pub(crate) fn apply_codex_concrete_account_profile_to_body_with_policy(
     }
 }
 
-fn normalize_installation_id_in_headers(
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+fn normalize_turn_metadata_in_headers(
     provider_request_headers: &mut BTreeMap<String, String>,
-    installation_id: &str,
+    profile: &CodexConcreteAccountProfile,
+    now_unix_secs: u64,
 ) {
     set_header_value_case_insensitive(
         provider_request_headers,
         X_CODEX_INSTALLATION_ID,
-        installation_id,
+        &profile.installation_id,
     );
     if let Some((header_name, metadata)) =
         remove_header_case_insensitive(provider_request_headers, X_CODEX_TURN_METADATA)
     {
-        let rewritten = rewrite_turn_metadata_installation_id_string(&metadata, installation_id)
+        let rewritten = rewrite_turn_metadata_for_profile_string(&metadata, profile, now_unix_secs)
             .unwrap_or(metadata);
         provider_request_headers.insert(header_name, rewritten);
     }
@@ -374,7 +488,11 @@ pub(crate) fn strip_codex_client_metadata_from_body(provider_request_body: &mut 
     body.remove("client_metadata");
 }
 
-fn normalize_installation_id_in_body(provider_request_body: &mut Value, installation_id: &str) {
+fn normalize_turn_metadata_in_body(
+    provider_request_body: &mut Value,
+    profile: &CodexConcreteAccountProfile,
+    now_unix_secs: u64,
+) {
     let Some(body) = provider_request_body.as_object_mut() else {
         return;
     };
@@ -391,19 +509,23 @@ fn normalize_installation_id_in_body(provider_request_body: &mut Value, installa
 
     metadata.insert(
         X_CODEX_INSTALLATION_ID.to_string(),
-        Value::String(installation_id.to_string()),
+        Value::String(profile.installation_id.clone()),
     );
     let Some(turn_metadata) = metadata.get_mut(X_CODEX_TURN_METADATA) else {
         return;
     };
-    rewrite_turn_metadata_installation_id_value(turn_metadata, installation_id);
+    rewrite_turn_metadata_for_profile_value(turn_metadata, profile, now_unix_secs);
 }
 
-fn rewrite_turn_metadata_installation_id_value(value: &mut Value, installation_id: &str) -> bool {
+fn rewrite_turn_metadata_for_profile_value(
+    value: &mut Value,
+    profile: &CodexConcreteAccountProfile,
+    now_unix_secs: u64,
+) -> bool {
     match value {
         Value::String(raw) => {
             let Some(rewritten) =
-                rewrite_turn_metadata_installation_id_string(raw, installation_id)
+                rewrite_turn_metadata_for_profile_string(raw, profile, now_unix_secs)
             else {
                 return false;
             };
@@ -411,13 +533,30 @@ fn rewrite_turn_metadata_installation_id_value(value: &mut Value, installation_i
             true
         }
         Value::Object(object) => {
-            object.insert(
-                "installation_id".to_string(),
-                Value::String(installation_id.to_string()),
-            );
+            rewrite_turn_metadata_object_for_profile(object, profile, now_unix_secs);
             true
         }
         _ => false,
+    }
+}
+
+/// The profile pass owns two blob keys: `installation_id` (the account's
+/// frozen install) and `workspaces` (the account's synthetic developer).
+/// Every other key is left for the runtime identity pass, which runs after
+/// this one on every surface and copies `workspaces` as it finds it here.
+fn rewrite_turn_metadata_object_for_profile(
+    object: &mut Map<String, Value>,
+    profile: &CodexConcreteAccountProfile,
+    now_unix_secs: u64,
+) {
+    object.insert(
+        "installation_id".to_string(),
+        Value::String(profile.installation_id.clone()),
+    );
+    if let Some(workspaces) = object.get_mut("workspaces") {
+        if let Some(synthetic) = synthesize_codex_workspaces(workspaces, profile, now_unix_secs) {
+            *workspaces = synthetic;
+        }
     }
 }
 
@@ -477,30 +616,599 @@ pub(crate) fn serialize_ascii_json(value: &Value) -> Option<String> {
     String::from_utf8(encoded).ok()
 }
 
-fn rewrite_turn_metadata_installation_id_string(
+fn rewrite_turn_metadata_for_profile_string(
     raw: &str,
-    installation_id: &str,
+    profile: &CodexConcreteAccountProfile,
+    now_unix_secs: u64,
 ) -> Option<String> {
     let mut parsed = serde_json::from_str::<Value>(raw).ok()?;
-    match parsed.as_object_mut() {
-        Some(object) => {
-            object.insert(
-                "installation_id".to_string(),
-                Value::String(installation_id.to_string()),
-            );
-            // This JSON is embedded in an HTTP header. Preserve Unicode
-            // semantics while keeping every serialized byte header-safe.
-            serialize_ascii_json(&parsed)
-        }
-        None => None,
-    }
+    let object = parsed.as_object_mut()?;
+    rewrite_turn_metadata_object_for_profile(object, profile, now_unix_secs);
+    // This JSON is embedded in an HTTP header. Preserve Unicode semantics
+    // while keeping every serialized byte header-safe.
+    serialize_ascii_json(&parsed)
 }
 
 pub(crate) fn normalize_codex_turn_metadata_for_profile(
     raw: &str,
     profile: &CodexConcreteAccountProfile,
 ) -> Option<String> {
-    rewrite_turn_metadata_installation_id_string(raw, &profile.installation_id)
+    rewrite_turn_metadata_for_profile_string(raw, profile, unix_now_secs())
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic workspaces
+// ---------------------------------------------------------------------------
+
+const WORKSPACE_DOMAIN: &[u8] = b"aether:codex:workspace:v1";
+
+/// Repository names a developer plausibly keeps checked out. Shared by every
+/// account; the per-account subset, layout and owner differ.
+const WORKSPACE_REPO_NAMES: &[&str] = &[
+    "api-gateway",
+    "web-app",
+    "dashboard",
+    "backend",
+    "frontend",
+    "mobile-app",
+    "data-pipeline",
+    "ml-experiments",
+    "infra",
+    "docs",
+    "cli-tools",
+    "auth-service",
+    "payment-service",
+    "notification-service",
+    "admin-portal",
+    "landing-page",
+    "design-system",
+    "sdk",
+    "scripts",
+    "playground",
+    "monorepo",
+    "platform",
+    "core",
+    "analytics",
+    "search-service",
+    "chat-app",
+    "todo-app",
+    "blog",
+    "portfolio",
+    "ecommerce",
+    "inventory",
+    "crm",
+    "scheduler",
+    "worker",
+    "ingest",
+    "etl",
+    "warehouse",
+    "reporting",
+    "billing",
+    "gateway",
+    "proxy",
+    "edge",
+    "orchestrator",
+    "agent",
+    "bot",
+    "automation",
+    "devops",
+    "k8s-config",
+    "terraform",
+    "ansible",
+    "helm-charts",
+    "ci-templates",
+    "webhooks",
+    "integrations",
+    "connectors",
+    "plugins",
+    "extensions",
+    "themes",
+    "ui-kit",
+    "components",
+    "storybook",
+    "e2e-tests",
+    "load-tests",
+    "benchmarks",
+    "migrations",
+];
+
+/// Directory under the home directory where the repositories live.
+const WORKSPACE_UNIX_PARENT_DIRS: &[&str] = &[
+    "Projects",
+    "Developer",
+    "code",
+    "src",
+    "dev",
+    "work",
+    "repos",
+    "workspace",
+];
+const WORKSPACE_WINDOWS_PARENT_DIRS: &[&str] =
+    &["Projects", "source\\repos", "dev", "code", "repos", "work"];
+
+/// Given names for accounts whose auth config carries no e-mail.
+const WORKSPACE_FALLBACK_USER_NAMES: &[&str] = &[
+    "alex", "sam", "chris", "jordan", "taylor", "morgan", "casey", "jamie", "riley", "drew",
+    "kevin", "david", "daniel", "michael", "james", "ryan", "tom", "ben", "matt", "nick", "eric",
+    "jason", "kyle", "adam", "mark", "paul", "peter", "steve", "andrew", "brian", "josh", "luke",
+];
+
+/// How many distinct repositories one account cycles through over time
+/// (inclusive bounds). At most [`WORKSPACE_ACTIVE_REPOS_PER_DAY`] of them are
+/// worked on during any one developer-day.
+const WORKSPACE_MIN_REPOS: u64 = 3;
+const WORKSPACE_MAX_REPOS: u64 = 8;
+/// A developer touches at most this many repositories per day: the main
+/// project and one side project.
+const WORKSPACE_ACTIVE_REPOS_PER_DAY: usize = 2;
+/// The main project stays the same for this many days (inclusive bounds).
+const WORKSPACE_PRIMARY_MIN_DAYS: u64 = 3;
+const WORKSPACE_PRIMARY_MAX_DAYS: u64 = 10;
+/// The side project rotates every one to three days (inclusive bounds).
+const WORKSPACE_SECONDARY_MIN_DAYS: u64 = 1;
+const WORKSPACE_SECONDARY_MAX_DAYS: u64 = 3;
+/// Share of inbound repository roots that land on the main project:
+/// `WORKSPACE_PRIMARY_LANE_WEIGHT` out of `WORKSPACE_LANE_WEIGHTS_TOTAL`.
+const WORKSPACE_PRIMARY_LANE_WEIGHT: u64 = 2;
+const WORKSPACE_LANE_WEIGHTS_TOTAL: u64 = 3;
+/// A developer-day starts this long after local midnight (inclusive bounds),
+/// so the active repository set changes between 03:00 and 06:00 gateway
+/// local time rather than exactly at midnight.
+const WORKSPACE_DAY_START_MIN_SECS: u64 = 3 * 3_600;
+const WORKSPACE_DAY_START_MAX_SECS: u64 = 6 * 3_600;
+const SECS_PER_DAY: u64 = 86_400;
+/// Per-repository commit cadence: a commit lands every few hours to every two
+/// days, each repository on its own period and phase.
+const WORKSPACE_COMMIT_PERIODS_SECS: &[u64] = &[3 * 3_600, 6 * 3_600, 12 * 3_600, 86_400, 172_800];
+/// Right after a commit the checkout is clean for a while (this share of the
+/// commit period, inclusive bounds, in permille), then the developer is
+/// editing again and `has_changes` is true until the next commit.
+const WORKSPACE_CLEAN_WINDOW_MIN_PERMILLE: u64 = 50;
+const WORKSPACE_CLEAN_WINDOW_MAX_PERMILLE: u64 = 250;
+const MAX_WORKSPACE_USER_NAME_LEN: usize = 20;
+/// GitHub's user name limit.
+const MAX_WORKSPACE_REMOTE_OWNER_LEN: usize = 39;
+
+fn workspace_digest(seed: &str, label: &str, parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(WORKSPACE_DOMAIN);
+    hasher.update([0]);
+    hasher.update(seed.as_bytes());
+    hasher.update([0]);
+    hasher.update(label.as_bytes());
+    for part in parts {
+        hasher.update([0]);
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+fn digest_index(digest: &[u8; 32], modulus: u64) -> u64 {
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(bytes) % modulus.max(1)
+}
+
+/// Uniform pick from an inclusive range, seeded by the digest.
+fn digest_range(digest: &[u8; 32], min: u64, max: u64) -> u64 {
+    min + digest_index(digest, max.saturating_sub(min) + 1)
+}
+
+fn pick<'a>(list: &[&'a str], digest: &[u8; 32]) -> &'a str {
+    list[digest_index(digest, list.len() as u64) as usize]
+}
+
+/// Per-account choices that must not vary between requests: OS layout, home
+/// directory, repository parent directory, remote URL style, repository set,
+/// day boundary and rotation cadence. Seeded by the frozen `installation_id`,
+/// so the developer is as stable as the install it belongs to. Time-dependent
+/// values (which repositories are active today, the current commit, whether
+/// the checkout is dirty) are pure functions of the layout and the request
+/// instant, so the header and the body of one request agree and every
+/// request made in the same window agrees with the previous one.
+struct CodexWorkspaceLayout<'a> {
+    seed: &'a str,
+    user_name: &'a str,
+    remote_owner: &'a str,
+    os: OutboundClientOs,
+    parent_dir: &'static str,
+    /// Distinct repository names, one per slot.
+    repos: Vec<&'static str>,
+    ssh_remote: bool,
+    /// Gateway time zone the developer-day is counted in.
+    tz: Tz,
+    day_start_secs: u64,
+    primary_period_days: u64,
+    primary_phase_days: u64,
+    secondary_period_days: u64,
+    secondary_phase_days: u64,
+}
+
+impl<'a> CodexWorkspaceLayout<'a> {
+    fn for_profile(profile: &'a CodexConcreteAccountProfile) -> Self {
+        Self::for_profile_in(profile, process_environment_timezone().tz)
+    }
+
+    fn for_profile_in(profile: &'a CodexConcreteAccountProfile, tz: Tz) -> Self {
+        let seed = profile.installation_id.as_str();
+        let os = OutboundClientOs::from_user_agent(Some(profile.user_agent.as_str()));
+        let parent_dir = match os {
+            OutboundClientOs::Windows => pick(
+                WORKSPACE_WINDOWS_PARENT_DIRS,
+                &workspace_digest(seed, "parent-dir", &[]),
+            ),
+            OutboundClientOs::MacOs | OutboundClientOs::Other => pick(
+                WORKSPACE_UNIX_PARENT_DIRS,
+                &workspace_digest(seed, "parent-dir", &[]),
+            ),
+        };
+        let repo_slots = digest_range(
+            &workspace_digest(seed, "repo-slots", &[]),
+            WORKSPACE_MIN_REPOS,
+            WORKSPACE_MAX_REPOS,
+        );
+        // Distinct names: a slot whose pick collides walks forward to the next
+        // free name, so the account really has `repo_slots` repositories.
+        let mut repos: Vec<&'static str> = Vec::with_capacity(repo_slots as usize);
+        for slot in 0..repo_slots {
+            let start = digest_index(
+                &workspace_digest(seed, "repo", &[&slot.to_be_bytes()]),
+                WORKSPACE_REPO_NAMES.len() as u64,
+            ) as usize;
+            let name = (0..WORKSPACE_REPO_NAMES.len())
+                .map(|step| WORKSPACE_REPO_NAMES[(start + step) % WORKSPACE_REPO_NAMES.len()])
+                .find(|candidate| !repos.contains(candidate))
+                .unwrap_or(WORKSPACE_REPO_NAMES[start]);
+            repos.push(name);
+        }
+        let ssh_remote = workspace_digest(seed, "remote-scheme", &[])[0] & 1 == 1;
+        let day_start_secs = digest_range(
+            &workspace_digest(seed, "day-start", &[]),
+            WORKSPACE_DAY_START_MIN_SECS,
+            WORKSPACE_DAY_START_MAX_SECS,
+        );
+        let primary_period_days = digest_range(
+            &workspace_digest(seed, "primary-period", &[]),
+            WORKSPACE_PRIMARY_MIN_DAYS,
+            WORKSPACE_PRIMARY_MAX_DAYS,
+        );
+        let primary_phase_days = digest_index(
+            &workspace_digest(seed, "primary-phase", &[]),
+            primary_period_days,
+        );
+        let secondary_period_days = digest_range(
+            &workspace_digest(seed, "secondary-period", &[]),
+            WORKSPACE_SECONDARY_MIN_DAYS,
+            WORKSPACE_SECONDARY_MAX_DAYS,
+        );
+        let secondary_phase_days = digest_index(
+            &workspace_digest(seed, "secondary-phase", &[]),
+            secondary_period_days,
+        );
+        Self {
+            seed,
+            user_name: profile.workspace_identity.user_name.as_str(),
+            remote_owner: profile.workspace_identity.remote_owner.as_str(),
+            os,
+            parent_dir,
+            repos,
+            ssh_remote,
+            tz,
+            day_start_secs,
+            primary_period_days,
+            primary_phase_days,
+            secondary_period_days,
+            secondary_phase_days,
+        }
+    }
+
+    /// Developer-day index: days since the epoch in the gateway time zone,
+    /// with the day boundary shifted to the account's start-of-day hour.
+    fn local_day_index(&self, now_unix_secs: u64) -> u64 {
+        let offset_secs = self
+            .tz
+            .timestamp_opt(now_unix_secs.min(i64::MAX as u64) as i64, 0)
+            .single()
+            .map(|at| i64::from(at.offset().fix().local_minus_utc()))
+            .unwrap_or(0);
+        let local = (now_unix_secs as i64 + offset_secs - self.day_start_secs as i64).max(0) as u64;
+        local / SECS_PER_DAY
+    }
+
+    /// The two repositories the developer works on during the day that
+    /// contains `now`: the main project (rotates every few days) and a side
+    /// project (rotates every day or so, never the main one).
+    fn active_repos(&self, now_unix_secs: u64) -> (&'static str, &'static str) {
+        let day = self.local_day_index(now_unix_secs);
+        let slots = self.repos.len() as u64;
+        let primary_epoch = (day + self.primary_phase_days) / self.primary_period_days;
+        let primary = digest_index(
+            &workspace_digest(self.seed, "primary", &[&primary_epoch.to_be_bytes()]),
+            slots,
+        );
+        let secondary_epoch = (day + self.secondary_phase_days) / self.secondary_period_days;
+        let mut secondary = digest_index(
+            &workspace_digest(self.seed, "secondary", &[&secondary_epoch.to_be_bytes()]),
+            slots,
+        );
+        if secondary == primary {
+            secondary = (secondary + 1) % slots;
+        }
+        (self.repos[primary as usize], self.repos[secondary as usize])
+    }
+
+    /// Maps an inbound repository root onto one of today's two repositories.
+    /// The same inbound root lands on the same lane every time, so one
+    /// downstream thread keeps one workspace for as long as that lane's
+    /// repository stays active; when the developer moves on to another
+    /// project, so does the thread.
+    fn repo_for_inbound_root(&self, inbound_root: &str, now_unix_secs: u64) -> &'static str {
+        let (primary, secondary) = self.active_repos(now_unix_secs);
+        let lane = digest_index(
+            &workspace_digest(self.seed, "lane", &[inbound_root.as_bytes()]),
+            WORKSPACE_LANE_WEIGHTS_TOTAL,
+        );
+        if lane < WORKSPACE_PRIMARY_LANE_WEIGHT {
+            primary
+        } else {
+            secondary
+        }
+    }
+
+    fn repo_root(&self, repo: &str) -> String {
+        match self.os {
+            OutboundClientOs::MacOs => {
+                format!("/Users/{}/{}/{repo}", self.user_name, self.parent_dir)
+            }
+            OutboundClientOs::Windows => {
+                format!("C:\\Users\\{}\\{}\\{repo}", self.user_name, self.parent_dir)
+            }
+            OutboundClientOs::Other => {
+                format!("/home/{}/{}/{repo}", self.user_name, self.parent_dir)
+            }
+        }
+    }
+
+    /// Both shapes are what codex-rs `SanitizedGitUrl` lets through: the SSH
+    /// `git@` user is preserved, HTTPS carries no userinfo.
+    fn remote_url(&self, repo: &str) -> String {
+        if self.ssh_remote {
+            format!("git@github.com:{}/{repo}.git", self.remote_owner)
+        } else {
+            format!("https://github.com/{}/{repo}.git", self.remote_owner)
+        }
+    }
+
+    /// Each repository commits on its own period and phase.
+    fn commit_cadence(&self, repo: &str) -> (u64, u64) {
+        let period = WORKSPACE_COMMIT_PERIODS_SECS[digest_index(
+            &workspace_digest(self.seed, "commit-period", &[repo.as_bytes()]),
+            WORKSPACE_COMMIT_PERIODS_SECS.len() as u64,
+        ) as usize];
+        let phase = digest_index(
+            &workspace_digest(self.seed, "commit-phase", &[repo.as_bytes()]),
+            period,
+        );
+        (period, phase)
+    }
+
+    /// `(epoch, seconds elapsed since that epoch's commit, period)`.
+    fn commit_epoch(&self, repo: &str, now_unix_secs: u64) -> (u64, u64, u64) {
+        let (period, phase) = self.commit_cadence(repo);
+        let shifted = now_unix_secs.saturating_add(phase);
+        (shifted / period, shifted % period, period)
+    }
+
+    /// Stable inside one commit period, then moves: a developer who never
+    /// commits is as unusual as one who commits on every request.
+    fn commit_hash(&self, repo: &str, now_unix_secs: u64) -> String {
+        let (epoch, _, _) = self.commit_epoch(repo, now_unix_secs);
+        let digest = workspace_digest(
+            self.seed,
+            "commit",
+            &[repo.as_bytes(), &epoch.to_be_bytes()],
+        );
+        hex_lower(&digest[..20])
+    }
+
+    /// Clean for a short window after each commit, dirty until the next one.
+    fn has_changes(&self, repo: &str, now_unix_secs: u64) -> bool {
+        let (epoch, elapsed, period) = self.commit_epoch(repo, now_unix_secs);
+        let permille = digest_range(
+            &workspace_digest(
+                self.seed,
+                "clean-window",
+                &[repo.as_bytes(), &epoch.to_be_bytes()],
+            ),
+            WORKSPACE_CLEAN_WINDOW_MIN_PERMILLE,
+            WORKSPACE_CLEAN_WINDOW_MAX_PERMILLE,
+        );
+        elapsed >= period * permille / 1_000
+    }
+}
+
+/// Replaces every inbound `workspaces` entry with the account's synthetic
+/// repository for that root. Field presence mirrors the inbound entry
+/// (codex-rs only serializes the fields it collected), so a client version or
+/// a checkout without remotes keeps its shape while every value is the
+/// account's own: remote, commit and dirty flag all come from the layout's
+/// cadence, never from the downstream checkout. Two inbound roots that land on
+/// the same repository collapse into one entry. `None` leaves the inbound
+/// value untouched: not an object, or empty, in which case nothing
+/// identifying is present.
+fn synthesize_codex_workspaces(
+    inbound: &Value,
+    profile: &CodexConcreteAccountProfile,
+    now_unix_secs: u64,
+) -> Option<Value> {
+    let inbound = inbound.as_object()?;
+    if inbound.is_empty() {
+        return None;
+    }
+    let layout = CodexWorkspaceLayout::for_profile(profile);
+    // codex-rs keys the map with a BTreeMap, so the wire order is sorted.
+    let mut synthetic = BTreeMap::new();
+    for (inbound_root, inbound_entry) in inbound {
+        let repo = layout.repo_for_inbound_root(inbound_root, now_unix_secs);
+        let inbound_entry = inbound_entry.as_object();
+        let mut entry = Map::new();
+        if inbound_entry.is_some_and(|entry| entry.contains_key("associated_remote_urls")) {
+            entry.insert(
+                "associated_remote_urls".to_string(),
+                json!({ "origin": layout.remote_url(repo) }),
+            );
+        }
+        if inbound_entry.is_some_and(|entry| entry.contains_key("latest_git_commit_hash")) {
+            entry.insert(
+                "latest_git_commit_hash".to_string(),
+                Value::String(layout.commit_hash(repo, now_unix_secs)),
+            );
+        }
+        if inbound_entry.is_some_and(|entry| entry.contains_key("has_changes")) {
+            entry.insert(
+                "has_changes".to_string(),
+                Value::Bool(layout.has_changes(repo, now_unix_secs)),
+            );
+        }
+        synthetic.insert(layout.repo_root(repo), Value::Object(entry));
+    }
+    Some(Value::Object(synthetic.into_iter().collect()))
+}
+
+// ---------------------------------------------------------------------------
+// Workspace identity (user name / remote owner)
+// ---------------------------------------------------------------------------
+
+/// E-mail of the Codex account behind the key, as the OAuth login / import
+/// stored it in the auth config (`email`; imports may still carry the
+/// `oauth_email` alias).
+pub(crate) fn codex_auth_email(auth_config_raw: Option<&str>) -> Option<String> {
+    let raw = auth_config_raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let parsed = serde_json::from_str::<Value>(raw).ok()?;
+    ["email", "oauth_email"].iter().find_map(|key| {
+        parsed
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| value.contains('@'))
+            .map(str::to_ascii_lowercase)
+    })
+}
+
+/// Persisted identity wins so an account never changes developer; the only
+/// move is from a hash-picked fallback to the e-mail-derived name once the
+/// auth config gains an e-mail (import without profile enrichment, then a
+/// re-login).
+fn select_codex_workspace_identity(
+    persisted: Option<CodexWorkspaceIdentity>,
+    auth_email: Option<&str>,
+    selection: &CodexProfileSelectionIdentity,
+) -> CodexWorkspaceIdentity {
+    let from_email = auth_email.and_then(workspace_identity_from_email);
+    match (persisted, from_email) {
+        (Some(persisted), Some(from_email))
+            if persisted.source == CodexWorkspaceIdentitySource::Fallback =>
+        {
+            from_email
+        }
+        (Some(persisted), _) => persisted,
+        (None, Some(from_email)) => from_email,
+        (None, None) => fallback_workspace_identity(selection),
+    }
+}
+
+/// `john.smith+codex@example.com` → home `johnsmith`, owner `john-smith`.
+/// A local part without a letter (numeric mailboxes) yields `None`: neither
+/// a macOS account nor a GitHub handle is usually all digits.
+fn workspace_identity_from_email(email: &str) -> Option<CodexWorkspaceIdentity> {
+    let local = email.split('@').next()?.split('+').next()?.trim();
+    let local = local.to_ascii_lowercase();
+    let user_name = local
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(MAX_WORKSPACE_USER_NAME_LEN)
+        .collect::<String>();
+    if !user_name
+        .chars()
+        .any(|character| character.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    let mut remote_owner = String::new();
+    for character in local.chars() {
+        if character.is_ascii_alphanumeric() {
+            remote_owner.push(character);
+        } else if !remote_owner.is_empty() && !remote_owner.ends_with('-') {
+            remote_owner.push('-');
+        }
+    }
+    remote_owner.truncate(MAX_WORKSPACE_REMOTE_OWNER_LEN);
+    let remote_owner = remote_owner.trim_matches('-');
+    let remote_owner = if remote_owner.is_empty() {
+        user_name.clone()
+    } else {
+        remote_owner.to_string()
+    };
+    Some(CodexWorkspaceIdentity {
+        user_name,
+        remote_owner,
+        source: CodexWorkspaceIdentitySource::AuthEmail,
+    })
+}
+
+fn fallback_workspace_identity(
+    selection: &CodexProfileSelectionIdentity,
+) -> CodexWorkspaceIdentity {
+    let digest = workspace_digest(
+        &selection.selection_key_hash,
+        "fallback-user",
+        &[selection.selection_key_kind.as_bytes()],
+    );
+    let mut user_name = pick(WORKSPACE_FALLBACK_USER_NAMES, &digest).to_string();
+    if digest[8] & 1 == 1 {
+        user_name.push_str(&format!("{:02}", digest[9] % 100));
+    }
+    CodexWorkspaceIdentity {
+        remote_owner: user_name.clone(),
+        user_name,
+        source: CodexWorkspaceIdentitySource::Fallback,
+    }
+}
+
+fn codex_profile_workspace_identity_from_object(
+    profile: &Map<String, Value>,
+) -> Option<CodexWorkspaceIdentity> {
+    let identity = profile.get("workspace_identity")?.as_object()?;
+    let field = |key: &str, max_len: usize, extra: &[char]| {
+        identity
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= max_len
+                    && value.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || extra.contains(&character)
+                    })
+            })
+            .map(ToOwned::to_owned)
+    };
+    let user_name = field("user_name", 64, &['.', '_', '-'])?;
+    let remote_owner = field("remote_owner", MAX_WORKSPACE_REMOTE_OWNER_LEN, &['-'])?;
+    // A hand-written identity without `source` is kept as if pinned.
+    let source = identity
+        .get("source")
+        .and_then(Value::as_str)
+        .and_then(CodexWorkspaceIdentitySource::parse)
+        .unwrap_or(CodexWorkspaceIdentitySource::AuthEmail);
+    Some(CodexWorkspaceIdentity {
+        user_name,
+        remote_owner,
+        source,
+    })
 }
 
 fn set_header_value_case_insensitive(
@@ -773,17 +1481,22 @@ fn codex_concrete_profile_hash(
     user_agent: &str,
     originator: &str,
     installation_id: &str,
+    workspace_identity: &CodexWorkspaceIdentity,
     transport_profile_id: &str,
     transport_tls_fingerprint_hash: Option<&str>,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"aether:codex:concrete-profile:v2");
+    hasher.update(b"aether:codex:concrete-profile:v3");
     hasher.update([0]);
     hasher.update(user_agent.as_bytes());
     hasher.update([0]);
     hasher.update(originator.as_bytes());
     hasher.update([0]);
     hasher.update(installation_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(workspace_identity.user_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(workspace_identity.remote_owner.as_bytes());
     hasher.update([0]);
     hasher.update(transport_profile_id.as_bytes());
     hasher.update([0]);
@@ -852,12 +1565,29 @@ mod tests {
             profile["transport_tls_fingerprint_hash"],
             CODEX_DEFAULT_TLS_JA3_HASH
         );
+        // No e-mail in the auth config: a hash-picked developer, persisted as such.
+        assert_eq!(profile["workspace_identity"]["source"], "fallback");
+        let user_name = profile["workspace_identity"]["user_name"]
+            .as_str()
+            .expect("user_name");
+        assert!(
+            user_name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "{user_name}"
+        );
+        assert_eq!(profile["workspace_identity"]["remote_owner"], user_name);
         assert_eq!(
             profile["fingerprint_hash"],
             codex_concrete_profile_hash(
                 "codex-tui/0.142.0 test",
                 "codex-tui",
                 installation_id,
+                &CodexWorkspaceIdentity {
+                    user_name: user_name.to_string(),
+                    remote_owner: user_name.to_string(),
+                    source: CodexWorkspaceIdentitySource::Fallback,
+                },
                 TRANSPORT_PROFILE_CODEX_REQWEST_DEFAULT_TLS_AUTO,
                 Some(CODEX_DEFAULT_TLS_JA3_HASH),
             )
@@ -1093,10 +1823,617 @@ mod tests {
                 "codex-tui/0.142.0 test",
                 "codex-tui",
                 profile.installation_id.as_str(),
+                &profile.workspace_identity,
                 TRANSPORT_PROFILE_CODEX_LEGACY_REQWEST_RUSTLS_AUTO,
                 None,
             )
         );
+    }
+
+    fn test_workspace_identity() -> CodexWorkspaceIdentity {
+        CodexWorkspaceIdentity {
+            user_name: "quinnvale".to_string(),
+            remote_owner: "quinnvale".to_string(),
+            source: CodexWorkspaceIdentitySource::AuthEmail,
+        }
+    }
+
+    fn test_profile(user_agent: &str) -> CodexConcreteAccountProfile {
+        CodexConcreteAccountProfile {
+            user_agent: user_agent.to_string(),
+            originator: "codex-tui".to_string(),
+            installation_id: "019f0a27-08f6-47d2-ba0b-1ff45470ee76".to_string(),
+            workspace_identity: test_workspace_identity(),
+            fingerprint_hash: "sha256:hash".to_string(),
+        }
+    }
+
+    /// Shaped like the blob the operator captured on 2026-09-11; the developer,
+    /// paths, remote, commit and ids are synthetic stand-ins.
+    const LEAKING_TURN_METADATA: &str = r#"{"installation_id":"7d3f1a2b-9c4e-4f60-8a1b-2c3d4e5f6071","session_id":"01a078d0-a8e5-7c21-9d3e-4f5a6b7c8d9e","thread_id":"01a078d0-a8e5-7c21-9d3e-4f5a6b7c8d9e","agent_name":"/root","turn_id":"01a08e51-5902-7e4f-8a1b-2c3d4e5f6a7b","request_kind":"turn","sandbox":"none","sandbox_mode":"danger-full-access","workspaces":{"/Users/quinn/Projects/ledger":{"associated_remote_urls":{"origin":"git@github.com:QuinnVale/ledger-copilot.git"},"latest_git_commit_hash":"4c1d9e2f7a3b58c6d0e1f2a3b4c5d6e7f8091a2b","has_changes":true}},"turn_started_at_unix_ms":1789094091010}"#;
+
+    fn assert_no_downstream_workspace_leak(serialized: &str) {
+        // The home directory is matched with its separator so a synthetic
+        // developer whose name merely starts with the real one is not a hit.
+        for leaked in [
+            "/Users/quinn/",
+            "/home/quinn/",
+            r"C:\Users\quinn\",
+            "Projects/ledger\"",
+            "QuinnVale",
+            "ledger-copilot",
+            "4c1d9e2f7a3b58c6d0e1f2a3b4c5d6e7f8091a2b",
+        ] {
+            assert!(
+                !serialized.contains(leaked),
+                "{leaked} leaked in {serialized}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_identity_derives_home_and_owner_from_auth_email() {
+        for (email, user_name, owner) in [
+            ("QuinnVale@example.com", "quinnvale", "quinnvale"),
+            ("john.smith+codex@company.io", "johnsmith", "john-smith"),
+            ("mary_jane.w@example.org", "maryjanew", "mary-jane-w"),
+            ("  Dev.Ops--Team@x.dev ", "devopsteam", "dev-ops-team"),
+        ] {
+            let identity = workspace_identity_from_email(email.trim())
+                .unwrap_or_else(|| panic!("{email} should derive"));
+            assert_eq!(identity.user_name, user_name, "{email}");
+            assert_eq!(identity.remote_owner, owner, "{email}");
+            assert_eq!(identity.source, CodexWorkspaceIdentitySource::AuthEmail);
+        }
+        // Numeric mailboxes and non-ASCII local parts do not make a name.
+        assert!(workspace_identity_from_email("1234567890@example.com").is_none());
+        assert!(workspace_identity_from_email("用户@example.com").is_none());
+
+        assert_eq!(
+            codex_auth_email(Some(r#"{"account_id":"acc","email":" Dev@Example.com "}"#)),
+            Some("dev@example.com".to_string())
+        );
+        assert_eq!(
+            codex_auth_email(Some(r#"{"oauth_email":"imported@example.com"}"#)),
+            Some("imported@example.com".to_string())
+        );
+        assert_eq!(codex_auth_email(Some(r#"{"email":"not-an-email"}"#)), None);
+        assert_eq!(codex_auth_email(Some(r#"{"account_id":"acc"}"#)), None);
+    }
+
+    #[test]
+    fn fallback_workspace_identity_is_deterministic_per_selection() {
+        let selection =
+            codex_profile_selection_identity(Some(r#"{"account_id":"acc-1"}"#), "name", "key");
+        let first = fallback_workspace_identity(&selection);
+        let second = fallback_workspace_identity(&selection);
+        assert_eq!(first, second);
+        assert_eq!(first.source, CodexWorkspaceIdentitySource::Fallback);
+        assert_eq!(first.remote_owner, first.user_name);
+        let letters = first
+            .user_name
+            .trim_end_matches(|c: char| c.is_ascii_digit());
+        assert!(
+            WORKSPACE_FALLBACK_USER_NAMES.contains(&letters),
+            "{}",
+            first.user_name
+        );
+        assert!(first.user_name.len() - letters.len() <= 2);
+
+        // Other accounts get their own developer (not one name for the pool).
+        let distinct = (0..64).any(|index| {
+            let selection = codex_profile_selection_identity(
+                Some(&format!(r#"{{"account_id":"acc-{index}"}}"#)),
+                "name",
+                "key",
+            );
+            fallback_workspace_identity(&selection) != first
+        });
+        assert!(distinct);
+    }
+
+    #[test]
+    fn materialization_persists_workspace_identity_and_upgrades_fallback_once() {
+        let materialize = |fingerprint: Option<&Value>, auth_config_raw: &str| {
+            materialize_codex_key_fingerprint(CodexProfileMaterializeInput {
+                provider_type: "codex",
+                fingerprint,
+                auth_config_raw: Some(auth_config_raw),
+                key_id: "key-1",
+                key_name: "name-1",
+                user_agent: "codex-tui/0.142.0 test",
+                originator: "codex-tui",
+                now_unix_secs: 1_760_000_000,
+            })
+            .expect("codex profile should materialize")
+            .fingerprint
+        };
+
+        // Imported without an e-mail: fallback developer.
+        let first = materialize(None, r#"{"account_id":"acc-1"}"#);
+        let first_identity = &first[CODEX_CLIENT_PROFILE_KEY]["workspace_identity"];
+        assert_eq!(first_identity["source"], "fallback");
+
+        // The auth config gains an e-mail (re-login): upgrade to the e-mail name.
+        let second = materialize(
+            Some(&first),
+            r#"{"account_id":"acc-1","email":"Quinn.Vale@example.com"}"#,
+        );
+        let second_identity = &second[CODEX_CLIENT_PROFILE_KEY]["workspace_identity"];
+        assert_eq!(second_identity["source"], "auth_email");
+        assert_eq!(second_identity["user_name"], "quinnvale");
+        assert_eq!(second_identity["remote_owner"], "quinn-vale");
+        assert_ne!(
+            first[CODEX_CLIENT_PROFILE_KEY]["fingerprint_hash"],
+            second[CODEX_CLIENT_PROFILE_KEY]["fingerprint_hash"]
+        );
+
+        // A later e-mail change does not move the developer again.
+        let third = materialize(
+            Some(&second),
+            r#"{"account_id":"acc-1","email":"other@example.com"}"#,
+        );
+        assert_eq!(
+            third[CODEX_CLIENT_PROFILE_KEY]["workspace_identity"],
+            *second_identity
+        );
+
+        // Read-only resolution presents the persisted identity.
+        let resolved = resolve_codex_concrete_account_profile(
+            Some(&third),
+            Some(r#"{"account_id":"acc-1","email":"other@example.com"}"#),
+            "key-1",
+            "name-1",
+            "codex-tui/0.142.0 test",
+            "codex-tui",
+        )
+        .expect("profile should resolve");
+        assert_eq!(resolved.workspace_identity.user_name, "quinnvale");
+        assert_eq!(resolved.workspace_identity.remote_owner, "quinn-vale");
+        assert_eq!(
+            resolved.fingerprint_hash,
+            third[CODEX_CLIENT_PROFILE_KEY]["fingerprint_hash"]
+        );
+
+        // A legacy profile without the key derives live from the e-mail, which
+        // is exactly what its next refresh persists.
+        let mut legacy = second.clone();
+        legacy[CODEX_CLIENT_PROFILE_KEY]
+            .as_object_mut()
+            .expect("profile object")
+            .remove("workspace_identity");
+        let legacy_resolved = resolve_codex_concrete_account_profile(
+            Some(&legacy),
+            Some(r#"{"account_id":"acc-1","email":"Quinn.Vale@example.com"}"#),
+            "key-1",
+            "name-1",
+            "codex-tui/0.142.0 test",
+            "codex-tui",
+        )
+        .expect("profile should resolve");
+        assert_eq!(
+            legacy_resolved.workspace_identity,
+            resolved.workspace_identity
+        );
+    }
+
+    #[test]
+    fn rewrites_workspaces_with_the_account_developer_on_every_os_layout() {
+        let now = 1_789_094_091;
+        for (user_agent, root_prefix, remote_owner_prefixes) in [
+            (
+                "codex_cli_rs/0.153.4 (Mac OS 26.5.1; arm64) ghostty/1.3.1",
+                "/Users/quinnvale/",
+                ["git@github.com:quinnvale/", "https://github.com/quinnvale/"],
+            ),
+            (
+                "codex-tui/0.153.4 (Windows 10.0.26200; x86_64) WindowsTerminal (codex-tui; 0.153.4)",
+                "C:\\Users\\quinnvale\\",
+                ["git@github.com:quinnvale/", "https://github.com/quinnvale/"],
+            ),
+            (
+                "codex-tui/0.153.4 (Linux 6.8.0; x86_64) unknown",
+                "/home/quinnvale/",
+                ["git@github.com:quinnvale/", "https://github.com/quinnvale/"],
+            ),
+        ] {
+            let profile = test_profile(user_agent);
+            let rewritten =
+                rewrite_turn_metadata_for_profile_string(LEAKING_TURN_METADATA, &profile, now)
+                    .expect("blob should rewrite");
+            assert!(rewritten.is_ascii());
+            assert_no_downstream_workspace_leak(&rewritten);
+            let blob = serde_json::from_str::<Value>(&rewritten).expect("json");
+            assert_eq!(blob["installation_id"], profile.installation_id);
+            // Everything the profile pass does not own is untouched.
+            assert_eq!(blob["session_id"], "01a078d0-a8e5-7c21-9d3e-4f5a6b7c8d9e");
+            assert_eq!(blob["agent_name"], "/root");
+            assert_eq!(blob["turn_started_at_unix_ms"], 1_789_094_091_010_u64);
+
+            let workspaces = blob["workspaces"].as_object().expect("workspaces object");
+            assert_eq!(workspaces.len(), 1, "{user_agent}");
+            let (root, entry) = workspaces.iter().next().expect("one workspace");
+            assert!(root.starts_with(root_prefix), "{user_agent}: {root}");
+            let repo = root.rsplit(['/', '\\']).next().expect("repo name");
+            assert!(WORKSPACE_REPO_NAMES.contains(&repo), "{root}");
+            // Field order follows codex-rs TurnMetadataWorkspace.
+            assert_eq!(
+                entry.as_object().expect("entry").keys().collect::<Vec<_>>(),
+                ["associated_remote_urls", "latest_git_commit_hash", "has_changes"]
+            );
+            let origin = entry["associated_remote_urls"]["origin"]
+                .as_str()
+                .expect("origin");
+            assert!(
+                remote_owner_prefixes.iter().any(|prefix| origin.starts_with(prefix)),
+                "{origin}"
+            );
+            assert_eq!(entry["associated_remote_urls"].as_object().unwrap().len(), 1);
+            assert!(origin.ends_with(&format!("/{repo}.git")), "{origin}");
+            let commit = entry["latest_git_commit_hash"].as_str().expect("commit");
+            assert_eq!(commit.len(), 40);
+            assert!(commit.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+            // The dirty flag is the layout's, not the downstream checkout's.
+            let layout = CodexWorkspaceLayout::for_profile(&profile);
+            assert_eq!(
+                entry["has_changes"],
+                Value::Bool(layout.has_changes(repo, now)),
+                "{user_agent}"
+            );
+
+            // Deterministic: the same inbound root presents the same workspace.
+            let again =
+                rewrite_turn_metadata_for_profile_string(LEAKING_TURN_METADATA, &profile, now)
+                    .expect("blob should rewrite");
+            assert_eq!(again, rewritten);
+        }
+    }
+
+    /// A fixed zone keeps the day boundary independent of the host the tests
+    /// run on.
+    const TEST_TZ: Tz = chrono_tz::America::New_York;
+
+    fn test_layout(profile: &CodexConcreteAccountProfile) -> CodexWorkspaceLayout<'_> {
+        CodexWorkspaceLayout::for_profile_in(profile, TEST_TZ)
+    }
+
+    #[test]
+    fn synthetic_workspace_layout_is_per_account_and_bounded() {
+        let mac = "codex_cli_rs/0.153.4 (Mac OS 26.5.1; arm64) ghostty/1.3.1";
+        let profile = test_profile(mac);
+        let layout = test_layout(&profile);
+        let slots = layout.repos.len() as u64;
+        assert!((WORKSPACE_MIN_REPOS..=WORKSPACE_MAX_REPOS).contains(&slots));
+        let distinct = layout
+            .repos
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(distinct.len() as u64, slots, "{:?}", layout.repos);
+        assert!(WORKSPACE_UNIX_PARENT_DIRS.contains(&layout.parent_dir));
+        assert!(
+            (WORKSPACE_DAY_START_MIN_SECS..=WORKSPACE_DAY_START_MAX_SECS)
+                .contains(&layout.day_start_secs)
+        );
+        assert!((WORKSPACE_PRIMARY_MIN_DAYS..=WORKSPACE_PRIMARY_MAX_DAYS)
+            .contains(&layout.primary_period_days));
+        assert!(layout.primary_phase_days < layout.primary_period_days);
+        assert!(
+            (WORKSPACE_SECONDARY_MIN_DAYS..=WORKSPACE_SECONDARY_MAX_DAYS)
+                .contains(&layout.secondary_period_days)
+        );
+        assert!(layout.secondary_phase_days < layout.secondary_period_days);
+        for repo in &layout.repos {
+            let (period, phase) = layout.commit_cadence(repo);
+            assert!(WORKSPACE_COMMIT_PERIODS_SECS.contains(&period), "{repo}");
+            assert!(phase < period, "{repo}");
+        }
+
+        // Another account (another install) lays its repositories out differently
+        // somewhere in these choices, and never shares the seed-derived commit.
+        let mut other = test_profile(mac);
+        other.installation_id = "6d2f8c1a-2b6e-4d7f-9a1b-3c4d5e6f7a8b".to_string();
+        let other_layout = test_layout(&other);
+        assert_ne!(
+            layout.commit_hash("core", 1_789_094_091),
+            other_layout.commit_hash("core", 1_789_094_091)
+        );
+    }
+
+    #[test]
+    fn at_most_two_repositories_are_active_per_developer_day() {
+        let profile = test_profile("codex_cli_rs/0.153.4 (Mac OS 26.5.1; arm64) ghostty/1.3.1");
+        let layout = test_layout(&profile);
+        let roots = (0..200)
+            .map(|index| format!("/Users/user{index}/proj{index}"))
+            .collect::<Vec<_>>();
+
+        // Walk 60 developer-days in 10-minute steps: every day shows at most
+        // two repositories, both from the account's own set, and both lanes
+        // are really used over time.
+        let start = 1_789_094_091_u64;
+        let mut first_day = None;
+        let mut days_seen =
+            std::collections::BTreeMap::<u64, std::collections::BTreeSet<&str>>::new();
+        let mut now = start;
+        while now < start + 60 * SECS_PER_DAY {
+            let day = layout.local_day_index(now);
+            first_day.get_or_insert(day);
+            let (primary, secondary) = layout.active_repos(now);
+            assert_ne!(primary, secondary);
+            let today = days_seen.entry(day).or_default();
+            for root in &roots {
+                let repo = layout.repo_for_inbound_root(root, now);
+                assert!(layout.repos.contains(&repo), "{repo}");
+                today.insert(repo);
+            }
+            assert!(
+                today.len() <= WORKSPACE_ACTIVE_REPOS_PER_DAY,
+                "day {day}: {today:?}"
+            );
+            now += 600;
+        }
+        assert!(days_seen.len() >= 59, "{}", days_seen.len());
+        assert!(days_seen
+            .values()
+            .all(|repos| repos.len() == WORKSPACE_ACTIVE_REPOS_PER_DAY));
+        // The whole set is visited over two months, so the account is not
+        // stuck on one pair forever.
+        let all = days_seen
+            .values()
+            .flatten()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(all.len() >= 3, "{all:?}");
+        // Consecutive days do not always change the main project.
+        let primaries = days_seen
+            .keys()
+            .map(|day| layout.active_repos(day * SECS_PER_DAY + layout.day_start_secs + 12 * 3_600))
+            .map(|(primary, _)| primary)
+            .collect::<Vec<_>>();
+        assert!(
+            primaries.windows(2).any(|pair| pair[0] == pair[1]),
+            "{primaries:?}"
+        );
+        assert!(
+            primaries.windows(2).any(|pair| pair[0] != pair[1]),
+            "{primaries:?}"
+        );
+    }
+
+    #[test]
+    fn developer_day_boundary_follows_the_gateway_zone_and_the_account_phase() {
+        let profile = test_profile("codex_cli_rs/0.153.4 (Mac OS 26.5.1; arm64) ghostty/1.3.1");
+        let layout = test_layout(&profile);
+        // 2026-09-11 00:00:00 America/New_York (EDT, UTC-4) = 04:00:00 UTC.
+        let local_midnight = 1_789_099_200_u64;
+        let boundary = local_midnight + layout.day_start_secs;
+        assert_eq!(
+            layout.local_day_index(boundary - 1) + 1,
+            layout.local_day_index(boundary)
+        );
+        // Between two boundaries the day index does not move.
+        assert_eq!(
+            layout.local_day_index(boundary),
+            layout.local_day_index(boundary + SECS_PER_DAY - 1)
+        );
+        // UTC midnight is not a boundary for this zone.
+        let utc_midnight = 1_789_084_800_u64;
+        assert_eq!(
+            layout.local_day_index(utc_midnight - 1),
+            layout.local_day_index(utc_midnight)
+        );
+        // The same account in UTC counts a different day around the boundary.
+        let utc_layout = CodexWorkspaceLayout::for_profile_in(&profile, chrono_tz::UTC);
+        assert_eq!(
+            utc_layout.local_day_index(utc_midnight + layout.day_start_secs - 1) + 1,
+            utc_layout.local_day_index(utc_midnight + layout.day_start_secs)
+        );
+    }
+
+    #[test]
+    fn synthetic_commit_hash_is_stable_within_a_period_and_moves_after_it() {
+        let profile = test_profile("codex_cli_rs/0.153.4 (Mac OS 26.5.1; arm64) ghostty/1.3.1");
+        let layout = test_layout(&profile);
+        let now = 1_789_094_091;
+        let (period, phase) = layout.commit_cadence("core");
+        // Inside one period: the same commit, aligned to the repository's phase.
+        let period_start = (now + phase) / period * period - phase;
+        assert_eq!(
+            layout.commit_hash("core", period_start),
+            layout.commit_hash("core", period_start + period - 1)
+        );
+        assert_ne!(
+            layout.commit_hash("core", period_start),
+            layout.commit_hash("core", period_start + period)
+        );
+        // Repositories move independently: different commits, and over the
+        // account's own set not every repository shares one cadence.
+        assert_ne!(
+            layout.commit_hash("core", now),
+            layout.commit_hash("docs", now)
+        );
+        let cadences = layout
+            .repos
+            .iter()
+            .map(|repo| layout.commit_cadence(repo))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(cadences.len() > 1, "{cadences:?}");
+    }
+
+    #[test]
+    fn dirty_flag_is_clean_right_after_a_commit_then_dirty_until_the_next() {
+        let profile = test_profile("codex_cli_rs/0.153.4 (Mac OS 26.5.1; arm64) ghostty/1.3.1");
+        let layout = test_layout(&profile);
+        let now = 1_789_094_091;
+        let (period, phase) = layout.commit_cadence("core");
+        let period_start = (now + phase) / period * period - phase;
+        assert!(!layout.has_changes("core", period_start));
+        assert!(!layout.has_changes(
+            "core",
+            period_start + period * WORKSPACE_CLEAN_WINDOW_MIN_PERMILLE / 1_000 - 1
+        ));
+        assert!(layout.has_changes(
+            "core",
+            period_start + period * WORKSPACE_CLEAN_WINDOW_MAX_PERMILLE / 1_000
+        ));
+        assert!(layout.has_changes("core", period_start + period - 1));
+        // Monotonic inside the period: once dirty, dirty until the commit.
+        let mut seen_dirty = false;
+        for step in (0..period).step_by((period / 200).max(1) as usize) {
+            let dirty = layout.has_changes("core", period_start + step);
+            assert!(!(seen_dirty && !dirty), "step {step}");
+            seen_dirty |= dirty;
+        }
+    }
+
+    #[test]
+    fn workspaces_rewrite_mirrors_inbound_field_presence_and_skips_absent_maps() {
+        let profile = test_profile("codex_cli_rs/0.153.4 (Mac OS 26.5.1; arm64) ghostty/1.3.1");
+        let now = 1_789_094_091;
+
+        // A checkout without remotes keeps its shape: only `has_changes`.
+        let rewritten = rewrite_turn_metadata_for_profile_string(
+            r#"{"installation_id":"old","workspaces":{"/home/me/private":{"has_changes":false}}}"#,
+            &profile,
+            now,
+        )
+        .expect("rewrite");
+        let blob = serde_json::from_str::<Value>(&rewritten).expect("json");
+        let (root, entry) = blob["workspaces"]
+            .as_object()
+            .expect("workspaces")
+            .iter()
+            .next()
+            .expect("entry");
+        assert!(root.starts_with("/Users/quinnvale/"), "{root}");
+        assert_eq!(
+            entry.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["has_changes"]
+        );
+        assert!(entry["has_changes"].is_boolean());
+        assert!(!rewritten.contains("/home/me/private"));
+
+        // Two inbound roots: two synthetic entries, sorted like a BTreeMap.
+        let rewritten = rewrite_turn_metadata_for_profile_string(
+            r#"{"installation_id":"old","workspaces":{"/a":{"latest_git_commit_hash":"1"},"/b":{"latest_git_commit_hash":"2"}}}"#,
+            &profile,
+            now,
+        )
+        .expect("rewrite");
+        let blob = serde_json::from_str::<Value>(&rewritten).expect("json");
+        let roots = blob["workspaces"]
+            .as_object()
+            .expect("workspaces")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut sorted = roots.clone();
+        sorted.sort();
+        assert_eq!(roots, sorted);
+        for entry in blob["workspaces"].as_object().unwrap().values() {
+            assert_eq!(
+                entry.as_object().unwrap().keys().collect::<Vec<_>>(),
+                ["latest_git_commit_hash"]
+            );
+        }
+
+        // No `workspaces` (prewarm, compaction, old clients): none is invented.
+        let rewritten = rewrite_turn_metadata_for_profile_string(
+            r#"{"installation_id":"old","session_id":"sess"}"#,
+            &profile,
+            now,
+        )
+        .expect("rewrite");
+        let blob = serde_json::from_str::<Value>(&rewritten).expect("json");
+        assert!(!blob.as_object().unwrap().contains_key("workspaces"));
+
+        // An empty or non-object map carries nothing and stays as sent.
+        for raw in [
+            r#"{"installation_id":"old","workspaces":{}}"#,
+            r#"{"installation_id":"old","workspaces":null}"#,
+        ] {
+            let rewritten =
+                rewrite_turn_metadata_for_profile_string(raw, &profile, now).expect("rewrite");
+            let blob = serde_json::from_str::<Value>(&rewritten).expect("json");
+            let expected = serde_json::from_str::<Value>(raw).expect("json");
+            assert_eq!(blob["workspaces"], expected["workspaces"], "{raw}");
+        }
+    }
+
+    #[test]
+    fn request_pass_rewrites_workspaces_in_header_and_body_blobs_consistently() {
+        let profile = test_profile("codex_cli_rs/0.153.4 (Mac OS 26.5.1; arm64) ghostty/1.3.1");
+        let mut headers = BTreeMap::from([(
+            "X-Codex-Turn-Metadata".to_string(),
+            LEAKING_TURN_METADATA.to_string(),
+        )]);
+        let inbound_blob = serde_json::from_str::<Value>(LEAKING_TURN_METADATA).expect("json");
+        let mut body = json!({
+            "input": [{"content": [{"type": "input_text", "text": "<environment_context><cwd>/Users/quinn/Projects/ledger</cwd></environment_context>"}]}],
+            "client_metadata": {
+                "x-codex-turn-metadata": LEAKING_TURN_METADATA,
+                "session_id": "01a078d0-a8e5-7c21-9d3e-4f5a6b7c8d9e"
+            }
+        });
+
+        apply_codex_concrete_account_profile_to_request_at(
+            &mut headers,
+            &mut body,
+            &profile,
+            CodexProfileRequestBodyPolicy::NormalizeClientMetadata,
+            1_789_094_091,
+        );
+
+        let header_blob = headers.get("X-Codex-Turn-Metadata").expect("header kept");
+        let body_blob = body["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("body blob");
+        assert_eq!(header_blob, body_blob);
+        assert_no_downstream_workspace_leak(header_blob);
+        let header_blob = serde_json::from_str::<Value>(header_blob).expect("json");
+        assert_ne!(header_blob["workspaces"], inbound_blob["workspaces"]);
+        assert_eq!(header_blob["session_id"], inbound_blob["session_id"]);
+        // The profile pass does not touch the prompt; `<cwd>` is out of scope here.
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            "<environment_context><cwd>/Users/quinn/Projects/ledger</cwd></environment_context>"
+        );
+
+        // Object-form blob in the body (a client that does not stringify).
+        let mut body = json!({
+            "client_metadata": { "x-codex-turn-metadata": inbound_blob.clone() }
+        });
+        let mut headers = BTreeMap::new();
+        apply_codex_concrete_account_profile_to_request_at(
+            &mut headers,
+            &mut body,
+            &profile,
+            CodexProfileRequestBodyPolicy::NormalizeClientMetadata,
+            1_789_094_091,
+        );
+        let object_blob = &body["client_metadata"]["x-codex-turn-metadata"];
+        assert!(object_blob.is_object());
+        assert_no_downstream_workspace_leak(&object_blob.to_string());
+        assert_eq!(object_blob["workspaces"], header_blob["workspaces"]);
+
+        // Standalone Search header and the WS handshake normalizer share the rewrite.
+        let mut headers = BTreeMap::from([(
+            "x-codex-turn-metadata".to_string(),
+            LEAKING_TURN_METADATA.to_string(),
+        )]);
+        apply_codex_concrete_account_profile_to_search_headers_at(
+            &mut headers,
+            &profile,
+            1_789_094_091,
+        );
+        let search_blob = headers.get("x-codex-turn-metadata").expect("search header");
+        assert_no_downstream_workspace_leak(search_blob);
+        assert_eq!(
+            serde_json::from_str::<Value>(search_blob).expect("json")["workspaces"],
+            header_blob["workspaces"]
+        );
+        let ws_blob = normalize_codex_turn_metadata_for_profile(LEAKING_TURN_METADATA, &profile)
+            .expect("ws handshake blob");
+        assert_no_downstream_workspace_leak(&ws_blob);
     }
 
     #[test]
@@ -1174,12 +2511,7 @@ mod tests {
 
     #[test]
     fn normalizes_installation_id_without_touching_runtime_or_prompt_fields() {
-        let profile = CodexConcreteAccountProfile {
-            user_agent: "ua".to_string(),
-            originator: "codex-tui".to_string(),
-            installation_id: "019f0a27-08f6-47d2-ba0b-1ff45470ee76".to_string(),
-            fingerprint_hash: "sha256:hash".to_string(),
-        };
+        let profile = test_profile("ua");
         let mut headers = BTreeMap::from([
             (
                 "x-codex-installation-id".to_string(),
@@ -1245,12 +2577,7 @@ mod tests {
 
     #[test]
     fn turn_metadata_normalization_ascii_escapes_unicode_for_http_headers() {
-        let profile = CodexConcreteAccountProfile {
-            user_agent: "ua".to_string(),
-            originator: "codex-tui".to_string(),
-            installation_id: "019f0a27-08f6-47d2-ba0b-1ff45470ee76".to_string(),
-            fingerprint_hash: "sha256:hash".to_string(),
-        };
+        let profile = test_profile("ua");
         let original = r#"{"installation_id":"old","cwd":"/workspace/\u9879\u76ee\ud83d\ude80","label":"caf\u00e9","delete":"\u007f","\u8def\u5f84":"value"}"#;
         let expected =
             serde_json::from_str::<Value>(original).expect("source metadata should parse");
@@ -1277,12 +2604,7 @@ mod tests {
 
     #[test]
     fn injects_profile_installation_id_when_request_omits_codex_metadata() {
-        let profile = CodexConcreteAccountProfile {
-            user_agent: "ua".to_string(),
-            originator: "codex-tui".to_string(),
-            installation_id: "019f0a27-08f6-47d2-ba0b-1ff45470ee76".to_string(),
-            fingerprint_hash: "sha256:hash".to_string(),
-        };
+        let profile = test_profile("ua");
         let mut headers = BTreeMap::new();
         let instructions = "do not mutate";
         let input_text = "<environment_context><cwd>/Users/alice/repo</cwd></environment_context>";

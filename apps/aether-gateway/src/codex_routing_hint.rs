@@ -3,6 +3,46 @@ use serde_json::Value;
 use crate::AiExecutionDecision;
 
 pub(crate) const HEADER: &str = "x-codex-routing-hint";
+pub(crate) const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
+
+// Keep this list aligned with codex-rs models-manager/models.json. Aether does
+// not fetch the Codex model manifest at request time, so the model capability
+// must be represented locally when building the provider request.
+const RESPONSES_LITE_MODELS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-daybreak-blue-latest",
+    "gpt-daybreak-red-latest",
+    "codex-auto-review",
+];
+
+fn model_name_uses_responses_lite(model: &str) -> bool {
+    RESPONSES_LITE_MODELS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(model.trim()))
+}
+
+pub(crate) fn apply_responses_lite_header(
+    provider_type: &str,
+    provider_api_format: &str,
+    headers: &mut std::collections::BTreeMap<String, String>,
+    model: &str,
+) {
+    if !provider_type.trim().eq_ignore_ascii_case("codex")
+        || !matches!(
+            crate::ai_serving::normalize_api_format_alias(provider_api_format).as_str(),
+            "openai:responses" | "openai:responses:compact"
+        )
+    {
+        return;
+    }
+    headers.retain(|name, _| !name.eq_ignore_ascii_case(RESPONSES_LITE_HEADER));
+    if model_name_uses_responses_lite(model) {
+        headers.insert(RESPONSES_LITE_HEADER.to_string(), "true".to_string());
+    }
+}
 
 /// Derive the hint from the provider body, never from the client model alias.
 pub(crate) fn from_body(body: &Value) -> Option<String> {
@@ -39,6 +79,18 @@ pub(crate) fn apply_to_decision(provider_type: &str, decision: &mut AiExecutionD
     decision
         .provider_request_headers
         .retain(|name, _| !name.eq_ignore_ascii_case(HEADER));
+    let model = decision
+        .provider_request_body
+        .as_ref()
+        .and_then(|body| body.get("model"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    apply_responses_lite_header(
+        provider_type,
+        decision.provider_api_format.as_deref().unwrap_or_default(),
+        &mut decision.provider_request_headers,
+        model,
+    );
     if let Some(hint) = decision.provider_request_body.as_ref().and_then(from_body) {
         decision
             .provider_request_headers
@@ -92,6 +144,32 @@ mod tests {
         ] {
             assert_eq!(from_body(&body).as_deref(), expected, "{body}");
         }
+    }
+
+    #[test]
+    fn responses_lite_header_follows_final_provider_model() {
+        let mut decision: AiExecutionDecision = serde_json::from_value(json!({
+            "action":"execute",
+            "provider_api_format":"openai:responses",
+            "provider_request_body":{"model":"gpt-6-astra"},
+            "provider_request_headers":{
+                "x-openai-internal-codex-responses-lite":"stale",
+                "authorization":"Bearer test"
+            },
+            "report_context":{}
+        }))
+        .unwrap();
+        apply_to_decision("codex", &mut decision);
+        assert_eq!(
+            decision.provider_request_headers[RESPONSES_LITE_HEADER],
+            "true"
+        );
+
+        decision.provider_request_body = Some(json!({"model":"gpt-5.5"}));
+        apply_to_decision("codex", &mut decision);
+        assert!(!decision
+            .provider_request_headers
+            .contains_key(RESPONSES_LITE_HEADER));
     }
 
     #[test]

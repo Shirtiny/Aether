@@ -301,6 +301,24 @@ pub(crate) async fn resolve_local_openai_responses_codex_ws_candidate_parts(
             transport,
             provider_api_format,
         );
+        // The handshake user-agent is the one the client-side identity in the
+        // step bodies must agree with, so the release follow that moves this
+        // account's version token forward runs here, on the handshake headers,
+        // before the candidate is frozen. The runtime copies the effective
+        // user-agent off `candidate.headers` when it builds the step bodies.
+        let _ = crate::ai_serving::apply_codex_pool_client_release_headers(
+            &state.runtime_state,
+            transport,
+            &mut provider_request_headers,
+            effective_headers,
+        )
+        .await;
+        crate::codex_routing_hint::apply_responses_lite_header(
+            &transport.provider.provider_type,
+            provider_api_format,
+            &mut provider_request_headers,
+            prepared.mapped_model.as_str(),
+        );
     }
 
     Ok(Some(LocalOpenAiResponsesCodexWsCandidateParts {
