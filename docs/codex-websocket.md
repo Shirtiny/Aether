@@ -106,6 +106,16 @@ adapter_proof_version=1
 一旦 Provider write 的结果不确定，Aether 不会把当前 step 自动投递到另一个账号。
 这条限制用于避免重复执行和重复计费。
 
+候选规划成功且原生 WS 候选集为空时，Aether 在写入 Provider 前发送
+`client_reconnect`，携带 `reason=candidate_unavailable`、
+`middle_route_disposition=exclude` 和上述未执行证明。sub2api 可据此尝试其他中间路由；
+仅当所有可用 WS 路由均被明确排除时，才在客户端下一次 Upgrade 返回 HTTP 426，
+让支持该约定的客户端切换到 HTTP/SSE。已完成的 WS Upgrade 不能改写成 HTTP 426。
+
+目录切换、热状态 fence 拒绝已规划候选、规划失败、容量不足和粘性连接临时故障
+不等于 WS 不受支持，仍保留原有 `retain`/重试语义；不能仅凭连接关闭、503 或任意
+`exclude` 就宣告 WS 路由耗尽。鉴权/策略拒绝与执行状态不明的请求不得用此机制降级重放。
+
 ## 3. 隐藏的全局熔断
 
 系统配置 key 为 `codex_ws`。它只控制 Codex adapter，不控制 Standard adapter，也不再

@@ -1740,6 +1740,11 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 hot_rejected_attempts,
             )
             .await;
+            if candidates.is_empty() {
+                return Err(StepPreparationError::retain(
+                    "account_catalog_changed_during_selection",
+                ));
+            }
         }
         Ok(candidates)
     }

@@ -1316,6 +1316,13 @@ async fn connect_candidates_for_step(
     step_usage: &mut StepUsageLifecycleGuard<'_>,
     candidates: Vec<CodexWsCandidate>,
 ) -> Result<ConnectedCandidate, CandidateConnectionError> {
+    if candidates.is_empty() {
+        let error = runtime
+            .validate_runtime_fences()
+            .err()
+            .unwrap_or_else(|| StepPreparationError::exclude("candidate_unavailable"));
+        return Err(CandidateConnectionError::Unavailable(error));
+    }
     let connect_deadline =
         tokio::time::Instant::now() + initial_connect_budget(candidates.as_slice());
     let mut remaining_candidates = RemainingCandidatesGuard::new(runtime, candidates);
@@ -4278,6 +4285,96 @@ mod tests {
             })
     }
 
+    fn sent_route_control(sent: &Arc<Mutex<Vec<RelayFrame>>>) -> serde_json::Value {
+        sent.lock()
+            .expect("client frames should lock")
+            .iter()
+            .filter_map(|frame| match frame {
+                RelayFrame::Text(text) => serde_json::from_slice::<serde_json::Value>(text).ok(),
+                _ => None,
+            })
+            .find(|event| event["type"] == "aether.route_control")
+            .expect("route control should be sent")
+    }
+
+    #[tokio::test]
+    async fn empty_candidate_set_excludes_middle_route_before_any_provider_write() {
+        let (official, official_sent) = ScriptedPeer::new([]);
+        let runtime = TestRuntime::new(Box::new(official), false);
+        runtime.only_first_provider();
+        let (client, client_sent) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        assert_eq!(runtime.select_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.connect_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.prepare_calls.load(Ordering::Relaxed), 0);
+        assert!(official_sent
+            .lock()
+            .expect("official frames should lock")
+            .is_empty());
+        let control = sent_route_control(&client_sent);
+        assert_eq!(control["action"], "client_reconnect");
+        assert_eq!(control["reason"], "candidate_unavailable");
+        assert_eq!(control["middle_route_disposition"], "exclude");
+        assert_eq!(
+            control["adapter_proof_class"],
+            "codex_official_ws.not_executed"
+        );
+        assert_eq!(control["adapter_proof_version"], 1);
+        assert!(client_sent
+            .lock()
+            .expect("client frames should lock")
+            .contains(&RelayFrame::Close));
+    }
+
+    #[tokio::test]
+    async fn empty_candidate_set_does_not_mask_runtime_fence_failure() {
+        let (official, _) = ScriptedPeer::new([]);
+        let runtime = TestRuntime::with_runtime_fences(
+            Box::new(official),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        runtime.only_first_provider();
+        let (client, client_sent) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
+
+        run_codex_ws_session(Box::new(client), &runtime).await;
+
+        assert_eq!(runtime.connect_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            sent_route_control(&client_sent)["reason"],
+            "codex_ws_global_configuration_changed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selection_failures_retain_middle_route_without_claiming_no_candidates() {
+        for reason in [
+            "account_catalog_changed_during_selection",
+            "account_catalog_transitioning",
+            "candidate_planning_failed",
+        ] {
+            let (official, _) = ScriptedPeer::new([]);
+            let runtime = TestRuntime::new(Box::new(official), false);
+            runtime.only_first_provider();
+            runtime
+                .selection_failures
+                .lock()
+                .expect("selection failures should lock")
+                .extend([reason, reason]);
+            let (client, client_sent) =
+                ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
+
+            run_codex_ws_session(Box::new(client), &runtime).await;
+
+            assert_eq!(runtime.connect_calls.load(Ordering::Relaxed), 0);
+            let control = sent_route_control(&client_sent);
+            assert_eq!(control["reason"], reason);
+            assert_eq!(control["middle_route_disposition"], "retain");
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn falls_back_before_write_and_releases_step_permit_after_exactly_one_report() {
         let created = json!({
@@ -4362,7 +4459,7 @@ mod tests {
         let (official, _) = ScriptedPeer::new([]);
         let runtime = TestRuntime::new(Box::new(official), true);
         runtime.use_established_sticky_binding();
-        let (client, _) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
+        let (client, client_sent) = ScriptedPeer::new([(Duration::ZERO, relay_text(request()))]);
 
         run_codex_ws_session(Box::new(client), &runtime).await;
 
@@ -4382,6 +4479,10 @@ mod tests {
                 .lock()
                 .expect("unused candidates should lock"),
             vec!["provider-selected", "provider-unused"]
+        );
+        assert_eq!(
+            sent_route_control(&client_sent)["middle_route_disposition"],
+            "retain"
         );
     }
 
@@ -4479,6 +4580,10 @@ mod tests {
             &client_sent,
             "official_ws_account_rate_limited"
         ));
+        assert_eq!(
+            sent_route_control(&client_sent)["middle_route_disposition"],
+            "retain"
+        );
     }
 
     #[tokio::test]
