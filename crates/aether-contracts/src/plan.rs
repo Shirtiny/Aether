@@ -7,6 +7,21 @@ pub const EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER: &str = "x-aether-execution-
 pub const EXECUTION_REQUEST_HTTP1_ONLY_HEADER: &str = "x-aether-execution-http1-only";
 pub const EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER: &str =
     "x-aether-execution-accept-invalid-certs";
+/// Every execution transport control header shares this prefix; the transport
+/// strips the whole prefix so an unknown control never reaches an upstream.
+pub const EXECUTION_REQUEST_CONTROL_HEADER_PREFIX: &str = "x-aether-execution-";
+/// Requests the transport to emit request headers in a named client's wire
+/// order instead of the plan's alphabetical map order.
+pub const EXECUTION_REQUEST_HEADER_ORDER_HEADER: &str = "x-aether-execution-header-order";
+pub const EXECUTION_HEADER_ORDER_CODEX_CLI: &str = "codex-cli";
+/// Requests the transport to compress a JSON request body on the wire
+/// (`content-encoding`), the way the named client does.
+pub const EXECUTION_REQUEST_BODY_ENCODING_HEADER: &str = "x-aether-execution-request-body-encoding";
+pub const EXECUTION_REQUEST_BODY_ENCODING_ZSTD: &str = "zstd";
+/// Selects a gateway-side cookie jar for the request: the transport replays
+/// the jar's cookies and ingests the response's `set-cookie` headers.
+pub const EXECUTION_REQUEST_COOKIE_JAR_HEADER: &str = "x-aether-execution-cookie-jar";
+pub const EXECUTION_COOKIE_JAR_CHATGPT_CLOUDFLARE: &str = "chatgpt-cloudflare";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]

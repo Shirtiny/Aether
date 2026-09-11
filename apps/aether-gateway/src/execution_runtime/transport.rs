@@ -3,12 +3,15 @@ use std::error::Error as _;
 use std::future::Future;
 use std::io::Read;
 use std::io::Write;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use aether_contracts::{
     ExecutionPlan, ExecutionResult, ExecutionTelemetry, ProxySnapshot, ResolvedTransportProfile,
-    ResponseBody, EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER,
-    EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER, EXECUTION_REQUEST_HTTP1_ONLY_HEADER,
+    ResponseBody, EXECUTION_COOKIE_JAR_CHATGPT_CLOUDFLARE, EXECUTION_HEADER_ORDER_CODEX_CLI,
+    EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER, EXECUTION_REQUEST_BODY_ENCODING_HEADER,
+    EXECUTION_REQUEST_BODY_ENCODING_ZSTD, EXECUTION_REQUEST_CONTROL_HEADER_PREFIX,
+    EXECUTION_REQUEST_COOKIE_JAR_HEADER, EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER,
+    EXECUTION_REQUEST_HEADER_ORDER_HEADER, EXECUTION_REQUEST_HTTP1_ONLY_HEADER,
     TRANSPORT_BACKEND_BROWSER_WREQ, TRANSPORT_BACKEND_REQWEST_DEFAULT_TLS,
     TRANSPORT_BACKEND_REQWEST_RUSTLS, TRANSPORT_HTTP_MODE_HTTP1_ONLY,
 };
@@ -20,7 +23,7 @@ use flate2::read::{DeflateDecoder, GzDecoder};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, COOKIE, SET_COOKIE};
 use reqwest::redirect::Policy;
 use serde::Serialize;
 use serde_json::json;
@@ -28,6 +31,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::ai_serving::api::extract_provider_private_stream_error_body;
+use crate::execution_runtime::chatgpt_cloudflare_cookies;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::execute_sync_plan_via_remote_execution_runtime;
 use crate::execution_runtime::windsurf::maybe_execute_windsurf_sync;
@@ -206,6 +210,40 @@ pub(crate) struct ExecutionTransportControls {
     follow_redirects: Option<bool>,
     http1_only: bool,
     accept_invalid_certs: bool,
+    header_order: ExecutionHeaderOrder,
+    request_body_encoding: ExecutionRequestBodyEncoding,
+    cookie_jar: ExecutionCookieJar,
+}
+
+/// Wire order of the request headers (`x-aether-execution-header-order`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ExecutionHeaderOrder {
+    /// The plan's `BTreeMap` order (alphabetical).
+    #[default]
+    PlanOrder,
+    /// The order codex-rs puts its `/backend-api/codex/*` headers on the wire.
+    CodexCli,
+}
+
+/// Wire encoding of a JSON request body
+/// (`x-aether-execution-request-body-encoding`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ExecutionRequestBodyEncoding {
+    #[default]
+    Identity,
+    /// `zstd` level 3 + `content-encoding: zstd`, as codex-rs does for
+    /// `/responses` (`http-client/src/request.rs`).
+    Zstd,
+}
+
+/// Gateway-side cookie jar consulted for the request
+/// (`x-aether-execution-cookie-jar`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ExecutionCookieJar {
+    #[default]
+    None,
+    /// Cloudflare cookies of the ChatGPT hosts, keyed by the plan's key id.
+    ChatgptCloudflare,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -380,11 +418,8 @@ pub(crate) async fn execute_stream_plan_via_local_tunnel(
 
     let body_bytes = build_request_body(plan)?;
     let transport_controls = resolve_execution_transport_controls(&plan.headers);
-    let headers = build_request_headers(
-        &plan.headers,
-        plan.content_encoding.as_deref(),
-        plan.body.body_bytes_b64.is_some(),
-    )?;
+    let mut headers = build_plan_request_headers(plan)?;
+    apply_request_cookie_jar(plan, transport_controls.cookie_jar, &mut headers);
     let started_at = Instant::now();
     let response = state
         .tunnel
@@ -396,6 +431,7 @@ pub(crate) async fn execute_stream_plan_via_local_tunnel(
         .await
         .map_err(ExecutionRuntimeTransportError::RelayError)?;
     let status_code = response.status();
+    ingest_response_cookie_pairs(plan, transport_controls.cookie_jar, response.headers());
     let headers = collect_tunnel_response_headers(response.headers());
 
     Ok(Some(DirectUpstreamStreamExecution {
@@ -501,11 +537,8 @@ async fn execute_sync_plan_via_local_tunnel_inner(
 
     let body_bytes = build_request_body(plan)?;
     let transport_controls = resolve_execution_transport_controls(&plan.headers);
-    let headers = build_request_headers(
-        &plan.headers,
-        plan.content_encoding.as_deref(),
-        plan.body.body_bytes_b64.is_some(),
-    )?;
+    let mut headers = build_plan_request_headers(plan)?;
+    apply_request_cookie_jar(plan, transport_controls.cookie_jar, &mut headers);
     let timeout_secs = resolve_relay_timeout_seconds(plan);
     tracing::info!(
         request_id = %plan.request_id,
@@ -534,6 +567,7 @@ async fn execute_sync_plan_via_local_tunnel_inner(
         .map_err(ExecutionRuntimeTransportError::RelayError)?;
     let ttfb_ms = started_at.elapsed().as_millis() as u64;
     let status_code = response.status();
+    ingest_response_cookie_pairs(plan, transport_controls.cookie_jar, response.headers());
     let headers = collect_tunnel_response_headers(response.headers());
     let proxy_timing = execution_header_for_log(&headers, "x-proxy-timing").unwrap_or("-");
     let (body_bytes, stream_ttfb_ms) =
@@ -667,11 +701,8 @@ async fn send_request_inner(
 
     let method = plan.method.parse::<reqwest::Method>()?;
     let transport_controls = resolve_execution_transport_controls(&plan.headers);
-    let headers = build_request_headers(
-        &plan.headers,
-        plan.content_encoding.as_deref(),
-        plan.body.body_bytes_b64.is_some(),
-    )?;
+    let mut headers = build_plan_request_headers(plan)?;
+    apply_request_cookie_jar(plan, transport_controls.cookie_jar, &mut headers);
     let total_timeout = if apply_request_total_timeout {
         resolve_non_stream_total_timeout(plan)
     } else {
@@ -680,7 +711,7 @@ async fn send_request_inner(
     let stream_first_byte_timeout = resolve_stream_first_byte_timeout(plan);
 
     if transport_profile_uses_browser_wreq(plan.transport_profile.as_ref()) {
-        return send_via_browser_wreq_transport(
+        let response = send_via_browser_wreq_transport(
             plan,
             method,
             headers,
@@ -690,11 +721,17 @@ async fn send_request_inner(
             transport_controls,
             apply_request_total_timeout,
         )
-        .await;
+        .await?;
+        ingest_response_cookies(
+            plan,
+            transport_controls.cookie_jar,
+            response.set_cookie_values().iter().map(String::as_str),
+        );
+        return Ok(response);
     }
 
     if let Some(node_id) = resolve_tunnel_node_id(plan.proxy.as_ref()) {
-        return send_via_tunnel_relay(
+        let response = send_via_tunnel_relay(
             plan,
             method,
             headers,
@@ -705,7 +742,13 @@ async fn send_request_inner(
             transport_controls,
         )
         .await
-        .map(DirectHttpResponse::Reqwest);
+        .map(DirectHttpResponse::Reqwest)?;
+        ingest_response_cookies(
+            plan,
+            transport_controls.cookie_jar,
+            response.set_cookie_values().iter().map(String::as_str),
+        );
+        return Ok(response);
     }
 
     let client = build_client(
@@ -746,9 +789,15 @@ async fn send_request_inner(
     if let Some(timeout) = total_timeout {
         request = request.timeout(timeout);
     }
-    send_reqwest_request(request, stream_first_byte_timeout)
+    let response = send_reqwest_request(request, stream_first_byte_timeout)
         .await
-        .map(DirectHttpResponse::Reqwest)
+        .map(DirectHttpResponse::Reqwest)?;
+    ingest_response_cookies(
+        plan,
+        transport_controls.cookie_jar,
+        response.set_cookie_values().iter().map(String::as_str),
+    );
+    Ok(response)
 }
 
 pub(crate) enum DirectHttpResponse {
@@ -770,6 +819,15 @@ impl DirectHttpResponse {
             DirectHttpResponse::BrowserWreq(response) => {
                 collect_response_headers(response.headers())
             }
+        }
+    }
+
+    /// Every `set-cookie` value of the response, in order (the string map
+    /// above collapses repeated headers).
+    fn set_cookie_values(&self) -> Vec<String> {
+        match self {
+            DirectHttpResponse::Reqwest(response) => set_cookie_values(response.headers()),
+            DirectHttpResponse::BrowserWreq(response) => set_cookie_values(response.headers()),
         }
     }
 
@@ -1105,6 +1163,8 @@ pub(crate) fn build_request_body(
 
     if should_gzip_request_body(plan) && plan.body.json_body.is_some() {
         body_bytes = gzip_bytes(&body_bytes)?;
+    } else if should_zstd_request_body(plan) {
+        body_bytes = zstd_bytes(&body_bytes)?;
     }
 
     Ok(body_bytes)
@@ -1115,6 +1175,52 @@ fn should_gzip_request_body(plan: &ExecutionPlan) -> bool {
         normalize_content_encoding(plan.content_encoding.as_deref()).as_deref(),
         Some("gzip")
     )
+}
+
+/// zstd applies to JSON bodies the gateway serializes itself, either because
+/// the plan says `content_encoding: zstd` (like gzip) or because the zstd
+/// control is set and the plan names no encoding. An explicit plan encoding
+/// always wins over the control; raw byte bodies pass through untouched.
+fn should_zstd_request_body(plan: &ExecutionPlan) -> bool {
+    if plan.body.json_body.is_none() {
+        return false;
+    }
+    match normalize_content_encoding(plan.content_encoding.as_deref()).as_deref() {
+        Some(EXECUTION_REQUEST_BODY_ENCODING_ZSTD) => true,
+        None => {
+            resolve_execution_transport_controls(&plan.headers).request_body_encoding
+                == ExecutionRequestBodyEncoding::Zstd
+        }
+        Some(_) => false,
+    }
+}
+
+/// `content-encoding` the wire body really carries after [`build_request_body`].
+fn effective_request_content_encoding(plan: &ExecutionPlan) -> Option<String> {
+    if should_zstd_request_body(plan) {
+        return Some(EXECUTION_REQUEST_BODY_ENCODING_ZSTD.to_string());
+    }
+    plan.content_encoding.clone()
+}
+
+/// Request headers for `plan`, with the `content-encoding` that matches the
+/// body [`build_request_body`] produces.
+pub(crate) fn build_plan_request_headers(
+    plan: &ExecutionPlan,
+) -> Result<HeaderMap, ExecutionRuntimeTransportError> {
+    build_request_headers(
+        &plan.headers,
+        effective_request_content_encoding(plan).as_deref(),
+        plan.body.body_bytes_b64.is_some(),
+    )
+}
+
+/// Level 3 is what codex-rs uses (`zstd::stream::encode_all(.., 3)`).
+const ZSTD_REQUEST_BODY_LEVEL: i32 = 3;
+
+fn zstd_bytes(body_bytes: &[u8]) -> Result<Vec<u8>, ExecutionRuntimeTransportError> {
+    zstd::stream::encode_all(body_bytes, ZSTD_REQUEST_BODY_LEVEL)
+        .map_err(|err| ExecutionRuntimeTransportError::RelayError(err.to_string()))
 }
 
 fn normalize_content_encoding(value: Option<&str>) -> Option<String> {
@@ -1696,10 +1802,11 @@ pub(crate) fn build_request_headers(
     content_encoding: Option<&str>,
     allow_passthrough_content_encoding: bool,
 ) -> Result<HeaderMap, ExecutionRuntimeTransportError> {
+    let controls = resolve_execution_transport_controls(headers);
     let mut out = HeaderMap::new();
     let normalized_content_encoding = normalize_content_encoding(content_encoding);
     if let Some(encoding) = normalized_content_encoding.as_deref() {
-        if encoding != "gzip" && !allow_passthrough_content_encoding {
+        if !is_gateway_encoded_content_encoding(encoding) && !allow_passthrough_content_encoding {
             return Err(ExecutionRuntimeTransportError::UnsupportedContentEncoding(
                 encoding.to_string(),
             ));
@@ -1707,11 +1814,11 @@ pub(crate) fn build_request_headers(
     }
     for (key, value) in headers {
         let normalized_key = key.trim().to_ascii_lowercase();
+        // Every `x-aether-execution-*` header is a transport control; an
+        // unknown one must be dropped, never forwarded upstream.
         if is_hop_by_hop_header(&normalized_key)
             || normalized_key == "content-encoding"
-            || normalized_key == EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER
-            || normalized_key == EXECUTION_REQUEST_HTTP1_ONLY_HEADER
-            || normalized_key == EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER
+            || normalized_key.starts_with(EXECUTION_REQUEST_CONTROL_HEADER_PREFIX)
         {
             continue;
         }
@@ -1730,7 +1837,15 @@ pub(crate) fn build_request_headers(
             })?,
         );
     }
-    Ok(out)
+    Ok(match controls.header_order {
+        ExecutionHeaderOrder::PlanOrder => out,
+        ExecutionHeaderOrder::CodexCli => order_request_headers_like_codex_cli(out),
+    })
+}
+
+/// Encodings [`build_request_body`] can produce for a JSON body.
+fn is_gateway_encoded_content_encoding(encoding: &str) -> bool {
+    encoding == "gzip" || encoding == EXECUTION_REQUEST_BODY_ENCODING_ZSTD
 }
 
 fn resolve_execution_transport_controls(
@@ -1751,7 +1866,218 @@ fn resolve_execution_transport_controls(
         )
         .and_then(|value| parse_execution_transport_bool(value))
         .unwrap_or(false),
+        header_order: match execution_transport_header_value(
+            headers,
+            EXECUTION_REQUEST_HEADER_ORDER_HEADER,
+        ) {
+            Some(value)
+                if value
+                    .trim()
+                    .eq_ignore_ascii_case(EXECUTION_HEADER_ORDER_CODEX_CLI) =>
+            {
+                ExecutionHeaderOrder::CodexCli
+            }
+            _ => ExecutionHeaderOrder::PlanOrder,
+        },
+        request_body_encoding: match execution_transport_header_value(
+            headers,
+            EXECUTION_REQUEST_BODY_ENCODING_HEADER,
+        ) {
+            Some(value)
+                if value
+                    .trim()
+                    .eq_ignore_ascii_case(EXECUTION_REQUEST_BODY_ENCODING_ZSTD) =>
+            {
+                ExecutionRequestBodyEncoding::Zstd
+            }
+            _ => ExecutionRequestBodyEncoding::Identity,
+        },
+        cookie_jar: match execution_transport_header_value(
+            headers,
+            EXECUTION_REQUEST_COOKIE_JAR_HEADER,
+        ) {
+            Some(value)
+                if value
+                    .trim()
+                    .eq_ignore_ascii_case(EXECUTION_COOKIE_JAR_CHATGPT_CLOUDFLARE) =>
+            {
+                ExecutionCookieJar::ChatgptCloudflare
+            }
+            _ => ExecutionCookieJar::None,
+        },
     }
+}
+
+/// Replays the selected jar's cookies as the request `cookie` header. Runs
+/// after header ordering, so `cookie` lands last like reqwest's own jar does
+/// (the official client's `cookie` sits right before `host`). An explicit
+/// plan `cookie` header always wins.
+fn apply_request_cookie_jar(
+    plan: &ExecutionPlan,
+    jar: ExecutionCookieJar,
+    headers: &mut HeaderMap,
+) {
+    if jar != ExecutionCookieJar::ChatgptCloudflare || headers.contains_key(COOKIE) {
+        return;
+    }
+    let Some(cookie) = chatgpt_cloudflare_cookies::request_cookie_header(
+        plan.key_id.as_str(),
+        plan.url.as_str(),
+        SystemTime::now(),
+    ) else {
+        return;
+    };
+    match HeaderValue::from_str(&cookie) {
+        Ok(value) => {
+            headers.insert(COOKIE, value);
+        }
+        Err(_) => tracing::debug!(
+            request_id = %plan.request_id,
+            key_id = %plan.key_id,
+            "gateway execution runtime cookie jar value is not a valid header value"
+        ),
+    }
+}
+
+fn ingest_response_cookies<'a>(
+    plan: &ExecutionPlan,
+    jar: ExecutionCookieJar,
+    set_cookie_values: impl IntoIterator<Item = &'a str>,
+) {
+    if jar != ExecutionCookieJar::ChatgptCloudflare {
+        return;
+    }
+    let stored = chatgpt_cloudflare_cookies::ingest_set_cookie_headers(
+        plan.key_id.as_str(),
+        plan.url.as_str(),
+        set_cookie_values,
+        SystemTime::now(),
+    );
+    if stored > 0 {
+        tracing::debug!(
+            request_id = %plan.request_id,
+            key_id = %plan.key_id,
+            upstream_host = %execution_log_url_host(plan.url.as_str()),
+            stored,
+            "gateway execution runtime cookie jar stored response cookies"
+        );
+    }
+}
+
+fn ingest_response_cookie_pairs(
+    plan: &ExecutionPlan,
+    jar: ExecutionCookieJar,
+    headers: &[(String, String)],
+) {
+    ingest_response_cookies(
+        plan,
+        jar,
+        headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(SET_COOKIE.as_str()))
+            .map(|(_, value)| value.as_str()),
+    );
+}
+
+fn set_cookie_values(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok().map(str::to_owned))
+        .collect()
+}
+
+/// Header names codex-rs puts first on `/backend-api/codex/*` requests, in
+/// wire order. Observed on a direct-login 0.154.0 `POST /responses`:
+/// `version`, `x-codex-beta-features`, `x-codex-turn-state`,
+/// `x-codex-window-id`, `x-codex-turn-metadata`,
+/// `x-openai-internal-codex-responses-lite`, `x-codex-routing-hint`,
+/// `x-client-request-id`, `session-id`, `thread-id`. Headers the capture did
+/// not carry are slotted where `core/src/client.rs` builds them
+/// (`x-codex-installation-id` leads the compact extra headers,
+/// `x-openai-memgen-request` follows the compatibility headers,
+/// `x-oai-attestation` precedes the lite flag).
+const CODEX_CLI_LEADING_HEADER_ORDER: &[&str] = &[
+    "version",
+    "x-codex-installation-id",
+    "x-codex-beta-features",
+    "x-codex-turn-state",
+    "x-codex-window-id",
+    "x-codex-turn-metadata",
+    "x-openai-memgen-request",
+    "x-oai-attestation",
+    "x-openai-internal-codex-responses-lite",
+    "x-codex-routing-hint",
+    "x-client-request-id",
+    "session-id",
+    "thread-id",
+    "x-codex-parent-thread-id",
+    "x-openai-subagent",
+];
+
+/// Header names codex-rs (reqwest defaults + auth) puts last, in wire order:
+/// `accept`, `content-encoding`, `content-type`, `authorization`,
+/// `chatgpt-account-id`, `originator`, `user-agent`, then the residency
+/// default header and the cookie jar; hyper appends `host` and
+/// `content-length` itself.
+const CODEX_CLI_TRAILING_HEADER_ORDER: &[&str] = &[
+    "accept",
+    "content-encoding",
+    "content-type",
+    "authorization",
+    "chatgpt-account-id",
+    "originator",
+    "user-agent",
+    "x-openai-internal-codex-residency",
+    "cookie",
+];
+
+/// Leading names first (in list order), then everything else in the order it
+/// came, then the trailing names (in list order). A stable sort keeps the
+/// relative order of unknown headers and of repeated values.
+/// (`HeaderMap::remove` swap-removes and would scramble the middle bucket,
+/// so the map is drained once instead.)
+fn order_request_headers_like_codex_cli(headers: HeaderMap) -> HeaderMap {
+    fn rank(name: &HeaderName) -> (u8, usize) {
+        let name = name.as_str();
+        if let Some(index) = CODEX_CLI_LEADING_HEADER_ORDER
+            .iter()
+            .position(|leading| *leading == name)
+        {
+            return (0, index);
+        }
+        if let Some(index) = CODEX_CLI_TRAILING_HEADER_ORDER
+            .iter()
+            .position(|trailing| *trailing == name)
+        {
+            return (2, index);
+        }
+        (1, 0)
+    }
+
+    let mut entries = drain_header_entries(headers);
+    entries.sort_by_key(|(name, _)| rank(name));
+    let mut ordered = HeaderMap::with_capacity(entries.len());
+    for (name, value) in entries {
+        ordered.append(name, value);
+    }
+    ordered
+}
+
+/// `(name, value)` pairs in wire order; `HeaderMap::drain` yields the name
+/// only for the first value of a repeated header.
+fn drain_header_entries(mut headers: HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
+    let mut entries = Vec::with_capacity(headers.len());
+    let mut current: Option<HeaderName> = None;
+    for (name, value) in headers.drain() {
+        if let Some(name) = name {
+            current = Some(name);
+        }
+        if let Some(name) = current.as_ref() {
+            entries.push((name.clone(), value));
+        }
+    }
+    entries
 }
 
 fn execution_transport_header_value<'a>(
@@ -1947,23 +2273,28 @@ mod tests {
     use tokio::sync::watch;
 
     use super::{
-        build_browser_wreq_client, build_client, build_direct_tunnel_request_meta,
-        build_execution_response_body, build_request_headers, execute_sync_plan,
+        apply_request_cookie_jar, build_browser_wreq_client, build_client,
+        build_direct_tunnel_request_meta, build_execution_response_body,
+        build_plan_request_headers, build_request_body, build_request_headers, execute_sync_plan,
+        ingest_response_cookies, order_request_headers_like_codex_cli,
         record_manual_proxy_request_failure, record_manual_proxy_request_outcome,
         record_manual_proxy_request_success, record_manual_proxy_stream_error,
         resolve_execution_transport_controls, resolve_non_stream_total_timeout,
         resolve_stream_first_byte_timeout, response_body_is_json, DirectSyncExecutionRuntime,
+        ExecutionCookieJar, ExecutionHeaderOrder, ExecutionRequestBodyEncoding,
         ExecutionRuntimeTransportError, ExecutionTransportControls,
     };
     use crate::constants::{
         EXECUTION_RUNTIME_LOOP_GUARD_HEADER, EXECUTION_RUNTIME_LOOP_GUARD_VIA_TOKEN,
     };
+    use crate::execution_runtime::chatgpt_cloudflare_cookies;
     use crate::frontdoor_loop_guard::{
         frontdoor_self_loop_public_ai_path, gateway_frontdoor_self_loop_guard_error_with_port,
         gateway_frontdoor_self_loop_guard_matches_with_port,
     };
     use crate::tunnel::{tunnel_protocol, TunnelProxyConn};
     use crate::AppState;
+    use reqwest::header::{HeaderMap, HeaderValue};
 
     const LOCAL_HTTP_SUCCESS_TIMEOUT_MS: u64 = 15_000;
 
@@ -2059,6 +2390,288 @@ mod tests {
         assert!(forwarded
             .get("x-aether-execution-accept-invalid-certs")
             .is_none());
+    }
+
+    #[test]
+    fn every_execution_control_header_is_stripped_by_prefix() {
+        let headers = BTreeMap::from([
+            ("content-type".into(), "application/json".into()),
+            ("x-aether-execution-header-order".into(), "codex-cli".into()),
+            (
+                "x-aether-execution-request-body-encoding".into(),
+                "zstd".into(),
+            ),
+            (
+                "x-aether-execution-cookie-jar".into(),
+                "chatgpt-cloudflare".into(),
+            ),
+            ("X-Aether-Execution-Future-Control".into(), "1".into()),
+            ("x-aether-other".into(), "kept".into()),
+        ]);
+
+        let controls = resolve_execution_transport_controls(&headers);
+        assert_eq!(controls.header_order, ExecutionHeaderOrder::CodexCli);
+        assert_eq!(
+            controls.request_body_encoding,
+            ExecutionRequestBodyEncoding::Zstd
+        );
+        assert_eq!(controls.cookie_jar, ExecutionCookieJar::ChatgptCloudflare);
+
+        let forwarded = build_request_headers(&headers, None, false)
+            .expect("headers should build after stripping internal controls");
+        let keys = forwarded
+            .keys()
+            .map(|key| key.as_str().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            keys.iter()
+                .all(|key| !key.starts_with("x-aether-execution-")),
+            "{keys:?}"
+        );
+        assert_eq!(forwarded.get("x-aether-other").unwrap(), "kept");
+
+        let defaults = resolve_execution_transport_controls(&BTreeMap::from([(
+            "x-aether-execution-header-order".to_string(),
+            "unknown".to_string(),
+        )]));
+        assert_eq!(defaults.header_order, ExecutionHeaderOrder::PlanOrder);
+        assert_eq!(
+            defaults.request_body_encoding,
+            ExecutionRequestBodyEncoding::Identity
+        );
+        assert_eq!(defaults.cookie_jar, ExecutionCookieJar::None);
+    }
+
+    #[test]
+    fn codex_cli_header_order_matches_the_official_responses_wire_order() {
+        let headers = BTreeMap::from([
+            ("accept".to_string(), "text/event-stream".to_string()),
+            ("authorization".into(), "Bearer token".into()),
+            ("chatgpt-account-id".into(), "acct".into()),
+            ("content-type".into(), "application/json".into()),
+            ("originator".into(), "codex_cli_rs".into()),
+            ("session-id".into(), "sess".into()),
+            ("thread-id".into(), "thread".into()),
+            ("user-agent".into(), "codex_cli_rs/0.154.0".into()),
+            ("version".into(), "0.154.0".into()),
+            ("x-client-request-id".into(), "thread".into()),
+            ("x-codex-beta-features".into(), "feature".into()),
+            ("x-codex-routing-hint".into(), "hint".into()),
+            ("x-codex-turn-metadata".into(), "{}".into()),
+            ("x-codex-turn-state".into(), "state".into()),
+            ("x-codex-window-id".into(), "window".into()),
+            (
+                "x-openai-internal-codex-responses-lite".into(),
+                "true".into(),
+            ),
+            ("x-openai-internal-codex-residency".into(), "us".into()),
+            ("x-custom-passthrough".into(), "custom".into()),
+            ("x-other-passthrough".into(), "first, second".into()),
+            ("x-aether-execution-header-order".into(), "codex-cli".into()),
+            (
+                "x-aether-execution-request-body-encoding".into(),
+                "zstd".into(),
+            ),
+        ]);
+
+        let plan = ExecutionPlan {
+            headers,
+            url: "https://chatgpt.com/backend-api/codex/responses".into(),
+            ..tunnel_timeout_plan(true)
+        };
+        let forwarded = build_plan_request_headers(&plan).expect("headers should build");
+        let keys = forwarded
+            .keys()
+            .map(|key| key.as_str().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                "version",
+                "x-codex-beta-features",
+                "x-codex-turn-state",
+                "x-codex-window-id",
+                "x-codex-turn-metadata",
+                "x-openai-internal-codex-responses-lite",
+                "x-codex-routing-hint",
+                "x-client-request-id",
+                "session-id",
+                "thread-id",
+                "x-custom-passthrough",
+                "x-other-passthrough",
+                "accept",
+                "content-encoding",
+                "content-type",
+                "authorization",
+                "chatgpt-account-id",
+                "originator",
+                "user-agent",
+                "x-openai-internal-codex-residency",
+            ]
+        );
+        assert_eq!(forwarded.get("content-encoding").unwrap(), "zstd");
+
+        // Without the control the plan's alphabetical order is kept.
+        let mut plain = plan.clone();
+        plain.headers.remove("x-aether-execution-header-order");
+        let forwarded = build_plan_request_headers(&plain).expect("headers should build");
+        let keys = forwarded
+            .keys()
+            .map(|key| key.as_str().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(keys[0], "accept");
+        assert_eq!(keys[1], "authorization");
+    }
+
+    #[test]
+    fn codex_cli_header_order_keeps_repeated_values_and_unknown_headers_in_place() {
+        let mut headers = HeaderMap::new();
+        headers.append("user-agent", HeaderValue::from_static("ua"));
+        headers.append("x-b", HeaderValue::from_static("b1"));
+        headers.append("x-a", HeaderValue::from_static("a1"));
+        headers.append("x-b", HeaderValue::from_static("b2"));
+        headers.append("version", HeaderValue::from_static("0.154.0"));
+        headers.append("x-a", HeaderValue::from_static("a2"));
+        headers.append("thread-id", HeaderValue::from_static("t"));
+
+        let ordered = order_request_headers_like_codex_cli(headers);
+        let entries = ordered
+            .iter()
+            .map(|(name, value)| format!("{}={}", name.as_str(), value.to_str().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![
+                "version=0.154.0",
+                "thread-id=t",
+                "x-b=b1",
+                "x-b=b2",
+                "x-a=a1",
+                "x-a=a2",
+                "user-agent=ua",
+            ]
+        );
+    }
+
+    #[test]
+    fn zstd_body_encoding_control_compresses_gateway_serialized_json_only() {
+        let mut plan = tunnel_timeout_plan(false);
+        plan.headers.insert(
+            "x-aether-execution-request-body-encoding".into(),
+            "zstd".into(),
+        );
+        let body = build_request_body(&plan).expect("body should build");
+        let decoded = zstd::stream::decode_all(&body[..]).expect("body should be zstd");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&decoded).unwrap(),
+            json!({"model": "gpt-4.1"})
+        );
+        let headers = build_plan_request_headers(&plan).expect("headers should build");
+        assert_eq!(headers.get("content-encoding").unwrap(), "zstd");
+
+        // An explicit plan content encoding wins over the control.
+        let mut gzip_plan = plan.clone();
+        gzip_plan.content_encoding = Some("gzip".into());
+        let body = build_request_body(&gzip_plan).expect("body should build");
+        let mut decoder = flate2::read::GzDecoder::new(&body[..]);
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .expect("body should be gzip");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&decoded).unwrap(),
+            json!({"model": "gpt-4.1"})
+        );
+        let headers = build_plan_request_headers(&gzip_plan).expect("headers should build");
+        assert_eq!(headers.get("content-encoding").unwrap(), "gzip");
+
+        // Raw byte bodies are never touched.
+        let mut raw_plan = plan.clone();
+        raw_plan.body = RequestBody {
+            json_body: None,
+            body_bytes_b64: Some(base64::engine::general_purpose::STANDARD.encode(b"raw")),
+            body_ref: None,
+        };
+        let body = build_request_body(&raw_plan).expect("body should build");
+        assert_eq!(body, b"raw");
+        let headers = build_plan_request_headers(&raw_plan).expect("headers should build");
+        assert!(headers.get("content-encoding").is_none());
+
+        // Without the control nothing changes.
+        let mut plain = plan.clone();
+        plain
+            .headers
+            .remove("x-aether-execution-request-body-encoding");
+        let body = build_request_body(&plain).expect("body should build");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({"model": "gpt-4.1"})
+        );
+        let headers = build_plan_request_headers(&plain).expect("headers should build");
+        assert!(headers.get("content-encoding").is_none());
+    }
+
+    #[test]
+    fn chatgpt_cookie_jar_control_replays_ingested_cloudflare_cookies() {
+        chatgpt_cloudflare_cookies::clear_for_tests();
+        let mut plan = tunnel_timeout_plan(false);
+        plan.key_id = format!("cookie-jar-test-{}", std::process::id());
+        plan.url = "https://chatgpt.com/backend-api/codex/responses".into();
+        plan.headers.insert(
+            "x-aether-execution-cookie-jar".into(),
+            "chatgpt-cloudflare".into(),
+        );
+        plan.headers
+            .insert("x-aether-execution-header-order".into(), "codex-cli".into());
+
+        // Nothing to replay yet.
+        let mut headers = build_plan_request_headers(&plan).expect("headers should build");
+        apply_request_cookie_jar(&plan, ExecutionCookieJar::ChatgptCloudflare, &mut headers);
+        assert!(headers.get("cookie").is_none());
+
+        ingest_response_cookies(
+            &plan,
+            ExecutionCookieJar::ChatgptCloudflare,
+            [
+                "__cf_bm=bm; path=/; domain=.chatgpt.com; HttpOnly; Secure; SameSite=None",
+                "_cfuvid=uvid; path=/; domain=.chatgpt.com; HttpOnly; Secure; SameSite=None",
+                "oai-did=device; Path=/; Secure",
+            ],
+        );
+
+        let mut headers = build_plan_request_headers(&plan).expect("headers should build");
+        apply_request_cookie_jar(&plan, ExecutionCookieJar::ChatgptCloudflare, &mut headers);
+        assert_eq!(headers.get("cookie").unwrap(), "__cf_bm=bm; _cfuvid=uvid");
+        // The cookie is the last header, like reqwest's jar and the official client.
+        assert_eq!(headers.keys().last().unwrap().as_str(), "cookie");
+
+        // A plan cookie is never overridden.
+        let mut own = HeaderMap::new();
+        own.insert("cookie", HeaderValue::from_static("mine=1"));
+        apply_request_cookie_jar(&plan, ExecutionCookieJar::ChatgptCloudflare, &mut own);
+        assert_eq!(own.get("cookie").unwrap(), "mine=1");
+
+        // Other jars / hosts / keys stay isolated.
+        let mut headers = HeaderMap::new();
+        apply_request_cookie_jar(&plan, ExecutionCookieJar::None, &mut headers);
+        assert!(headers.get("cookie").is_none());
+        let mut other_key = plan.clone();
+        other_key.key_id.push_str("-other");
+        apply_request_cookie_jar(
+            &other_key,
+            ExecutionCookieJar::ChatgptCloudflare,
+            &mut headers,
+        );
+        assert!(headers.get("cookie").is_none());
+        let mut other_host = plan.clone();
+        other_host.url = "https://api.openai.com/v1/responses".into();
+        apply_request_cookie_jar(
+            &other_host,
+            ExecutionCookieJar::ChatgptCloudflare,
+            &mut headers,
+        );
+        assert!(headers.get("cookie").is_none());
+        chatgpt_cloudflare_cookies::clear_for_tests();
     }
 
     #[test]

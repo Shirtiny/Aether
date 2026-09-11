@@ -3,13 +3,19 @@
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::SystemTime;
 
+use aether_contracts::{
+    EXECUTION_COOKIE_JAR_CHATGPT_CLOUDFLARE, EXECUTION_HEADER_ORDER_CODEX_CLI,
+    EXECUTION_REQUEST_BODY_ENCODING_HEADER, EXECUTION_REQUEST_BODY_ENCODING_ZSTD,
+    EXECUTION_REQUEST_COOKIE_JAR_HEADER, EXECUTION_REQUEST_HEADER_ORDER_HEADER,
+};
 use aether_runtime_state::RuntimeState;
 use http::HeaderMap;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::codex_client_release::{
     observe_codex_client_release, resolve_codex_client_user_agent, unix_now_secs,
@@ -17,7 +23,8 @@ use crate::codex_client_release::{
 };
 use crate::codex_environment_context::{
     apply_codex_environment_context, environment_context_rewrite_enabled,
-    log_environment_context_report, process_environment_timezone, EnvironmentContextRewriteInput,
+    log_environment_context_report, process_environment_timezone, rewrite_switch_enabled,
+    EnvironmentContextRewriteInput,
 };
 use crate::codex_profile::{
     apply_codex_client_identity_headers, apply_codex_concrete_account_profile_to_request,
@@ -34,6 +41,7 @@ use crate::codex_runtime_identity::{
     CodexRuntimeIdentityResolution, CodexRuntimeIdentityScope, CodexRuntimeIdentityStore,
     CodexRuntimeIdentitySurface, InboundCodexRuntimeIdentity, OutboundCodexRuntimeIdentity,
 };
+use crate::execution_runtime::chatgpt_cloudflare_cookies::is_allowed_chatgpt_host;
 
 pub(crate) use crate::ai_serving::{
     apply_codex_official_ws_handshake_headers, apply_codex_openai_responses_special_body_edits,
@@ -623,6 +631,16 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
             apply_codex_pool_environment_context(body, surface, thread_id, turn_id, now);
         }
     }
+    // The profile pass put `x-codex-installation-id` on the headers so the
+    // identity pass above could read it into the turn-metadata blob and
+    // `client_metadata`; the official client only ever sends the header itself
+    // on `/responses/compact`, so it comes off the other surfaces here.
+    align_codex_installation_id_header_with_surface(
+        transport,
+        provider_request_headers,
+        surface,
+        codex_transport_fidelity_enabled(),
+    );
 
     // Endpoint request-header rules are an explicit operator override.  Apply
     // them after Codex identity sanitation so a configured header is not
@@ -638,7 +656,128 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
         original_body,
         Some(original_headers),
     );
+    // Transport-level fidelity (header order, body encoding, cookie jar) is
+    // decided last: it depends only on where the request goes, never on the
+    // identity switch, and the transport strips the controls before egress.
+    apply_codex_transport_fidelity_controls(
+        transport,
+        provider_request_headers,
+        surface,
+        codex_transport_fidelity_enabled(),
+    );
     outbound
+}
+
+/// Process-level kill switch for [`apply_codex_transport_fidelity_controls`]
+/// (`AETHER_CODEX_TRANSPORT_FIDELITY=off|0|false|disabled|no`).
+fn codex_transport_fidelity_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        rewrite_switch_enabled(
+            std::env::var("AETHER_CODEX_TRANSPORT_FIDELITY")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Asks the execution transport to put a Codex pool request on the wire the
+/// way codex-rs does when it talks to the ChatGPT backend.
+///
+/// A direct-login codex-rs 0.154.0 capture shows, on every
+/// `/backend-api/codex/*` request: a fixed header order (`version`,
+/// `x-codex-beta-features`, …, `session-id`, `thread-id`, then `accept`,
+/// `content-encoding`, `content-type`, `authorization`, `chatgpt-account-id`,
+/// `originator`, `user-agent`, `cookie`, `host`), a zstd-compressed
+/// `/responses` body (`content-encoding: zstd`, `http-client/src/request.rs`,
+/// `EnableRequestCompression` stable since 0.120.0) and Cloudflare's
+/// `_cfuvid` / `__cf_bm` / `__cflb` cookies replayed from a process-wide jar
+/// (`http-client/src/chatgpt_cloudflare_cookies.rs`, ≥ 0.143.0). Aether used
+/// to send alphabetical headers, identity bodies and no cookie at all, which
+/// is what no real client looks like.
+///
+/// The controls are `x-aether-execution-*` headers consumed and stripped by
+/// the execution transport; nothing here reaches the upstream as a header.
+/// Only Codex providers whose endpoint targets a ChatGPT host over `https`
+/// qualify; relays and mirrors keep the plain behaviour. `/responses/compact`
+/// and the header-only surfaces are not compressed because codex-rs only
+/// compresses the `/responses` stream body.
+pub(crate) fn apply_codex_transport_fidelity_controls(
+    transport: &GatewayProviderTransportSnapshot,
+    provider_request_headers: &mut BTreeMap<String, String>,
+    surface: CodexRuntimeIdentitySurface,
+    enabled: bool,
+) {
+    if !codex_wire_shape_alignment_applies(transport, enabled) {
+        return;
+    }
+    provider_request_headers.insert(
+        EXECUTION_REQUEST_HEADER_ORDER_HEADER.to_string(),
+        EXECUTION_HEADER_ORDER_CODEX_CLI.to_string(),
+    );
+    provider_request_headers.insert(
+        EXECUTION_REQUEST_COOKIE_JAR_HEADER.to_string(),
+        EXECUTION_COOKIE_JAR_CHATGPT_CLOUDFLARE.to_string(),
+    );
+    if surface == CodexRuntimeIdentitySurface::HttpResponses {
+        provider_request_headers.insert(
+            EXECUTION_REQUEST_BODY_ENCODING_HEADER.to_string(),
+            EXECUTION_REQUEST_BODY_ENCODING_ZSTD.to_string(),
+        );
+    }
+}
+
+/// Drops the `x-codex-installation-id` request header everywhere but on
+/// `/responses/compact`, the only request codex-rs puts it on
+/// (`core/src/client.rs`: it leads the compact extra headers, while
+/// `build_responses_options` and `compatibility_headers()` never add it; the
+/// 0.154.0 capture shows no such header on `/responses`, `/alpha/search`,
+/// `/models` or the analytics beacon). The installation id still travels
+/// where the official client carries it — inside `x-codex-turn-metadata` and
+/// the body `client_metadata` — which the profile and identity passes filled
+/// before this runs. Same scope and kill switch as
+/// [`apply_codex_transport_fidelity_controls`].
+pub(crate) fn align_codex_installation_id_header_with_surface(
+    transport: &GatewayProviderTransportSnapshot,
+    provider_request_headers: &mut BTreeMap<String, String>,
+    surface: CodexRuntimeIdentitySurface,
+    enabled: bool,
+) {
+    if surface == CodexRuntimeIdentitySurface::HttpCompact
+        || !codex_wire_shape_alignment_applies(transport, enabled)
+    {
+        return;
+    }
+    provider_request_headers.retain(|name, _| {
+        !name
+            .trim()
+            .eq_ignore_ascii_case(X_CODEX_INSTALLATION_ID_HEADER)
+    });
+}
+
+const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
+
+/// The wire-shape alignment covers a Codex provider whose endpoint targets a
+/// ChatGPT host over `https`, unless the kill switch is thrown.
+fn codex_wire_shape_alignment_applies(
+    transport: &GatewayProviderTransportSnapshot,
+    enabled: bool,
+) -> bool {
+    enabled
+        && transport
+            .provider
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case("codex")
+        && is_chatgpt_backend_base_url(transport.endpoint.base_url.as_str())
+}
+
+fn is_chatgpt_backend_base_url(base_url: &str) -> bool {
+    Url::parse(base_url.trim())
+        .ok()
+        .filter(|url| url.scheme() == "https")
+        .and_then(|url| url.host_str().map(is_allowed_chatgpt_host))
+        .unwrap_or(false)
 }
 
 /// Rewrites `<environment_context>` host-clock values for the HTTP surfaces

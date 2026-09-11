@@ -374,6 +374,20 @@ profile 中任意 revision、crypto provider 或 buffer 字段不匹配都会 fa
 `docs/architecture/codex-pool-runtime-identity-synthesis-plan-2026-09-03.md`，线上检查、
 事件处置与回滚见 `docs/operations/codex-runtime-identity-runbook.md`。
 
+**握手头集合与顺序（`.130`）。** 官方直登 codex-rs 0.154.0 的 WS 握手
+（`core/src/client.rs` `build_websocket_headers`，抓包见
+`github.com/Shirtiny/codex-cli-network-analyze` `ws-sse/analysis/ws-protocol.md`）在
+tungstenite 固定的 `Host` / `Connection` / `Upgrade` / `Sec-WebSocket-Version` /
+`Sec-WebSocket-Key` 之后依次是 `chatgpt-account-id`、`authorization`、`user-agent`、
+`originator`、`openai-beta: responses_websockets=2026-02-06`、`version`、
+`x-codex-beta-features`、`x-client-request-id`（= thread）、`session-id`、`thread-id`、
+`x-codex-window-id`、`x-codex-turn-metadata`、`x-codex-routing-hint`，最后是
+`sec-websocket-extensions`。握手**不带** `x-codex-installation-id`、
+`x-openai-internal-codex-responses-lite` 与 `cookie`（前两者在 WS 上走每步
+`client_metadata`，cookie jar 只作用于 HTTP）。Aether 的官方 WS 运行时按同样的顺序
+组装握手头（`codex_ws/runtime.rs` `build_official_ws_handshake_headers`），且不再把这两个
+HTTP-only 头带上握手；任何 `x-aether-*` 内部控制头在握手前被断言不存在。
+
 ## 7. 用量、结算和资源边界
 
 Aether 使用进程级有界队列，不为每个连接或 terminal 创建无界任务：

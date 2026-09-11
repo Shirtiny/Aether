@@ -363,6 +363,39 @@ where provider_id = '<codex pool provider id>';"
 - 直接按**自然日**从出站 blob 去重计数可能看到 4 个：日界不是本地午夜，而是 03:00–06:00 之间，一个自然日能横跨两个开发者日。要精确核对得按开发者日口径（本地时间减去约 3–6 小时后按日切片），或直接看代码不变量 `synthetic_workspace_layout_is_per_account_and_bounded`（单测里滚动 60 个开发者日、每步断言当日不同仓库根 ≤2）。
 - 出站 blob 里应看不到 `/Users/<真实用户>`、真实 owner / 仓库名或 40 位真实 commit；合成 commit 会在每账号每仓库自己的 3h–2d 周期边界换一次（`WORKSPACE_COMMIT_PERIODS_SECS`），这是预期，不是异常。
 
+### 3.11 传输层保真：头顺序 / zstd / Cloudflare cookie / installation-id 头（`.130`）
+
+依据是官方直登 codex-rs 0.154.0 的抓包分析（`github.com/Shirtiny/codex-cli-network-analyze`，`ws-sse/analysis/sse-capture.md`、`sse-all-headers.csv`、`ws-protocol.md`）对照 codex-rs 源码。三处与官方不一致的传输层形状，`.130` 起对**Codex 类型 provider + endpoint base_url 为 `https` 的 ChatGPT 主机**（`chatgpt.com` / `chat.openai.com` / `chatgpt-staging.com` 及其子域，镜像 / 中转不算）自动生效，与「会话身份合成」开关无关：
+
+| 项 | 官方直登 | `.130` 前的 Aether | `.130` |
+| --- | --- | --- | --- |
+| HTTP 头顺序 | `version` → `x-codex-beta-features` → [`x-codex-turn-state`] → `x-codex-window-id` → `x-codex-turn-metadata` → `x-openai-internal-codex-responses-lite` → `x-codex-routing-hint` → `x-client-request-id` → `session-id` → `thread-id` → `accept` → `content-encoding` → `content-type` → `authorization` → `chatgpt-account-id` → `originator` → `user-agent` → `cookie` → `host` → `content-length` | `BTreeMap` 字母序（`accept, authorization, chatgpt-account-id, content-type, originator, session-id, …`） | 按官方顺序（`execution_runtime/transport.rs` `CODEX_CLI_LEADING_HEADER_ORDER` / `CODEX_CLI_TRAILING_HEADER_ORDER`），未列出的头夹在中段保持原顺序 |
+| `/responses` 请求体 | `zstd` level 3 + `content-encoding: zstd`（`http-client/src/request.rs`，`EnableRequestCompression` 自 0.120.0 起默认开） | 明文 JSON，无 `content-encoding` | 只对 `/responses` 表面 zstd；`/responses/compact` 与 header-only 表面（search / chat / family / image）保持明文，与官方一致 |
+| Cloudflare cookie | 进程级 jar 只存 `__cf_bm` / `_cfuvid` / `__cflb` 等 CF 名单 cookie（`http-client/src/chatgpt_cloudflare_cookies.rs`，≥0.143.0），每个 HTTP 请求回放 `cookie: _cfuvid=…; __cf_bm=…; __cflb=…`；WS 握手不带 | 每个请求都无 cookie（每一 turn 都像新进程） | 网关内存 jar，**按账号 key id × 主机**隔离（`execution_runtime/chatgpt_cloudflare_cookies.rs`），名单与官方相同，RFC 6265 过期 / 路径 / Domain 处理；WS 握手不带 |
+| HTTP 版本 / TLS | HTTP/1.1（reqwest 0.12 native-tls 无 `native-tls-alpn` → 不发 ALPN） | 已一致：Codex 默认 transport profile `codex-reqwest-default-tls-auto` 走 native TLS 无 ALPN | 不变 |
+| `x-codex-installation-id` 请求头 | **只在 `/responses/compact` 上发**（`core/src/client.rs` 里它是 compact extra headers 的第一个；`build_responses_options` / `responses_metadata.compatibility_headers()` 都不加）。抓包里 `/responses`、`/alpha/search`、`/models`、analytics 均无此头；installation id 只出现在 `x-codex-turn-metadata` 与 body `client_metadata` 里 | profile pass 给**每个**请求都加该头（身份合成 pass 靠它取 installation id 填 blob 与 `client_metadata`） | 身份合成之后、endpoint header rules 之前，非 compact 表面（`/responses`、header-only、WS 候选头）剥掉该头；blob 与 `client_metadata` 里的 installation id 不变（`align_codex_installation_id_header_with_surface`） |
+
+实现方式：planner 在 `apply_codex_pool_runtime_identity` 末尾给出站头加三个内部控制头 `x-aether-execution-header-order: codex-cli`、`x-aether-execution-request-body-encoding: zstd`（仅 `/responses`）、`x-aether-execution-cookie-jar: chatgpt-cloudflare`；执行传输层读取后**按前缀 `x-aether-execution-` 整体剥掉**再出站（未知控制头也不会漏到上游）。`x-codex-installation-id` 的剥除与三个控制头同一作用域、同一 kill switch。
+
+```bash
+# 1. cookie jar 是否在工作（debug 级别；每次响应带 set-cookie 且被名单接受时一条）
+docker logs aether-app --since 30m 2>&1 | grep -E 'cookie jar (stored|value)' | tail
+```
+
+期望：上线后每个账号首个请求之后就能看到 `stored`，随后大多数请求不再打印（CF 只在刷新 `__cf_bm` 时重发 set-cookie，约 30 分钟一次）。`is not a valid header value` 出现说明上游发了非 ASCII 的 cookie 值，属异常。
+
+```sql
+-- 2. 审计里的出站头不应再出现内部控制头；`content-encoding` 在 /responses 上应为 zstd
+select count(*) n,
+       count(*) filter (where exists (select 1 from jsonb_object_keys(oh) k where k like 'x-aether-execution-%')) leaked_controls,
+       count(*) filter (where oh->>'content-encoding' = 'zstd') zstd
+from (select h.provider_request_headers::jsonb oh from usage_http_audits h join usage u on u.request_id=h.request_id
+      where h.created_at >= :'since' and u.provider_name='Codex Pro'
+        and jsonb_typeof(h.provider_request_headers::jsonb)='object') s;
+```
+
+注意审计里的 `provider_request_headers` 记录的是 planner 输出（**含**控制头、字母序、还没有 `cookie` / `content-encoding`），不是线缆形状；`leaked_controls` 在审计里为正是**预期**的，真正的出站形状只能抓包（`tcpdump` 到 443 看不到明文；用官方分析仓库的 mitm 方法对网关出口抓）。表中 `zstd` 列同理只有 planner 已写入 `content-encoding` 时才计数，正常为 0。真正要核对的是抓包：每个 `/backend-api/codex/responses` 请求头顺序与上表一致、`content-encoding: zstd`、第二个请求起带 `cookie`。
+
 ## 4. 日志事件与处置
 
 ```bash
@@ -472,6 +505,7 @@ from (select (h.provider_request_headers::jsonb->>'x-codex-turn-metadata')::json
 - `codex-rs/core/src/client.rs`：`prompt_cache_key` 规则（override → `internal_<source>:<parent>` → session_id）、`compact_conversation_history`。
 - `codex-rs/codex-api/src/requests/headers.rs`：`build_session_headers`（只有 dash 形式 `session-id` / `thread-id`）。
 - `codex-rs/codex-api/src/endpoint/responses.rs`、`endpoint/compact.rs`：`/responses` 加 `x-client-request-id` = thread，compact 不加。
+- `.130` 传输层保真的基准（按 0.154.0 抓包 + 源码）：`core/src/client.rs` `build_websocket_headers`（WS 握手头顺序）、`build_responses_options`（HTTP 头组装顺序；线缆顺序以抓包为准）；`http-client/src/request.rs`（`zstd::stream::encode_all(.., 3)` + `content-encoding: zstd`，只在 `/responses`）；`http-client/src/chatgpt_cloudflare_cookies.rs`、`chatgpt_hosts.rs`（cookie 名单、允许主机）；`features/src/lib.rs` `EnableRequestCompression`（Stable，默认开）；`core/src/client.rs` compact 路径的 `X_CODEX_INSTALLATION_ID_HEADER`（只有 compact 发这个头）与 `core/src/responses_metadata.rs` `compatibility_headers()`（window-id / turn-metadata / parent-thread / subagent，不含 installation-id）。再核对时看这几处有没有新头 / 新 cookie 名 / 压缩范围变化。
 
 ## 6. 回滚与关闭
 
@@ -481,6 +515,7 @@ from (select (h.provider_request_headers::jsonb->>'x-codex-turn-metadata')::json
 2. **镜像回滚**：按 `docs/operations/release-and-container-update-spec.md`，恢复对应 `.env.bak.<ts>_pre_vX` 的 `APP_IMAGE`，只重建 `app`，须操作员明确授权。**不要回到 .104**（带缓存回退）；.105 是含缓存修复的最低版本；再往前请回 .103 并关开关。
 3. **Redis 键**：`ap:{provider_id}:codex_rid:*` 都有 TTL，回滚后自然过期。不要手动清：清掉等于让所有活跃 thread 换身份，上游看到一批新 thread。
 4. **只关 `<environment_context>` 归一化（.122）**：给 `app` 容器加环境变量 `AETHER_CODEX_ENVIRONMENT_CONTEXT_REWRITE=off`（compose `environment:`）并只重建 `app`，秒级；身份合成不受影响。关掉后出站 `<timezone>` / `<current_date>` 立刻回到下游真实值，上游会看到该账号时区跳变一次。要换目标时区而不是关掉：改 `TZ`（或 `AETHER_CODEX_ENVIRONMENT_TIMEZONE`）后重建 `app`，中国时区会被拒绝并回退到 `America/New_York`（看 `codex_env_tz_rejected`）。
+5. **只关传输层保真（.130）**：给 `app` 容器加 `AETHER_CODEX_TRANSPORT_FIDELITY=off` 并只重建 `app`，秒级。关掉后出站头回到字母序、`/responses` 体回到明文、不再回放 CF cookie、`x-codex-installation-id` 头回到每个请求都带，四项一起关（没有单项开关；单项异常请回滚镜像）。WS 握手头顺序不受此开关影响（那是 WS 运行时的固定组装顺序，没有开关）。
 
 ## 7. 已知限制（不需要处理，只需知道）
 
@@ -504,3 +539,4 @@ from (select h.provider_request_headers::jsonb oh from usage_http_audits h join 
 期望 .107 后 `has_version = version_matches_ua = n`。
 
 - **`<environment_context>` 时区 / 日期归一化（.122）的残余**：只改 `<timezone>` / `<current_date>`，`<cwd>` / `<shell>` 与出站 UA 的 OS 可能不一致（PowerShell 路径配 macOS UA），用户已接受。请求时刻本身改不了：`turn_started_at_unix_ms` 是 UTC epoch，上游始终看得到真实作息节律（14 天样本按美国时区 41–45% 落在本地 00–07 点），要治只能在调度层按账号分「活跃时段」，属独立计划。上线一刻正在进行的线程会被一次性改写历史（tz 换、部分日切块删 / 插），prompt cache 失一次后稳定。无 id 的旧客户端形状只能 best-effort。WS 增量步的状态只活在进程内：重启或换绑后的第一个增量步若正好跨午夜会漏一块，下一 turn 的全量回放会补上。宿主 `/etc/timezone` 陈旧为 `Europe/Berlin` 不影响容器（容器走 `TZ`）。详见 `docs/architecture/codex-environment-context-time-normalization-plan-2026-09-10.md` §9。
+- **传输层保真（.130）的残余**：（a）Cloudflare cookie jar 只在网关进程内存里（上限 4096 个账号×主机 jar、每 jar 32 个 cookie，会话 cookie 24h 不用即失效），重启后第一个请求又是无 cookie 的「新进程」形状；多实例部署各自一份 jar，同一账号跨实例会呈现两套 `__cf_bm`，与官方「一个进程一个 jar」的语义相比是可见但轻微的差异。（b）走 `aether-tunnel` 中继（`proxy.mode = tunnel`）的请求，头顺序在中继协议里被转成 `BTreeMap` 后丢失，中继出口仍是字母序；cookie / zstd 不受影响。直连与浏览器 wreq 后端保持顺序。（c）`x-openai-internal-codex-residency` / `x-oai-attestation` / `x-openai-memgen-request` 抓包里没有，位置按源码组装顺序排，若官方线缆顺序不同属可接受偏差。（d）官方 `/responses` 之外的 HTTP（compact、search）本来就不压缩，Aether 同样不压缩；若未来 codex-rs 扩大压缩范围需要跟进。（e）不做任何 TLS 指纹层面的改动：Codex profile 已是 native TLS 无 ALPN、HTTP/1.1，与官方一致。

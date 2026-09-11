@@ -1088,22 +1088,6 @@ impl GatewayCodexWsRuntime {
             .into_client_request()
             .map_err(|_| PeerError("failed to build official Codex WS request".into()))?;
 
-        copy_official_candidate_headers(request.headers_mut(), &candidate.headers)?;
-        if !request.headers().contains_key(http::header::AUTHORIZATION) {
-            return Err(PeerError(
-                "selected Codex account has no materialized OAuth authorization".into(),
-            ));
-        }
-
-        for name in [
-            "x-codex-beta-features",
-            "x-openai-memgen-request",
-            "x-responsesapi-include-timing-metrics",
-        ] {
-            if let Some(value) = exact_request_header(&self.request_headers, name) {
-                insert_header(request.headers_mut(), name, value)?;
-            }
-        }
         // With pool runtime identity synthesis the handshake presents the
         // candidate's outbound session tree; the inbound official identity
         // keeps owning binding, fencing and settlement.
@@ -1111,71 +1095,69 @@ impl GatewayCodexWsRuntime {
             .runtime_identity
             .as_deref()
             .map(|snapshot| &snapshot.outbound);
-        let session_id = outbound_identity
-            .map(|outbound| outbound.session_id.as_str())
-            .unwrap_or(identity.session_id.as_str());
-        let thread_id = outbound_identity
-            .map(|outbound| outbound.thread_id.as_str())
-            .unwrap_or(identity.thread_id.as_str());
-        insert_header(request.headers_mut(), "session-id", session_id)?;
-        insert_header(request.headers_mut(), "thread-id", thread_id)?;
-        insert_header(request.headers_mut(), "x-client-request-id", thread_id)?;
-        if let Some(window_id) = identity.window_id.as_deref() {
-            let window_id = outbound_identity
-                .map(|outbound| outbound.window_id.as_str())
-                .unwrap_or(window_id);
-            insert_header(request.headers_mut(), "x-codex-window-id", window_id)?;
-        }
-        if outbound_identity.is_none() {
-            if let Some(parent_thread_id) = identity.parent_thread_id.as_deref() {
-                insert_header(
-                    request.headers_mut(),
-                    "x-codex-parent-thread-id",
-                    parent_thread_id,
-                )?;
+        let turn_metadata = match identity.turn_metadata.as_deref() {
+            Some(turn_metadata) => {
+                let normalized_turn_metadata;
+                let turn_metadata = if let Some(profile) = candidate.account_profile.as_deref() {
+                    normalized_turn_metadata =
+                        normalize_codex_turn_metadata_for_profile(turn_metadata, profile)
+                            .ok_or_else(|| {
+                                PeerError("x-codex-turn-metadata is not a valid JSON object".into())
+                            })?;
+                    normalized_turn_metadata.as_str()
+                } else {
+                    turn_metadata
+                };
+                if let Some(outbound) = outbound_identity {
+                    // The blob must match the client the handshake user-agent names.
+                    let user_agent = case_insensitive_btree_value(&candidate.headers, "user-agent");
+                    Some(
+                        rewrite_codex_turn_metadata_string(turn_metadata, outbound, user_agent)
+                            .ok_or_else(|| {
+                                PeerError("x-codex-turn-metadata is not a valid JSON object".into())
+                            })?,
+                    )
+                } else {
+                    Some(turn_metadata.to_string())
+                }
             }
-            if let Some(subagent) = identity.subagent.as_deref() {
-                insert_header(request.headers_mut(), "x-openai-subagent", subagent)?;
-            }
-        }
-        if identity.responses_lite {
-            insert_header(
-                request.headers_mut(),
-                "x-openai-internal-codex-responses-lite",
-                "true",
-            )?;
-        }
-        if let Some(turn_metadata) = identity.turn_metadata.as_deref() {
-            let normalized_turn_metadata;
-            let turn_metadata = if let Some(profile) = candidate.account_profile.as_deref() {
-                normalized_turn_metadata =
-                    normalize_codex_turn_metadata_for_profile(turn_metadata, profile).ok_or_else(
-                        || PeerError("x-codex-turn-metadata is not a valid JSON object".into()),
-                    )?;
-                normalized_turn_metadata.as_str()
+            None => None,
+        };
+        let handshake = OfficialWsHandshakeIdentity {
+            session_id: outbound_identity
+                .map(|outbound| outbound.session_id.as_str())
+                .unwrap_or(identity.session_id.as_str()),
+            thread_id: outbound_identity
+                .map(|outbound| outbound.thread_id.as_str())
+                .unwrap_or(identity.thread_id.as_str()),
+            window_id: identity.window_id.as_deref().map(|window_id| {
+                outbound_identity
+                    .map(|outbound| outbound.window_id.as_str())
+                    .unwrap_or(window_id)
+            }),
+            parent_thread_id: if outbound_identity.is_none() {
+                identity.parent_thread_id.as_deref()
             } else {
-                turn_metadata
-            };
-            let synthesized_turn_metadata;
-            let turn_metadata = if let Some(outbound) = outbound_identity {
-                // The blob must match the client the handshake user-agent names.
-                let user_agent = case_insensitive_btree_value(&candidate.headers, "user-agent");
-                synthesized_turn_metadata =
-                    rewrite_codex_turn_metadata_string(turn_metadata, outbound, user_agent)
-                        .ok_or_else(|| {
-                            PeerError("x-codex-turn-metadata is not a valid JSON object".into())
-                        })?;
-                synthesized_turn_metadata.as_str()
+                None
+            },
+            subagent: if outbound_identity.is_none() {
+                identity.subagent.as_deref()
             } else {
-                turn_metadata
-            };
-            insert_header(
-                request.headers_mut(),
-                "x-codex-turn-metadata",
-                turn_metadata,
-            )?;
+                None
+            },
+            turn_metadata: turn_metadata.as_deref(),
+        };
+        build_official_ws_handshake_headers(
+            request.headers_mut(),
+            &candidate.headers,
+            &self.request_headers,
+            &handshake,
+        )?;
+        if !request.headers().contains_key(http::header::AUTHORIZATION) {
+            return Err(PeerError(
+                "selected Codex account has no materialized OAuth authorization".into(),
+            ));
         }
-        insert_header(request.headers_mut(), "openai-beta", OPENAI_BETA_VALUE)?;
 
         debug_assert!(request
             .headers()
@@ -3372,25 +3354,83 @@ fn normalize_concurrent_limit(limit: Option<i32>) -> Option<usize> {
         .and_then(|limit| usize::try_from(limit).ok())
 }
 
-fn copy_official_candidate_headers(
+/// Session identity the official handshake announces, already resolved to
+/// the outbound (synthetic) tree when pool runtime identity is on.
+#[derive(Debug, Clone, Copy, Default)]
+struct OfficialWsHandshakeIdentity<'a> {
+    session_id: &'a str,
+    thread_id: &'a str,
+    window_id: Option<&'a str>,
+    parent_thread_id: Option<&'a str>,
+    subagent: Option<&'a str>,
+    turn_metadata: Option<&'a str>,
+}
+
+/// Materializes the official `GET /backend-api/codex/responses` handshake
+/// headers in the order codex-rs 0.154.0 puts them on the wire.
+///
+/// tungstenite writes `Host` / `Connection` / `Upgrade` /
+/// `Sec-WebSocket-Version` / `Sec-WebSocket-Key` first and then the rest in
+/// `HeaderMap` insertion order, so insertion order here is wire order. The
+/// official client sends, in this order: `chatgpt-account-id`,
+/// `authorization`, `user-agent`, `originator`, `openai-beta`, `version`,
+/// `x-codex-beta-features`, `x-client-request-id`, `session-id`, `thread-id`,
+/// `x-codex-window-id`, `x-codex-turn-metadata`, `x-codex-routing-hint`
+/// (`core/src/client.rs` `build_websocket_headers`, confirmed against a
+/// direct-login 0.154.0 capture). `x-codex-installation-id` and
+/// `x-openai-internal-codex-responses-lite` are HTTP-only there: the
+/// WebSocket carries both inside `client_metadata` of each step body, so
+/// they never go on the handshake.
+fn build_official_ws_handshake_headers(
     headers: &mut HeaderMap,
     candidate_headers: &BTreeMap<String, String>,
+    client_headers: &HeaderMap,
+    identity: &OfficialWsHandshakeIdentity<'_>,
 ) -> Result<(), PeerError> {
-    for name in [
-        "authorization",
-        "chatgpt-account-id",
-        "user-agent",
-        "originator",
-        "version",
-        "x-codex-installation-id",
-        "x-oai-attestation",
-        "x-codex-routing-hint",
-        "x-openai-internal-codex-residency",
-        "x-openai-internal-codex-responses-lite",
-    ] {
+    let mut copy_candidate = |headers: &mut HeaderMap, name: &str| -> Result<(), PeerError> {
         if let Some(value) = case_insensitive_btree_value(candidate_headers, name) {
             insert_header(headers, name, value)?;
         }
+        Ok(())
+    };
+    for name in [
+        "chatgpt-account-id",
+        "authorization",
+        "user-agent",
+        "originator",
+    ] {
+        copy_candidate(headers, name)?;
+    }
+    insert_header(headers, "openai-beta", OPENAI_BETA_VALUE)?;
+    copy_candidate(headers, "version")?;
+    if let Some(value) = exact_request_header(client_headers, "x-codex-beta-features") {
+        insert_header(headers, "x-codex-beta-features", value)?;
+    }
+    insert_header(headers, "x-client-request-id", identity.thread_id)?;
+    insert_header(headers, "session-id", identity.session_id)?;
+    insert_header(headers, "thread-id", identity.thread_id)?;
+    if let Some(parent_thread_id) = identity.parent_thread_id {
+        insert_header(headers, "x-codex-parent-thread-id", parent_thread_id)?;
+    }
+    if let Some(subagent) = identity.subagent {
+        insert_header(headers, "x-openai-subagent", subagent)?;
+    }
+    if let Some(window_id) = identity.window_id {
+        insert_header(headers, "x-codex-window-id", window_id)?;
+    }
+    if let Some(turn_metadata) = identity.turn_metadata {
+        insert_header(headers, "x-codex-turn-metadata", turn_metadata)?;
+    }
+    if let Some(value) = exact_request_header(client_headers, "x-openai-memgen-request") {
+        insert_header(headers, "x-openai-memgen-request", value)?;
+    }
+    copy_candidate(headers, "x-codex-routing-hint")?;
+    copy_candidate(headers, "x-oai-attestation")?;
+    copy_candidate(headers, "x-openai-internal-codex-residency")?;
+    if let Some(value) =
+        exact_request_header(client_headers, "x-responsesapi-include-timing-metrics")
+    {
+        insert_header(headers, "x-responsesapi-include-timing-metrics", value)?;
     }
     Ok(())
 }
@@ -4772,16 +4812,122 @@ mod tests {
         let mut request = OFFICIAL_CODEX_RESPONSES_WS_URL
             .into_client_request()
             .unwrap();
-        copy_official_candidate_headers(request.headers_mut(), &candidate_headers).unwrap();
+        let identity = OfficialWsHandshakeIdentity {
+            session_id: "sess",
+            thread_id: "thread",
+            ..OfficialWsHandshakeIdentity::default()
+        };
+        build_official_ws_handshake_headers(
+            request.headers_mut(),
+            &candidate_headers,
+            &HeaderMap::new(),
+            &identity,
+        )
+        .unwrap();
         assert_eq!(
             request.headers()["x-codex-routing-hint"],
             "model=gpt-5.5;tier=priority"
         );
         assert_eq!(request.headers()["x-openai-internal-codex-residency"], "us");
         assert!(!request.headers().contains_key("x-aether-ws-control"));
-        let mut empty = HeaderMap::new();
-        copy_official_candidate_headers(&mut empty, &BTreeMap::new()).unwrap();
-        assert!(empty.is_empty());
+        let mut minimal = HeaderMap::new();
+        build_official_ws_handshake_headers(
+            &mut minimal,
+            &BTreeMap::new(),
+            &HeaderMap::new(),
+            &identity,
+        )
+        .unwrap();
+        assert_eq!(
+            minimal.keys().map(|name| name.as_str()).collect::<Vec<_>>(),
+            [
+                "openai-beta",
+                "x-client-request-id",
+                "session-id",
+                "thread-id"
+            ]
+        );
+    }
+
+    /// The handshake must carry exactly the official 0.154.0 header set in
+    /// the official wire order; HTTP-only headers stay off it.
+    #[test]
+    fn official_ws_handshake_headers_follow_the_official_wire_order() {
+        let candidate_headers = BTreeMap::from([
+            ("authorization".into(), "Bearer selected".into()),
+            ("chatgpt-account-id".into(), "acct".into()),
+            (
+                "user-agent".into(),
+                "codex_cli_rs/0.154.0 (Mac OS 26.5.1; arm64) iTerm.app/3.7.0".into(),
+            ),
+            ("originator".into(), "codex_cli_rs".into()),
+            ("version".into(), "0.154.0".into()),
+            ("x-codex-installation-id".into(), "inst".into()),
+            ("x-oai-attestation".into(), "att".into()),
+            ("x-codex-routing-hint".into(), "model=gpt-6-astra".into()),
+            ("x-openai-internal-codex-residency".into(), "us".into()),
+            (
+                "x-openai-internal-codex-responses-lite".into(),
+                "true".into(),
+            ),
+            ("x-aether-execution-http1-only".into(), "true".into()),
+        ]);
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert("x-codex-beta-features", "feature-a".parse().unwrap());
+        client_headers.insert("x-openai-memgen-request", "true".parse().unwrap());
+        client_headers.insert(
+            "x-responsesapi-include-timing-metrics",
+            "true".parse().unwrap(),
+        );
+        client_headers.insert(
+            "x-openai-internal-codex-responses-lite",
+            "true".parse().unwrap(),
+        );
+        let identity = OfficialWsHandshakeIdentity {
+            session_id: "sess",
+            thread_id: "thread",
+            window_id: Some("thread:0"),
+            parent_thread_id: Some("parent"),
+            subagent: Some("explorer"),
+            turn_metadata: Some("{\"turn_id\":\"turn\"}"),
+        };
+        let mut headers = HeaderMap::new();
+        build_official_ws_handshake_headers(
+            &mut headers,
+            &candidate_headers,
+            &client_headers,
+            &identity,
+        )
+        .unwrap();
+        assert_eq!(
+            headers.keys().map(|name| name.as_str()).collect::<Vec<_>>(),
+            [
+                "chatgpt-account-id",
+                "authorization",
+                "user-agent",
+                "originator",
+                "openai-beta",
+                "version",
+                "x-codex-beta-features",
+                "x-client-request-id",
+                "session-id",
+                "thread-id",
+                "x-codex-parent-thread-id",
+                "x-openai-subagent",
+                "x-codex-window-id",
+                "x-codex-turn-metadata",
+                "x-openai-memgen-request",
+                "x-codex-routing-hint",
+                "x-oai-attestation",
+                "x-openai-internal-codex-residency",
+                "x-responsesapi-include-timing-metrics",
+            ]
+        );
+        assert_eq!(headers["x-client-request-id"], "thread");
+        assert_eq!(headers["openai-beta"], OPENAI_BETA_VALUE);
+        assert!(!headers.contains_key("x-codex-installation-id"));
+        assert!(!headers.contains_key("x-openai-internal-codex-responses-lite"));
+        assert!(!headers.contains_key("x-aether-execution-http1-only"));
     }
 
     #[test]

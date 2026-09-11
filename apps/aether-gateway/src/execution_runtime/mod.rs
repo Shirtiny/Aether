@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+pub(crate) mod chatgpt_cloudflare_cookies;
 mod chatgpt_web_image;
 mod constants;
 mod fallback;

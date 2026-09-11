@@ -425,7 +425,9 @@ fn codex_pool_stable_client_headers_override_client_identity_headers() {
     let first_user_agent = headers.get("user-agent").cloned();
     let first_originator = headers.get("originator").cloned();
     let expected_version = crate::codex_profile::codex_client_version_from_user_agent(
-        first_user_agent.as_deref().expect("profile user-agent applied"),
+        first_user_agent
+            .as_deref()
+            .expect("profile user-agent applied"),
     )
     .expect("every built-in profile user-agent carries a version");
     assert_eq!(headers.get("version"), Some(&expected_version));
@@ -703,11 +705,9 @@ fn builtin_codex_client_header_profiles_use_current_observed_versions() {
     assert_eq!(unique_user_agents.len(), profiles.len());
     // gpt-6 upstream rejects clients below 0.153; the dictionary only ships
     // shapes observed inbound from real 0.153.x clients.
-    assert!(
-        profiles
-            .iter()
-            .all(|profile| profile.user_agent.contains("/0.153."))
-    );
+    assert!(profiles
+        .iter()
+        .all(|profile| profile.user_agent.contains("/0.153.")));
 }
 
 #[test]
@@ -1659,6 +1659,189 @@ async fn client_release_follow_leaves_a_non_codex_provider_alone() {
                 .to_string()
         )
     );
+}
+
+#[test]
+fn transport_fidelity_controls_follow_the_official_client_on_chatgpt_hosts() {
+    use crate::codex_runtime_identity::CodexRuntimeIdentitySurface;
+
+    let mut transport = sample_transport("codex", None);
+    transport.endpoint.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+
+    let mut headers = BTreeMap::from([("authorization".to_string(), "Bearer x".to_string())]);
+    super::apply_codex_transport_fidelity_controls(
+        &transport,
+        &mut headers,
+        CodexRuntimeIdentitySurface::HttpResponses,
+        true,
+    );
+    assert_eq!(
+        headers
+            .get("x-aether-execution-header-order")
+            .map(String::as_str),
+        Some("codex-cli")
+    );
+    assert_eq!(
+        headers
+            .get("x-aether-execution-cookie-jar")
+            .map(String::as_str),
+        Some("chatgpt-cloudflare")
+    );
+    assert_eq!(
+        headers
+            .get("x-aether-execution-request-body-encoding")
+            .map(String::as_str),
+        Some("zstd")
+    );
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer x")
+    );
+
+    // Only the `/responses` body is compressed by codex-rs; the other
+    // surfaces still get the wire order and the cookie jar.
+    for surface in [
+        CodexRuntimeIdentitySurface::HttpCompact,
+        CodexRuntimeIdentitySurface::Headers,
+        CodexRuntimeIdentitySurface::WsStepBody,
+    ] {
+        let mut headers = BTreeMap::new();
+        super::apply_codex_transport_fidelity_controls(&transport, &mut headers, surface, true);
+        assert_eq!(
+            headers
+                .get("x-aether-execution-header-order")
+                .map(String::as_str),
+            Some("codex-cli"),
+            "{surface:?}"
+        );
+        assert_eq!(
+            headers
+                .get("x-aether-execution-cookie-jar")
+                .map(String::as_str),
+            Some("chatgpt-cloudflare"),
+            "{surface:?}"
+        );
+        assert!(
+            !headers.contains_key("x-aether-execution-request-body-encoding"),
+            "{surface:?}"
+        );
+    }
+
+    // Sub-hosts of the allowed ChatGPT domains qualify as well.
+    transport.endpoint.base_url = "https://chatgpt-staging.com/backend-api/codex".to_string();
+    let mut headers = BTreeMap::new();
+    super::apply_codex_transport_fidelity_controls(
+        &transport,
+        &mut headers,
+        CodexRuntimeIdentitySurface::Headers,
+        true,
+    );
+    assert!(headers.contains_key("x-aether-execution-header-order"));
+}
+
+#[test]
+fn transport_fidelity_controls_stay_off_for_other_providers_hosts_and_the_kill_switch() {
+    use crate::codex_runtime_identity::CodexRuntimeIdentitySurface;
+
+    let mut chatgpt_openai = sample_transport("openai", None);
+    chatgpt_openai.endpoint.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+    let mut codex_mirror = sample_transport("codex", None);
+    codex_mirror.endpoint.base_url =
+        "https://codex-mirror.example.test/backend-api/codex".to_string();
+    let mut codex_plain_http = sample_transport("codex", None);
+    codex_plain_http.endpoint.base_url = "http://chatgpt.com/backend-api/codex".to_string();
+    let mut codex_chatgpt = sample_transport("codex", None);
+    codex_chatgpt.endpoint.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+
+    for (label, transport, enabled) in [
+        ("non-codex provider", &chatgpt_openai, true),
+        ("codex mirror host", &codex_mirror, true),
+        (
+            "default fixture host",
+            &sample_transport("codex", None),
+            true,
+        ),
+        ("plain http", &codex_plain_http, true),
+        ("kill switch", &codex_chatgpt, false),
+    ] {
+        let mut headers = BTreeMap::from([("authorization".to_string(), "Bearer x".to_string())]);
+        super::apply_codex_transport_fidelity_controls(
+            transport,
+            &mut headers,
+            CodexRuntimeIdentitySurface::HttpResponses,
+            enabled,
+        );
+        assert_eq!(
+            headers,
+            BTreeMap::from([("authorization".to_string(), "Bearer x".to_string())]),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn installation_id_header_only_survives_on_the_compact_surface() {
+    use crate::codex_runtime_identity::CodexRuntimeIdentitySurface;
+
+    let mut chatgpt = sample_transport("codex", None);
+    chatgpt.endpoint.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+    let seed = || {
+        BTreeMap::from([
+            ("X-Codex-Installation-Id".to_string(), "inst".to_string()),
+            (
+                "x-codex-turn-metadata".to_string(),
+                r#"{"installation_id":"inst"}"#.to_string(),
+            ),
+        ])
+    };
+
+    // codex-rs carries the installation id inside the turn-metadata blob and
+    // `client_metadata` on every request, but as a header only on compact.
+    for surface in [
+        CodexRuntimeIdentitySurface::HttpResponses,
+        CodexRuntimeIdentitySurface::Headers,
+        CodexRuntimeIdentitySurface::WsStepBody,
+    ] {
+        let mut headers = seed();
+        super::align_codex_installation_id_header_with_surface(
+            &chatgpt,
+            &mut headers,
+            surface,
+            true,
+        );
+        assert_eq!(
+            headers,
+            BTreeMap::from([(
+                "x-codex-turn-metadata".to_string(),
+                r#"{"installation_id":"inst"}"#.to_string(),
+            )]),
+            "{surface:?}"
+        );
+    }
+    let mut headers = seed();
+    super::align_codex_installation_id_header_with_surface(
+        &chatgpt,
+        &mut headers,
+        CodexRuntimeIdentitySurface::HttpCompact,
+        true,
+    );
+    assert_eq!(headers, seed());
+
+    // Same scope as the transport controls: mirrors and the kill switch keep
+    // the header.
+    let mut mirror = sample_transport("codex", None);
+    mirror.endpoint.base_url = "https://codex-mirror.example.test/backend-api/codex".to_string();
+    for (label, transport, enabled) in [("kill switch", &chatgpt, false), ("mirror", &mirror, true)]
+    {
+        let mut headers = seed();
+        super::align_codex_installation_id_header_with_surface(
+            transport,
+            &mut headers,
+            CodexRuntimeIdentitySurface::HttpResponses,
+            enabled,
+        );
+        assert_eq!(headers, seed(), "{label}");
+    }
 }
 
 /// A first-seen stamp old enough that every account's per-account adoption lag
