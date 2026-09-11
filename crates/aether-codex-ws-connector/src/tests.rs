@@ -1,3 +1,4 @@
+use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -314,12 +315,125 @@ fn tls_profile_freezes_the_pinned_codex_kx_group_order() {
     assert_eq!(
         groups,
         [
+            rustls::NamedGroup::X25519MLKEM768,
             rustls::NamedGroup::X25519,
             rustls::NamedGroup::secp256r1,
             rustls::NamedGroup::secp384r1,
-            rustls::NamedGroup::X25519MLKEM768,
         ]
     );
+}
+
+#[test]
+fn client_hello_matches_official_codex_0_154_ws_capture() {
+    let connector = CodexWebSocketConnector::with_root_store(RootCertStore::empty())
+        .expect("connector should build");
+    let mut client = rustls::ClientConnection::new(
+        connector
+            .fresh_tls_config()
+            .expect("TLS config should build"),
+        "chatgpt.com".try_into().expect("SNI should be valid"),
+    )
+    .expect("client should build");
+    let mut wire = Vec::new();
+    client
+        .write_tls(&mut wire)
+        .expect("ClientHello should serialize");
+    let mut acceptor = rustls::server::Acceptor::default();
+    acceptor
+        .read_tls(&mut Cursor::new(&wire))
+        .expect("ClientHello should be readable");
+    let accepted = acceptor
+        .accept()
+        .expect("ClientHello should parse")
+        .expect("complete ClientHello should be available");
+    let hello = accepted.client_hello();
+
+    // Three successful official 0.154.0 WS captures on 2026-09-11 had this shape.
+    // Extension order and ephemeral key bytes vary, so they are not golden bytes.
+    assert_eq!(hello.server_name(), Some("chatgpt.com"));
+    assert_eq!(
+        hello
+            .named_groups()
+            .expect("supported groups should be present"),
+        [
+            rustls::NamedGroup::X25519MLKEM768,
+            rustls::NamedGroup::X25519,
+            rustls::NamedGroup::secp256r1,
+            rustls::NamedGroup::secp384r1,
+        ]
+    );
+    assert_eq!(
+        hello
+            .cipher_suites()
+            .iter()
+            .map(|suite| u16::from(*suite))
+            .collect::<Vec<_>>(),
+        [0x1302, 0x1301, 0x1303, 0xc02c, 0xc02b, 0xcca9, 0xc030, 0xc02f, 0xcca8, 0x00ff]
+    );
+    assert_eq!(
+        hello
+            .signature_schemes()
+            .iter()
+            .map(|scheme| u16::from(*scheme))
+            .collect::<Vec<_>>(),
+        [0x0503, 0x0403, 0x0603, 0x0807, 0x0806, 0x0805, 0x0804, 0x0601, 0x0501, 0x0401]
+    );
+    assert!(hello.alpn().is_none());
+    // 1453-byte handshake body, 4-byte handshake header, 5-byte TLS record header.
+    assert_eq!(wire.len(), 1462);
+}
+
+#[test]
+fn first_flight_supports_hybrid_and_classical_servers_without_hello_retry_request() {
+    for group in [
+        rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+        rustls::crypto::aws_lc_rs::kx_group::X25519,
+    ] {
+        let (connector, acceptor) = test_tls_configs_with_kx_groups(vec![group]);
+        let mut client = rustls::ClientConnection::new(
+            connector
+                .fresh_tls_config()
+                .expect("TLS config should build"),
+            "localhost"
+                .try_into()
+                .expect("test server name should be valid"),
+        )
+        .expect("client should build");
+        let mut server = rustls::ServerConnection::new(Arc::clone(acceptor.config()))
+            .expect("server should build");
+        let mut client_flight = Vec::new();
+        client
+            .write_tls(&mut client_flight)
+            .expect("client should send first flight");
+        server
+            .read_tls(&mut Cursor::new(client_flight))
+            .expect("server should read first flight");
+        server
+            .process_new_packets()
+            .expect("server should accept ClientHello");
+        let mut server_flight = Vec::new();
+        server
+            .write_tls(&mut server_flight)
+            .expect("server should send first flight");
+        client
+            .read_tls(&mut Cursor::new(server_flight))
+            .expect("client should read server flight");
+        client
+            .process_new_packets()
+            .expect("client should accept server flight");
+
+        assert!(
+            !client.is_handshaking(),
+            "{:?} must finish from the first server flight, without HRR",
+            group.name()
+        );
+        assert_eq!(
+            client
+                .negotiated_key_exchange_group()
+                .map(|group| group.name()),
+            Some(group.name())
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -620,6 +734,12 @@ async fn start_tls_websocket_server(acceptor: TlsAcceptor) -> (SocketAddr, JoinH
 }
 
 fn test_tls_configs() -> (CodexWebSocketConnector, TlsAcceptor) {
+    test_tls_configs_with_kx_groups(rustls::crypto::aws_lc_rs::default_provider().kx_groups)
+}
+
+fn test_tls_configs_with_kx_groups(
+    kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup>,
+) -> (CodexWebSocketConnector, TlsAcceptor) {
     let certificate = CertificateDer::from(
         base64::engine::general_purpose::STANDARD
             .decode(TEST_CERTIFICATE_DER_BASE64)
@@ -630,7 +750,9 @@ fn test_tls_configs() -> (CodexWebSocketConnector, TlsAcceptor) {
             .decode(TEST_PRIVATE_KEY_DER_BASE64)
             .expect("embedded test private key should decode"),
     ));
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = kx_groups;
+    let provider = Arc::new(provider);
     let server_config = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("server TLS versions should build")

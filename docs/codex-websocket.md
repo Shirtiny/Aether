@@ -270,9 +270,21 @@ wss://chatgpt.com/backend-api/codex/responses
 OpenAI-Beta: responses_websockets=2026-02-06
 ```
 
-实现使用 Rustls 0.23 和 AWS-LC，按固定 Codex revision 对齐握手与 WebSocket 行为。
+实现使用 Rustls 0.23 和 AWS-LC，复用固定 Codex revision 的 WebSocket 实现，
+TLS 参数以显式配置和官方实测 ClientHello 为对齐依据。
 它不声称模拟 Chrome/JA3/JA4。证书和 SNI 校验不能关闭；自定义 CA 只允许沿用
 Codex 支持的 `CODEX_CA_CERTIFICATE` 或 `SSL_CERT_FILE` 条件。
+
+2026-09-11 的官方 CLI 0.154.0 WS 抓包显示，Supported Groups 顺序为
+`X25519MLKEM768, X25519, P-256, P-384`，首次同时发送混合后量子组与 X25519
+的 Key Share。Connector 显式固定此顺序，不依赖 Cargo feature 合并是否启用
+`prefer-post-quantum`，避免偏好混合后量子组的上游再发一次 HelloRetryRequest。
+本地回归测试同时验证混合后量子与仅 X25519 的服务端都能从首次 ClientHello 完成协商。
+
+这次 KX 排序修正保持既有 `profile_id`、schema、依赖版本和账号 manifest 字段不变，
+不要求重新开关存量账号的 WS。profile ID 中的 `0.144.1` 保留为兼容性标识，
+不代表继续采用旧的传统组优先顺序。扩展随机排列保持不变，不能以单次 JA3 字符串
+相等作为验收条件；JA4 相同也不足以证明 Supported Groups 和 Key Share 一致。
 
 profile 中任意 revision、crypto provider 或 buffer 字段不匹配都会 fail closed，
 不会降级为“近似 profile”。升级固定 profile 后，旧 schema/profile 账号必须重新

@@ -17,10 +17,10 @@ const SSL_CERT_FILE: &str = "SSL_CERT_FILE";
 type PemSection = (SectionKind, Vec<u8>);
 
 static PINNED_CODEX_KX_GROUPS: [&dyn rustls::crypto::SupportedKxGroup; 4] = [
+    rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
     rustls::crypto::aws_lc_rs::kx_group::X25519,
     rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
     rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
-    rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
 ];
 
 #[derive(Debug, Error)]
@@ -33,8 +33,8 @@ pub enum ConnectorBuildError {
 
 pub(crate) fn build_tls_config(roots: RootCertStore) -> Result<ClientConfig, ConnectorBuildError> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-    // The embedding gateway also uses rustls and can enable its feature-gated PQ preference.
-    // Preserve the pinned Codex build's no-PQ order independently of workspace feature unification.
+    // Match official Codex 0.154.0 WS captures: hybrid first, with an X25519 share too.
+    // Pin the order independently of the embedding workspace's rustls features.
     provider.kx_groups.clear();
     provider
         .kx_groups
