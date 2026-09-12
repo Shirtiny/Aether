@@ -85,6 +85,7 @@ pub(crate) use self::transport::{
     request_pair_transport_unsupported_reason, CandidateTransportPolicyFacts,
 };
 pub(crate) use crate::control::GatewayControlDecision;
+pub(crate) use crate::execution_runtime::chatgpt_cloudflare_cookies::is_allowed_chatgpt_host;
 pub(crate) use crate::execution_runtime::{ConversionMode, ExecutionStrategy};
 pub(crate) use crate::headers::RequestOrigin;
 pub(crate) use aether_ai_serving::{

@@ -41,14 +41,13 @@ use crate::codex_runtime_identity::{
     CodexRuntimeIdentityResolution, CodexRuntimeIdentityScope, CodexRuntimeIdentityStore,
     CodexRuntimeIdentitySurface, InboundCodexRuntimeIdentity, OutboundCodexRuntimeIdentity,
 };
-use crate::execution_runtime::chatgpt_cloudflare_cookies::is_allowed_chatgpt_host;
 
 pub(crate) use crate::ai_serving::{
     apply_codex_official_ws_handshake_headers, apply_codex_openai_responses_special_body_edits,
     apply_codex_openai_responses_special_headers,
 };
 
-use crate::ai_serving::GatewayProviderTransportSnapshot;
+use crate::ai_serving::{is_allowed_chatgpt_host, GatewayProviderTransportSnapshot};
 
 const DEFAULT_CODEX_POOL_CLIENT_HEADER_PROFILES_JSON: &str =
     include_str!("../../../../../../resources/codex-client-header-profiles.json");
