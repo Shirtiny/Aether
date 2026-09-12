@@ -350,6 +350,46 @@ fn provider_query_model_test_empty_selected_key_ids_keep_default_selection() {
 }
 
 #[test]
+fn provider_query_direct_key_availability_test_only_for_direct_mode_with_selected_keys() {
+    let keys = provider_query_extract_api_key_ids(&json!({ "api_key_ids": ["key-a"] }));
+    assert!(keys.is_some());
+
+    // Direct mode + explicitly selected keys is the availability probe that
+    // bypasses disabled/scheduling state.
+    assert!(provider_query_is_direct_key_availability_test(
+        &json!({ "mode": "direct" }),
+        keys.as_ref()
+    ));
+    assert!(provider_query_is_direct_key_availability_test(
+        &json!({ "mode": "DIRECT" }),
+        keys.as_ref()
+    ));
+
+    // Scheduling simulations keep honouring disabled/scheduling state, even
+    // when they restrict the pool to specific keys.
+    assert!(!provider_query_is_direct_key_availability_test(
+        &json!({ "mode": "pool" }),
+        keys.as_ref()
+    ));
+    assert!(!provider_query_is_direct_key_availability_test(
+        &json!({ "mode": "global" }),
+        keys.as_ref()
+    ));
+    // Default mode is `global`.
+    assert!(!provider_query_is_direct_key_availability_test(
+        &json!({}),
+        keys.as_ref()
+    ));
+
+    // Direct mode without an explicit key selection is not a single-key probe;
+    // keep respecting `is_active` so we still pick a usable key.
+    assert!(!provider_query_is_direct_key_availability_test(
+        &json!({ "mode": "direct" }),
+        None
+    ));
+}
+
+#[test]
 fn provider_query_standard_test_resolves_codex_responses_upstream_streaming() {
     assert!(provider_query_resolve_standard_test_upstream_is_stream(
         None,

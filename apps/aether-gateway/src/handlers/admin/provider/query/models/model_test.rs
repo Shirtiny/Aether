@@ -442,6 +442,17 @@ fn provider_query_test_mode(payload: &Value) -> &str {
         .unwrap_or("global")
 }
 
+/// A direct (`mode == "direct"`) test targeting explicitly selected keys is an
+/// availability probe: the operator asked to test *these* keys, so it must run
+/// even when a key is disabled or in a scheduling state. The `pool`/`global`
+/// failover simulations are scheduling tests and keep honouring those states.
+fn provider_query_is_direct_key_availability_test(
+    payload: &Value,
+    selected_key_ids: Option<&BTreeSet<String>>,
+) -> bool {
+    provider_query_test_mode(payload).eq_ignore_ascii_case("direct") && selected_key_ids.is_some()
+}
+
 fn provider_query_should_apply_model_mapping(payload: &Value) -> bool {
     payload
         .get("apply_model_mapping")
@@ -872,6 +883,7 @@ async fn provider_query_select_preferred_non_kiro_endpoint(
     endpoints: &[StoredProviderCatalogEndpoint],
     keys: &[StoredProviderCatalogKey],
     selected_key_ids: Option<&BTreeSet<String>>,
+    allow_inactive_keys: bool,
 ) -> Option<StoredProviderCatalogEndpoint> {
     for priority in 0..=2 {
         for endpoint in endpoints.iter().filter(|endpoint| endpoint.is_active) {
@@ -883,7 +895,7 @@ async fn provider_query_select_preferred_non_kiro_endpoint(
                 continue;
             }
             for key in keys {
-                if !key.is_active
+                if !(allow_inactive_keys || key.is_active)
                     || !provider_query_selected_key_ids_allow_key(selected_key_ids, &key.id)
                     || !provider_query_key_supports_endpoint(
                         key,
@@ -915,7 +927,7 @@ async fn provider_query_select_preferred_non_kiro_endpoint(
         .find(|endpoint| {
             endpoint.is_active
                 && keys.iter().any(|key| {
-                    key.is_active
+                    (allow_inactive_keys || key.is_active)
                         && provider_query_selected_key_ids_allow_key(selected_key_ids, &key.id)
                         && provider_query_key_supports_endpoint(
                             key,
@@ -1337,6 +1349,14 @@ async fn provider_query_build_kiro_test_candidates(
     let selected_key_ids = provider_query_extract_api_key_ids(payload);
     let requested_endpoint_id = provider_query_extract_endpoint_id(payload);
     let requested_api_format = provider_query_extract_api_format(payload);
+    // A direct test of explicitly selected keys is an availability probe of
+    // those keys: it must reach the upstream regardless of whether the key is
+    // disabled or in a scheduling (circuit-breaker/quota) state. Only the
+    // scheduling simulations (`pool`/`global` failover) keep respecting those
+    // states. Scheduling state never skips in direct mode anyway (it only sorts
+    // candidates), so bypassing `is_active` here is the whole fix.
+    let direct_key_availability_test =
+        provider_query_is_direct_key_availability_test(payload, selected_key_ids.as_ref());
     let endpoint = if requested_endpoint_id.is_none()
         && requested_api_format.is_none()
         && !provider.provider_type.trim().eq_ignore_ascii_case("kiro")
@@ -1347,6 +1367,7 @@ async fn provider_query_build_kiro_test_candidates(
             &endpoints,
             &all_keys,
             selected_key_ids.as_ref(),
+            direct_key_availability_test,
         )
         .await
         .ok_or_else(|| {
@@ -1444,7 +1465,7 @@ async fn provider_query_build_kiro_test_candidates(
 
     for key in all_keys
         .into_iter()
-        .filter(|key| key.is_active)
+        .filter(|key| direct_key_availability_test || key.is_active)
         .filter(|key| provider_query_selected_key_ids_allow_key(selected_key_ids.as_ref(), &key.id))
         .filter(|key| {
             provider_query_key_supports_endpoint(key, &provider.provider_type, &endpoint.api_format)
@@ -3095,6 +3116,17 @@ async fn provider_query_execute_standard_test_candidate(
             identity_surface,
         )
         .await;
+        // Reproduce the live planner's transport-fidelity tail so the test
+        // request goes on the wire the way codex-rs does: codex-cli header
+        // order, a zstd `/responses` body and the Cloudflare cookie jar.
+        // Without it the test egresses alphabetical headers and plain JSON,
+        // which is a different fingerprint than real traffic and cannot be used
+        // to judge wire fidelity. Self-gates to Codex → ChatGPT endpoints.
+        crate::ai_serving::apply_codex_wire_shape_alignment_for_surface(
+            &transport,
+            &mut request_headers,
+            identity_surface,
+        );
     }
     // A model test has to carry the same identity as real traffic, on both the
     // chat and responses formats, or it reports a failure the live path would

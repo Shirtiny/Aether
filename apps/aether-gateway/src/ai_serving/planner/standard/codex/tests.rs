@@ -1844,6 +1844,80 @@ fn installation_id_header_only_survives_on_the_compact_surface() {
     }
 }
 
+#[test]
+fn wire_shape_alignment_wrapper_runs_installation_and_transport_tails_together() {
+    use crate::codex_runtime_identity::CodexRuntimeIdentitySurface;
+
+    let mut chatgpt = sample_transport("codex", None);
+    chatgpt.endpoint.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+    let seed = || {
+        BTreeMap::from([
+            ("authorization".to_string(), "Bearer x".to_string()),
+            ("x-codex-installation-id".to_string(), "inst".to_string()),
+        ])
+    };
+
+    // Responses surface: the wrapper strips the installation-id header (kept
+    // only on compact) and asks the transport for codex-cli order, the
+    // Cloudflare cookie jar and a zstd body — matching the live planner tail.
+    let mut headers = seed();
+    super::apply_codex_wire_shape_alignment_for_surface(
+        &chatgpt,
+        &mut headers,
+        CodexRuntimeIdentitySurface::HttpResponses,
+    );
+    assert!(!headers.contains_key("x-codex-installation-id"));
+    assert_eq!(
+        headers
+            .get("x-aether-execution-header-order")
+            .map(String::as_str),
+        Some("codex-cli")
+    );
+    assert_eq!(
+        headers
+            .get("x-aether-execution-cookie-jar")
+            .map(String::as_str),
+        Some("chatgpt-cloudflare")
+    );
+    assert_eq!(
+        headers
+            .get("x-aether-execution-request-body-encoding")
+            .map(String::as_str),
+        Some("zstd")
+    );
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer x")
+    );
+
+    // Compact surface: the installation-id header survives and the body is not
+    // compressed, but the wire order and cookie jar still apply.
+    let mut headers = seed();
+    super::apply_codex_wire_shape_alignment_for_surface(
+        &chatgpt,
+        &mut headers,
+        CodexRuntimeIdentitySurface::HttpCompact,
+    );
+    assert_eq!(
+        headers.get("x-codex-installation-id").map(String::as_str),
+        Some("inst")
+    );
+    assert!(headers.contains_key("x-aether-execution-header-order"));
+    assert!(headers.contains_key("x-aether-execution-cookie-jar"));
+    assert!(!headers.contains_key("x-aether-execution-request-body-encoding"));
+
+    // A non-ChatGPT relay stays untouched.
+    let mut mirror = sample_transport("codex", None);
+    mirror.endpoint.base_url = "https://codex-mirror.example.test/backend-api/codex".to_string();
+    let mut headers = seed();
+    super::apply_codex_wire_shape_alignment_for_surface(
+        &mirror,
+        &mut headers,
+        CodexRuntimeIdentitySurface::HttpResponses,
+    );
+    assert_eq!(headers, seed());
+}
+
 /// A first-seen stamp old enough that every account's per-account adoption lag
 /// (at most four days) has already elapsed.
 fn codex_client_release_seed_secs() -> u64 {

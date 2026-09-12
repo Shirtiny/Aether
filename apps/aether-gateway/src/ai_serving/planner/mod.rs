@@ -72,7 +72,7 @@ pub(crate) use self::standard::{
     apply_codex_official_ws_handshake_headers, apply_codex_pool_client_release_headers,
     apply_codex_pool_concrete_account_profile,
     apply_codex_pool_concrete_account_profile_for_api_format, apply_codex_pool_runtime_identity,
-    apply_codex_pool_stable_client_headers,
+    apply_codex_pool_stable_client_headers, apply_codex_wire_shape_alignment_for_surface,
     build_compact_local_openai_responses_stream_plan_and_reports_for_kind_with_required_capabilities,
     build_local_openai_chat_stream_attempt_source_for_kind,
     build_local_openai_chat_stream_plan_and_reports_for_kind,

@@ -20,7 +20,7 @@ pub(crate) use self::codex::{
     apply_codex_pool_concrete_account_profile,
     apply_codex_pool_concrete_account_profile_for_api_format, apply_codex_pool_runtime_identity,
     apply_codex_pool_search_account_profile, apply_codex_pool_stable_client_headers,
-    materialize_codex_pool_key_fingerprint,
+    apply_codex_wire_shape_alignment_for_surface, materialize_codex_pool_key_fingerprint,
     materialize_codex_pool_key_fingerprint_with_client_headers, refresh_codex_pool_key_fingerprint,
     resolve_codex_pool_concrete_account_profile, resolve_codex_pool_runtime_identity_scope,
     select_codex_pool_client_header_profile, validate_codex_client_header_config,

@@ -754,6 +754,29 @@ pub(crate) fn align_codex_installation_id_header_with_surface(
     });
 }
 
+/// Runs the same transport-fidelity tail the live Codex planner applies
+/// ([`align_codex_installation_id_header_with_surface`] then
+/// [`apply_codex_transport_fidelity_controls`]) so an out-of-band request such
+/// as the admin model test reproduces the Codex wire shape (codex-cli header
+/// order, zstd `/responses` body, Cloudflare cookie jar) instead of egressing
+/// alphabetical headers and an uncompressed body. Self-gates to Codex →
+/// ChatGPT endpoints and honours the `AETHER_CODEX_TRANSPORT_FIDELITY` kill
+/// switch, exactly like the planner.
+pub(crate) fn apply_codex_wire_shape_alignment_for_surface(
+    transport: &GatewayProviderTransportSnapshot,
+    provider_request_headers: &mut BTreeMap<String, String>,
+    surface: CodexRuntimeIdentitySurface,
+) {
+    let enabled = codex_transport_fidelity_enabled();
+    align_codex_installation_id_header_with_surface(
+        transport,
+        provider_request_headers,
+        surface,
+        enabled,
+    );
+    apply_codex_transport_fidelity_controls(transport, provider_request_headers, surface, enabled);
+}
+
 const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 
 /// The wire-shape alignment covers a Codex provider whose endpoint targets a
