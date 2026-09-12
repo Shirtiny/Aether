@@ -5,16 +5,46 @@ use crate::AiExecutionDecision;
 pub(crate) const HEADER: &str = "x-codex-routing-hint";
 pub(crate) const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 
+/// Slugs whose server manifest sets `use_responses_lite`. Mirror of codex-rs
+/// `models-manager/models.json` (7 entries as of 2026-09-12). Aether does not
+/// fetch the manifest at request time, so the capability lives here.
+const RESPONSES_LITE_MODELS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-daybreak-blue-latest",
+    "gpt-daybreak-red-latest",
+    "codex-auto-review",
+];
+
+pub(crate) fn model_name_uses_responses_lite(model: &str) -> bool {
+    let model = model.trim();
+    !model.is_empty()
+        && RESPONSES_LITE_MODELS
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(model))
+}
+
 /// codex-rs flags a Responses Lite request in two places at once, both keyed
 /// on `model_info.use_responses_lite` from the server's model manifest: the
 /// `x-openai-internal-codex-responses-lite: true` header and a body whose
 /// `reasoning.context` is `all_turns` with instructions/tools folded into
 /// `input[]` (`core/src/client.rs` `build_reasoning_param`,
 /// `build_responses_request`, `add_responses_lite_header`). The backend
-/// rejects the header on its own with 400 "requires `reasoning.context` to be
-/// `all_turns`". Aether does not rewrite bodies into the lite contract and
-/// does not fetch the manifest, so the body is the only trustworthy signal:
-/// the header follows it in both directions, whatever the model is called.
+/// checks both halves against the model it actually serves:
+///
+/// * header without a lite body → 400 "requires `reasoning.context` to be
+///   `all_turns`" (third-party clients, older codex-rs);
+/// * header on a model that is not lite-capable → 400 "This model is not
+///   supported when using X-OpenAI-Internal-Codex-Responses-Lite". Aether
+///   hits this when a pool remaps a lite alias (`gpt-5.6-luna`) to a plain
+///   target (`gpt-5.5`): the client shaped a lite body for luna, the target
+///   is not luna;
+/// * a lite body without the header on a plain target is accepted.
+///
+/// So the header is sent only when the body is lite-shaped *and* the outbound
+/// target model is lite-capable. Aether never rewrites the body contract.
 pub(crate) fn body_uses_responses_lite(body: &Value) -> bool {
     body.get("reasoning")
         .and_then(|reasoning| reasoning.get("context"))
@@ -22,11 +52,14 @@ pub(crate) fn body_uses_responses_lite(body: &Value) -> bool {
         .is_some_and(|context| context == "all_turns")
 }
 
+/// `target_model` is the model the request is sent as (the pool's mapped
+/// model). When absent, the body's own `model` is used.
 pub(crate) fn apply_responses_lite_header(
     provider_type: &str,
     provider_api_format: &str,
     headers: &mut std::collections::BTreeMap<String, String>,
     body: Option<&Value>,
+    target_model: Option<&str>,
 ) {
     if !provider_type.trim().eq_ignore_ascii_case("codex")
         || !matches!(
@@ -37,7 +70,16 @@ pub(crate) fn apply_responses_lite_header(
         return;
     }
     headers.retain(|name, _| !name.eq_ignore_ascii_case(RESPONSES_LITE_HEADER));
-    if body.is_some_and(body_uses_responses_lite) {
+    let target = target_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .or_else(|| {
+            body.and_then(|body| body.get("model"))
+                .and_then(Value::as_str)
+        });
+    if body.is_some_and(body_uses_responses_lite)
+        && target.is_some_and(model_name_uses_responses_lite)
+    {
         headers.insert(RESPONSES_LITE_HEADER.to_string(), "true".to_string());
     }
 }
@@ -82,6 +124,7 @@ pub(crate) fn apply_to_decision(provider_type: &str, decision: &mut AiExecutionD
         decision.provider_api_format.as_deref().unwrap_or_default(),
         &mut decision.provider_request_headers,
         decision.provider_request_body.as_ref(),
+        decision.mapped_model.as_deref(),
     );
     if let Some(hint) = decision.provider_request_body.as_ref().and_then(from_body) {
         decision
@@ -142,6 +185,7 @@ mod tests {
         api_format: &str,
         body: Value,
         inbound_lite: Option<&str>,
+        mapped_model: Option<&str>,
     ) -> AiExecutionDecision {
         let mut headers = json!({"authorization":"Bearer test"});
         if let Some(value) = inbound_lite {
@@ -150,6 +194,7 @@ mod tests {
         serde_json::from_value(json!({
             "action":"execute",
             "provider_api_format":api_format,
+            "mapped_model":mapped_model,
             "provider_request_body":body,
             "provider_request_headers":headers,
             "report_context":{}
@@ -157,20 +202,48 @@ mod tests {
         .unwrap()
     }
 
+    fn has_lite(decision: &AiExecutionDecision) -> bool {
+        decision
+            .provider_request_headers
+            .contains_key(RESPONSES_LITE_HEADER)
+    }
+
     #[test]
-    fn responses_lite_header_follows_the_body_not_the_model_name() {
-        // codex-rs sends header and `reasoning.context = all_turns` together:
-        // kept, value normalised.
-        let mut decision = lite_decision(
-            "openai:responses",
-            json!({"model":"gpt-5.6-sol","reasoning":{"effort":"high","context":"all_turns"}}),
-            Some("stale"),
-        );
-        apply_to_decision("codex", &mut decision);
-        assert_eq!(
-            decision.provider_request_headers[RESPONSES_LITE_HEADER],
-            "true"
-        );
+    fn responses_lite_model_list_mirrors_the_manifest() {
+        for slug in [
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-daybreak-blue-latest",
+            "gpt-daybreak-red-latest",
+            "codex-auto-review",
+            " GPT-5.6-SOL ",
+        ] {
+            assert!(model_name_uses_responses_lite(slug), "{slug}");
+        }
+        for slug in ["gpt-5.5", "gpt-5.6-sol-mini", "gpt-5.6", "", "  "] {
+            assert!(!model_name_uses_responses_lite(slug), "{slug:?}");
+        }
+    }
+
+    #[test]
+    fn responses_lite_header_needs_a_lite_body_and_a_lite_capable_target() {
+        // codex-rs sends header and `reasoning.context = all_turns` together
+        // for a lite model served as itself: kept, value normalised.
+        for mapped in [Some("gpt-5.6-sol"), None] {
+            let mut decision = lite_decision(
+                "openai:responses",
+                json!({"model":"gpt-5.6-sol","reasoning":{"effort":"high","context":"all_turns"}}),
+                Some("stale"),
+                mapped,
+            );
+            apply_to_decision("codex", &mut decision);
+            assert_eq!(
+                decision.provider_request_headers[RESPONSES_LITE_HEADER], "true",
+                "{mapped:?}"
+            );
+        }
 
         // A lite-capable model name with a plain body (third-party client or
         // an older codex-rs without the manifest flag): the header must not be
@@ -180,37 +253,60 @@ mod tests {
             json!({"model":"gpt-6-astra","reasoning":{"effort":"high","context":"current_turn"}}),
             json!({"model":"gpt-5.6-luna"}),
         ] {
-            let mut decision = lite_decision("openai:responses", body.clone(), Some("true"));
+            let mut decision = lite_decision("openai:responses", body.clone(), Some("true"), None);
             apply_to_decision("codex", &mut decision);
-            assert!(
-                !decision
-                    .provider_request_headers
-                    .contains_key(RESPONSES_LITE_HEADER),
-                "{body}"
-            );
+            assert!(!has_lite(&decision), "{body}");
         }
 
-        // The body carries the lite marker but the header was lost on the way
-        // in: restored, also on compact and for a model outside any list.
+        // A lite body headed for a plain target: the pool remapped
+        // `gpt-5.6-luna` to `gpt-5.5`. The backend rejects the header for
+        // that model but accepts the body, so the header is dropped. This
+        // holds whether the body already names the target or the mapping is
+        // only known through `mapped_model`, on both endpoints.
         for api_format in ["openai:responses", "openai:responses:compact"] {
-            let mut decision = lite_decision(
-                api_format,
-                json!({"model":"gpt-5.5","reasoning":{"context":"all_turns"}}),
-                None,
-            );
-            apply_to_decision("codex", &mut decision);
-            assert_eq!(
-                decision.provider_request_headers[RESPONSES_LITE_HEADER], "true",
-                "{api_format}"
-            );
+            for (body, mapped) in [
+                (
+                    json!({"model":"gpt-5.5","reasoning":{"context":"all_turns"}}),
+                    None,
+                ),
+                (
+                    json!({"model":"gpt-5.5","reasoning":{"context":"all_turns"}}),
+                    Some("gpt-5.5"),
+                ),
+                (
+                    json!({"model":"gpt-5.6-luna","reasoning":{"context":"all_turns"}}),
+                    Some("gpt-5.5"),
+                ),
+            ] {
+                let mut decision = lite_decision(api_format, body.clone(), Some("true"), mapped);
+                apply_to_decision("codex", &mut decision);
+                assert!(!has_lite(&decision), "{api_format} {body} {mapped:?}");
+            }
         }
+
+        // Lite alias served as itself: `mapped_model` wins over a stale body
+        // model and the header is restored even if the client lost it.
+        let mut decision = lite_decision(
+            "openai:responses:compact",
+            json!({"model":"gpt-5.6-luna","reasoning":{"context":"all_turns"}}),
+            None,
+            Some("gpt-5.6-luna"),
+        );
+        apply_to_decision("codex", &mut decision);
+        assert!(has_lite(&decision));
 
         // No body at all: nothing to follow, header dropped.
         let mut headers = std::collections::BTreeMap::from([(
             RESPONSES_LITE_HEADER.to_string(),
             "true".to_string(),
         )]);
-        apply_responses_lite_header("codex", "openai:responses", &mut headers, None);
+        apply_responses_lite_header(
+            "codex",
+            "openai:responses",
+            &mut headers,
+            None,
+            Some("gpt-5.6-sol"),
+        );
         assert!(headers.is_empty());
     }
 

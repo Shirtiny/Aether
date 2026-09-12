@@ -396,35 +396,38 @@ from (select h.provider_request_headers::jsonb oh from usage_http_audits h join 
 
 注意审计里的 `provider_request_headers` 记录的是 planner 输出（**含**控制头、字母序、还没有 `cookie` / `content-encoding`），不是线缆形状；`leaked_controls` 在审计里为正是**预期**的，真正的出站形状只能抓包（`tcpdump` 到 443 看不到明文；用官方分析仓库的 mitm 方法对网关出口抓）。表中 `zstd` 列同理只有 planner 已写入 `content-encoding` 时才计数，正常为 0。真正要核对的是抓包：每个 `/backend-api/codex/responses` 请求头顺序与上表一致、`content-encoding: zstd`、第二个请求起带 `cookie`。
 
-### 3.12 `x-openai-internal-codex-responses-lite` 只跟随请求体（`.131`）
+### 3.12 `x-openai-internal-codex-responses-lite` 只在「lite 请求体 ∧ lite 目标模型」时发送（`.131` → `.132`）
 
 `.127` 起 `codex_routing_hint.rs` 按静态模型名单（`gpt-5.6-sol` / `gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-6-astra` / `gpt-daybreak-*` / `codex-auto-review`）给出站请求加该头。`.130` 把它首次带上线后（2026-09-12 01:38Z 起）`Go-http-client/1.1` 这类第三方客户端发到 `gpt-5.6-sol` 的请求全部 400：`X-OpenAI-Internal-Codex-Responses-Lite requires reasoning.context to be all_turns`；同一时段官方 Codex Desktop 0.153.4 的请求全部 200。
 
 原因：官方 codex-rs 只在模型 manifest `use_responses_lite` 为真时加该头，**同一个开关同时**把 body 改成 lite 契约——`reasoning.context = all_turns`、instructions 与 tools 折成 `input[]` 项、`parallel_tool_calls` 关（`core/src/client.rs` `build_reasoning_param` / `build_responses_request` / `add_responses_lite_header`）。头与体永远成对出现；后端校验的就是这一对。网关不改写 body 契约，也不拉 manifest，所以按模型名加头会造出真实客户端不会产生的「有头没体」。
 
-`.131` 起规则：该头只跟随 body。`reasoning.context == "all_turns"` → 带头（入站丢了也补回）；否则摘掉（入站带了也摘）；模型名不再参与。HTTP `/responses`、`/responses/compact` 与 WS 候选头同一规则（`codex_routing_hint::apply_responses_lite_header` 的 `body` 参数）。WS 每步 body 里的 `client_metadata.ws_request_header_x_openai_internal_codex_responses_lite` 一直是入站透传，握手不带该头（§3.11），都不受影响。
+`.131` 把规则改成「只跟随 body」（`reasoning.context == "all_turns"` → 带头，否则摘掉，模型名不参与）。上线 2 分钟后（02:55Z 起）出现第二个签名：官方 Codex Desktop 0.153.4 发到 `gpt-5.6-luna` 的请求 400 `This model is not supported when using X-OpenAI-Internal-Codex-Responses-Lite.`。原因是号池把 luna 映射到 `gpt-5.5`（`usage.target_model`；24h 内 luna→gpt-5.5 8.9k 条、terra→gpt-5.5 3.5k 条），客户端按 luna 的 manifest 造了 lite body，而目标 `gpt-5.5` 不支持 lite：后端拒绝**头**，但接受不带头的 lite body（`.130` 下同一路径 960 条 200）。luna→luna 带头是 200。
+
+`.132` 起规则（两者取交集）：`reasoning.context == "all_turns"` **且** 出站目标模型（`decision.mapped_model`，WS 候选用 `prepared.mapped_model`，缺失时退回 body `model`）在 lite 名单里（镜像 codex-rs `models-manager/models.json` 的 `use_responses_lite`：`gpt-6-astra` / `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-daybreak-blue-latest` / `gpt-daybreak-red-latest` / `codex-auto-review`）→ 带头（入站丢了也补回）；任一不满足 → 摘掉（入站带了也摘）。HTTP `/responses`、`/responses/compact` 与 WS 候选头同一规则（`codex_routing_hint::apply_responses_lite_header` 的 `body` + `target_model` 参数）。名单变化时要同步 `RESPONSES_LITE_MODELS`。WS 每步 body 里的 `client_metadata.ws_request_header_x_openai_internal_codex_responses_lite` 一直是入站透传，握手不带该头（§3.11），都不受影响。
 
 ```sql
--- 「有头没体」的 400 签名；.131 上线后应恒为 0
+-- 两个 lite 400 签名（有头没体 / 目标模型不支持 lite）；.132 上线后都应恒为 0
 select date_trunc('hour', created_at) h, model,
        coalesce(request_metadata::jsonb->>'client_family','<none>') fam, count(*)
 from usage
 where provider_name ilike 'Codex%' and status_code = 400
-  and error_message like 'X-OpenAI-Internal-Codex-Responses-Lite requires%'
+  and (error_message like 'X-OpenAI-Internal-Codex-Responses-Lite requires%'
+       or error_message like 'This model is not supported when using X-OpenAI-Internal-Codex-Responses-Lite%')
   and created_at >= :'since'
 group by 1,2,3 order by 1;
 ```
 
 ```sql
--- 出站 lite 头应与 body 一致：审计里带该头的请求都该来自 codex 家族客户端（第三方客户端不发 all_turns）
-select coalesce(u.request_metadata::jsonb->>'client_family','<none>') fam,
+-- 出站 lite 头应与 body 和目标模型一致：审计里带该头的请求都该来自 codex 家族客户端（第三方客户端不发 all_turns），且 target_model 都在 lite 名单里
+select coalesce(u.request_metadata::jsonb->>'client_family','<none>') fam, u.target_model,
        count(*) filter (where exists (select 1 from jsonb_object_keys(a.provider_request_headers::jsonb) k
                                       where lower(k)='x-openai-internal-codex-responses-lite')) with_lite,
        count(*) n
 from usage u join usage_http_audits a on a.request_id = u.request_id
 where u.provider_name ilike 'Codex%' and u.created_at >= :'since'
   and jsonb_typeof(a.provider_request_headers::jsonb)='object'
-group by 1 order by 3 desc;
+group by 1,2 order by 4 desc;
 ```
 
 ## 4. 日志事件与处置

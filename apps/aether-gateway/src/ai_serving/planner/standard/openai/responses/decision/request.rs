@@ -313,13 +313,15 @@ pub(crate) async fn resolve_local_openai_responses_codex_ws_candidate_parts(
             effective_headers,
         )
         .await;
-        // Responses Lite is a body contract; the header only ever accompanies
-        // a body the client already shaped for it.
+        // Responses Lite is a body contract checked against the served model:
+        // the header only accompanies a body the client already shaped for
+        // it, and only when the mapped target is lite-capable.
         crate::codex_routing_hint::apply_responses_lite_header(
             &transport.provider.provider_type,
             provider_api_format,
             &mut provider_request_headers,
             Some(body_json),
+            Some(prepared.mapped_model.as_str()),
         );
     }
 
