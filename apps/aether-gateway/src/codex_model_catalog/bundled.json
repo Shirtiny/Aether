@@ -10,6 +10,15 @@
       "priority": 1
     },
     {
+      "slug": "gpt-reserve",
+      "use_responses_lite": true,
+      "prefer_websockets": true,
+      "supported_in_api": true,
+      "visibility": "hide",
+      "minimal_client_version": "0.144.0",
+      "priority": 3
+    },
+    {
       "slug": "gpt-5.6-sol",
       "use_responses_lite": true,
       "prefer_websockets": true,

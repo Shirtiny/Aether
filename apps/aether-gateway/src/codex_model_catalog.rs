@@ -979,7 +979,7 @@ mod tests {
         RuntimeState::memory(aether_runtime_state::MemoryRuntimeStateConfig::default())
     }
 
-    const BUNDLED_LITE: [&str; 7] = [
+    const BUNDLED_LITE: [&str; 8] = [
         "codex-auto-review",
         "gpt-5.6-luna",
         "gpt-5.6-sol",
@@ -987,13 +987,14 @@ mod tests {
         "gpt-6-astra",
         "gpt-daybreak-blue-latest",
         "gpt-daybreak-red-latest",
+        "gpt-reserve",
     ];
 
     #[test]
     fn bundled_manifest_carries_the_capability_fields_only() {
         let bundled = bundled_snapshot();
         assert_eq!(bundled.client_version, BUNDLED_CLIENT_VERSION);
-        assert_eq!(bundled.models.len(), 11);
+        assert_eq!(bundled.models.len(), 12);
         assert_eq!(
             bundled.lite_slugs().into_iter().collect::<Vec<_>>(),
             BUNDLED_LITE
@@ -1020,6 +1021,21 @@ mod tests {
                 visibility: Some("list".to_string()),
                 minimal_client_version: Some("0.153.0".to_string()),
                 priority: Some(1),
+            }
+        );
+        // gpt-reserve is a server-only slug (absent from the upstream codex-rs
+        // models.json); its fields come from the live 0.154.0 snapshot, so
+        // regenerating from upstream alone would drop it (see runbook §5).
+        assert_eq!(
+            bundled.models["gpt-reserve"],
+            CodexModelCapability {
+                slug: "gpt-reserve".to_string(),
+                use_responses_lite: true,
+                prefer_websockets: Some(true),
+                supported_in_api: Some(true),
+                visibility: Some("hide".to_string()),
+                minimal_client_version: Some("0.144.0".to_string()),
+                priority: Some(3),
             }
         );
         assert!(ClientVersion::parse(CODEX_MANIFEST_FALLBACK_CLIENT_VERSION).is_some());
@@ -1257,6 +1273,7 @@ mod tests {
                 "gpt-6-astra".to_string(),
                 "gpt-daybreak-blue-latest".to_string(),
                 "gpt-daybreak-red-latest".to_string(),
+                "gpt-reserve".to_string(),
             ]
         );
         assert!(drift.contradicts());
@@ -1743,8 +1760,8 @@ mod tests {
             outcome,
             RefreshOutcome::Refreshed {
                 client_version: "0.155.0".to_string(),
-                model_count: 12,
-                lite_count: 8,
+                model_count: 13,
+                lite_count: 9,
                 drift_warned: true,
             }
         );

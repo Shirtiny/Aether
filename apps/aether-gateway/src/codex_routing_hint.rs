@@ -289,6 +289,7 @@ mod tests {
             "gpt-daybreak-blue-latest",
             "gpt-daybreak-red-latest",
             "codex-auto-review",
+            "gpt-reserve",
             " GPT-5.6-SOL ",
         ] {
             assert!(model_name_uses_responses_lite_with(None, slug), "{slug}");

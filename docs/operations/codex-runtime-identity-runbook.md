@@ -600,6 +600,8 @@ from (select (h.provider_request_headers::jsonb->>'x-codex-turn-metadata')::json
   EOF
   ```
 
+  > **服务端专属 slug（`.134` 起，重要）**：上游 `models-manager/models.json` 只含随 codex-rs 仓库发布的模型；OpenAI 服务端还会额外下发仓库里根本没有的 slug（就是 `codex_model_catalog_lite_drift` 的 `added` 项）。上面的命令从 upstream 生成，**不会**包含它们——每次重生成后必须**手工补回** `bundled.json`,否则会把它们丢掉。字段取当时线上快照的真实值（`aether-redis` `GET aether:codex:model_catalog:v1:<version>`，纯模型能力元数据、无密钥；口令用 `.env` 的 `REDIS_PASSWORD` + `--no-auth-warning`,不回显）。当前已知一条:`gpt-reserve`(`use_responses_lite:true, prefer_websockets:true, supported_in_api:true, visibility:"hide", minimal_client_version:"0.144.0", priority:3`,取自 0.154.0 快照,`.134` 已补入,`bundled.json` 现为 12 模型 / 8 lite)。`bundled_manifest_carries_the_capability_fields_only` 有对应断言,补漏时一并更新。
+
 ## 6. 回滚与关闭
 
 按影响从小到大：
