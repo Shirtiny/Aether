@@ -1687,6 +1687,10 @@ impl AppState {
             spawn_model_fetch_worker(self.clone()),
         );
         supervise_worker(
+            crate::task_runtime::TASK_KEY_CODEX_MODEL_CATALOG_WORKER,
+            crate::codex_model_catalog::spawn_codex_model_catalog_worker(self.clone()),
+        );
+        supervise_worker(
             crate::task_runtime::TASK_KEY_VIDEO_TASK_POLLER,
             spawn_video_task_poller(self.clone()),
         );

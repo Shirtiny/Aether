@@ -404,7 +404,7 @@ from (select h.provider_request_headers::jsonb oh from usage_http_audits h join 
 
 `.131` 把规则改成「只跟随 body」（`reasoning.context == "all_turns"` → 带头，否则摘掉，模型名不参与）。上线 2 分钟后（02:55Z 起）出现第二个签名：官方 Codex Desktop 0.153.4 发到 `gpt-5.6-luna` 的请求 400 `This model is not supported when using X-OpenAI-Internal-Codex-Responses-Lite.`。原因是号池把 luna 映射到 `gpt-5.5`（`usage.target_model`；24h 内 luna→gpt-5.5 8.9k 条、terra→gpt-5.5 3.5k 条），客户端按 luna 的 manifest 造了 lite body，而目标 `gpt-5.5` 不支持 lite：后端拒绝**头**，但接受不带头的 lite body（`.130` 下同一路径 960 条 200）。luna→luna 带头是 200。
 
-`.132` 起规则（两者取交集）：`reasoning.context == "all_turns"` **且** 出站目标模型（`decision.mapped_model`，WS 候选用 `prepared.mapped_model`，缺失时退回 body `model`）在 lite 名单里（镜像 codex-rs `models-manager/models.json` 的 `use_responses_lite`：`gpt-6-astra` / `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-daybreak-blue-latest` / `gpt-daybreak-red-latest` / `codex-auto-review`）→ 带头（入站丢了也补回）；任一不满足 → 摘掉（入站带了也摘）。HTTP `/responses`、`/responses/compact` 与 WS 候选头同一规则（`codex_routing_hint::apply_responses_lite_header` 的 `body` + `target_model` 参数）。名单变化时要同步 `RESPONSES_LITE_MODELS`。WS 每步 body 里的 `client_metadata.ws_request_header_x_openai_internal_codex_responses_lite` 一直是入站透传，握手不带该头（§3.11），都不受影响。
+`.132` 起规则（两者取交集）：`reasoning.context == "all_turns"` **且** 出站目标模型（`decision.mapped_model`，WS 候选用 `prepared.mapped_model`，缺失时退回 body `model`）在 lite 名单里（镜像 codex-rs `models-manager/models.json` 的 `use_responses_lite`：`gpt-6-astra` / `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-daybreak-blue-latest` / `gpt-daybreak-red-latest` / `codex-auto-review`）→ 带头（入站丢了也补回）；任一不满足 → 摘掉（入站带了也摘）。HTTP `/responses`、`/responses/compact` 与 WS 候选头同一规则（`codex_routing_hint::apply_responses_lite_header` 的 `body` + `target_model` 参数）。`.133` 起名单不再手抄：先查网关运行时拉到的官方 manifest 快照，快照没列的 slug 再退回内置精简副本（§3.13）。WS 握手不带该头（§3.11）；官方客户端把同一个 `use_responses_lite` 开关放进每步 body 的 `client_metadata.ws_request_header_x_openai_internal_codex_responses_lite`（字符串 `"true"`，`core/src/client.rs`），后端对它的校验与 HTTP 头一样。`.132` 及之前这个键是入站透传，所以 luna→gpt-5.5 的 WS 请求仍会 400 再回落 HTTP（48h 内 WS 上的 Codex 400 全是这一类）；`.133` 起步骤体里这个键按同一规则置 / 删（`codex_routing_hint::apply_codex_ws_responses_lite_flag`，在 `materialize_codex_ws_step_body` 里、身份改写之后、env-context 改写之前；首步与增量步都经过），没有 `client_metadata` 对象的 body 不新建。
 
 ```sql
 -- 两个 lite 400 签名（有头没体 / 目标模型不支持 lite）；.132 上线后都应恒为 0
@@ -430,6 +430,45 @@ where u.provider_name ilike 'Codex%' and u.created_at >= :'since'
 group by 1,2 order by 4 desc;
 ```
 
+### 3.13 Responses Lite 名单运行时跟随官方 manifest（`.133`）
+
+**数据流**：`codex_model_catalog.rs` 的后台任务（`codex.model_catalog.worker`，启动 15 s 后开始，之后每 300 s 一轮，镜像官方 `DEFAULT_MODEL_CACHE_TTL`）用号池里一个活跃 Codex 账号（Codex 类型 provider + `openai:responses` endpoint 且 base_url 是 `chatgpt.com/backend-api/codex`；`auto_fetch_models` 不影响）请求 `GET /backend-api/codex/models?client_version=<被跟随版本>`，出站身份是该账号自己的 UA / originator（版本 token 换成被跟随版本；账号冻结 UA 是预发布版（如 `0.153.0-alpha.5`）换不动、或没有具体 profile 时，保持模型同步的 `openai-codex/1.0` 且不带 `version` / `originator` 头，URL 与 UA 不会各说一个版本；debug 事件 `codex_model_catalog_identity_fallback`），bearer 与 `chatgpt-account-id` 由模型同步的计划构建器写好。响应里每个模型只留能力字段（`slug` / `use_responses_lite` / `prefer_websockets` / `supported_in_api` / `visibility` / `minimal_client_version` / `priority`），`base_instructions` 等提示词一律丢弃，不落库。
+
+**被跟随版本**：客户端发版登记表 `aether:codex:client_release:v1:{provider_id}:{family}`（§3.10）里所有 Codex provider × family 的最大版本（不套错峰），没有任何记录时用常量 `CODEX_MANIFEST_FALLBACK_CLIENT_VERSION`（与内置副本一起维护）。要用真实版本是因为服务端按 `client_version` 门控：模型同步硬编码的 `0.128.0-alpha.1` 只能看到 3 个模型，sol / terra / luna / astra / daybreak 全被 `minimal_client_version` 隐藏。
+
+**存储**：Redis `aether:codex:model_catalog:v1:<client_version>`（整份快照 JSON，TTL 7 天，重启后先读回）、`aether:codex:model_catalog:v1:refresh_lock`（60 s 锁，多实例只让一个实例拉）。同一版本的文档距上次拉取不到一个刷新间隔时只装载不请求。账号按 `key_id` 排序、按轮次轮转，一轮最多试 3 个；14 个账号摊下来单账号约 70 min 一次。拉取走 `execute_execution_runtime_sync_plan`，不参与 key 健康分 / 熔断记账，失败不会降级账号。
+
+**三级查询**（`codex_routing_hint::model_name_uses_responses_lite`，HTTP 四个位点、WS 候选头、WS 步骤体标记同一入口）：进程内快照列出了目标 slug → 以它为准（`true` / `false` 都算命中，所以某模型 lite 被撤时快照 `false` 覆盖内置 `true`）；快照没列（版本门控隐藏 / 自定义名）→ 内置精简副本 `codex_model_catalog/bundled.json`；两边都没有 → 不是 lite。开关关掉时只查内置副本。
+
+**漂移观测**：每次成功刷新把快照 lite 集合与内置副本比较，`added`（manifest 有、内置无）/ `removed`（内置有、manifest 明确说不是）非空 → `codex_model_catalog_lite_drift` warn（同一差异签名只 warn 一次），`hidden`（内置有、manifest 根本没列）只 debug。快照超过 24 h 没刷新成功 → 每小时一次 `codex_model_catalog_stale`，继续用旧快照。
+
+**复核**：
+
+```bash
+docker logs aether-app --since 10m 2>&1 | grep -E 'codex_model_catalog_' | cut -c1-300
+# 期望：启动 15 s 内 codex_model_catalog_loaded（首次部署没有 Redis 文档则直接 _refreshed），client_version = 登记表最新（当前 0.154.0），model_count >= 11、lite_count = 7，没有 _lite_drift / _refresh_failed
+```
+
+```bash
+# Redis 文档存在且 TTL ≈ 7 天（口令来自 .env，不回显）
+(. ./.env; export REDISCLI_AUTH="$REDIS_PASSWORD"; docker exec -e REDISCLI_AUTH aether-redis redis-cli --no-auth-warning --scan --pattern 'aether:codex:model_catalog:v1:*'; docker exec -e REDISCLI_AUTH aether-redis redis-cli --no-auth-warning ttl aether:codex:model_catalog:v1:0.154.0)
+```
+
+```sql
+-- §3.12 的两个 lite 400 签名按路径拆：.133 上线后 HTTP 与 WS 都应为 0（WS 行的 request_id 以 ws- 开头）
+select date_trunc('hour', created_at) h,
+       case when request_id like 'ws-%' then 'ws' else 'http' end path,
+       model, target_model, count(*)
+from usage
+where provider_name ilike 'Codex%' and status_code = 400
+  and (error_message like 'X-OpenAI-Internal-Codex-Responses-Lite requires%'
+       or error_message like 'This model is not supported when using X-OpenAI-Internal-Codex-Responses-Lite%')
+  and created_at >= :'since'
+group by 1,2,3,4 order by 1,2;
+```
+
+上线后 1 h 内还看一眼出站 `/models` 的节奏：`codex_model_catalog_refreshed` 每 5 min 一条、`key_id` 轮转不重复；连续多条 `_refresh_failed` 先看 §4。
+
 ## 4. 日志事件与处置
 
 ```bash
@@ -451,6 +490,12 @@ docker logs aether-app --since 2026-09-05T06:40:00Z 2>&1 | grep -E 'codex_rid_' 
 | `codex_env_tz_rejected`（warn，.122） | 某个时区候选被拒：`source`、`value`、`reason`（`empty` / `denied_region` / `unknown_iana_name` / `not_a_region_city_zone`） | `denied_region` = 配了中国时区，绝不能放行，改 `TZ`；`not_a_region_city_zone` = `UTC` / `Etc/*` / `EST` 之类，换成 `Region/City` 形。修完重建 `app` |
 | `codex_env_context_rewritten`（有删 / 插 / 追加时 info，否则 debug，.122） | 本请求 `<environment_context>` 改写计数：`surface`、`thread`、`blocks_seen`、`timezone_rewritten`、`date_rewritten`、`blocks_removed`、`blocks_inserted`、`blocks_appended`、`instant_source_*`、`unknown_child_tags`、`user_location_removed`、`prefix_cache_ids_rewritten`（.123 候选：按出站 thread 重推的 `msg_` / `at_` UUIDv5 前缀缓存 id 数） | 正常行为。`instant_source_heuristic` 长期占比高说明大量无 id 旧客户端；`blocks_removed` 持续为 0 而下游时区不是目标时区，检查 kill switch 是否被关 |
 | `codex_env_unknown_child_tag`（首次 warn、之后 debug，.122） | `<environment_context>` 里出现解析器不认识的顶层子标签，块按「含未知」处理：只改 tz / 日期，不判重不删 | 到 codex-rs `core/src/context/world_state/environment.rs` 看新标签是否为官方新增标量；是则加进解析器与判重集合并补单测 |
+| `codex_model_catalog_disabled`（info，.133，启动一次） | `AETHER_CODEX_MODEL_CATALOG=off`，运行时跟随关闭，只用内置名单 | 预期只在有意关闭时出现；否则查 compose `environment:` |
+| `codex_model_catalog_loaded`（info，.133） | 启动时从 Redis 读回快照：`client_version`、`model_count`、`lite_count`、`age_secs` | 正常。`age_secs` 很大说明上次运行长期拉不到，看同批 `_refresh_failed` |
+| `codex_model_catalog_refreshed`（info，.133，每 5 min） | 成功拉到 manifest：`client_version`、`model_count`、`lite_count`、`etag_changed`、`provider_id`、`key_id` | 正常。`lite_count` 与内置副本（7）不同时必有一条 `_lite_drift` 说明差在哪 |
+| `codex_model_catalog_refresh_failed`（warn，.133） | 某账号拉 manifest 失败（`status_code` / 错误文本前 200 字、`provider_id`、`key_id`），会换下一个账号；一轮全失败保留旧快照 | 偶发正常（单账号 401 / 网络）。连续 > 1 h：先看该账号 OAuth 是否过期、代理是否通，再看被跟随版本是否被服务端拒（`client_version` 太旧 / 太新都会 4xx）；期间决策用旧快照，24 h 后转 `_stale` |
+| `codex_model_catalog_lite_drift`（warn，.133，同签名一次） | 拉到的 lite 集合与内置副本矛盾：`added` / `removed`（`hidden` 只是版本门控，不算） | 决策已经跟着 manifest 走，不用救火。按 §5 命令重新生成 `bundled.json`、更新 `CODEX_MANIFEST_FALLBACK_CLIENT_VERSION`、更新 §3.12 名单并发版，让兜底与线上一致 |
+| `codex_model_catalog_stale`（warn，.133，每小时一次） | 快照超过 24 h 没刷新成功，仍在使用 | 同 `_refresh_failed` 的处置；确认后台任务还活着（`task_runtime` 里 `codex.model_catalog.worker`） |
 
 ### 4.1 未知键判定流程（白名单维护）
 
@@ -540,6 +585,20 @@ from (select (h.provider_request_headers::jsonb->>'x-codex-turn-metadata')::json
 - `codex-rs/codex-api/src/requests/headers.rs`：`build_session_headers`（只有 dash 形式 `session-id` / `thread-id`）。
 - `codex-rs/codex-api/src/endpoint/responses.rs`、`endpoint/compact.rs`：`/responses` 加 `x-client-request-id` = thread，compact 不加。
 - `.130` 传输层保真的基准（按 0.154.0 抓包 + 源码）：`core/src/client.rs` `build_websocket_headers`（WS 握手头顺序）、`build_responses_options`（HTTP 头组装顺序；线缆顺序以抓包为准）；`http-client/src/request.rs`（`zstd::stream::encode_all(.., 3)` + `content-encoding: zstd`，只在 `/responses`）；`http-client/src/chatgpt_cloudflare_cookies.rs`、`chatgpt_hosts.rs`（cookie 名单、允许主机）；`features/src/lib.rs` `EnableRequestCompression`（Stable，默认开）；`core/src/client.rs` compact 路径的 `X_CODEX_INSTALLATION_ID_HEADER`（只有 compact 发这个头）与 `core/src/responses_metadata.rs` `compatibility_headers()`（window-id / turn-metadata / parent-thread / subagent，不含 installation-id）。再核对时看这几处有没有新头 / 新 cookie 名 / 压缩范围变化。
+- `.133` Responses Lite 名单跟随的基准：`models-manager/src/manager.rs`（`DEFAULT_MODEL_CACHE_TTL` 300 s、`fetch_and_update_models` 以 `client_version_to_whole()` 拉、只记响应 `ETag`、`refresh_if_new_etag`）、`codex-api/src/endpoint/models.rs`（`GET {base}/models?client_version=X` 普通 GET）、`protocol/src/openai_models.rs`（`ModelInfo.use_responses_lite` 等字段）、`core/src/client.rs`（`add_responses_lite_header` 与 WS 步骤体 `client_metadata` 里的 `ws_request_header_x_openai_internal_codex_responses_lite = "true"`）、`models-manager/models.json`（内置 manifest）。内置精简副本 `apps/aether-gateway/src/codex_model_catalog/bundled.json` 由下面的命令重新生成（只保留能力字段，禁止带入任何 `base_instructions` 提示词；生成后把 `BUNDLED_CLIENT_VERSION` 改成新的 codex-rs 短 hash、`CODEX_MANIFEST_FALLBACK_CLIENT_VERSION` 改成当前稳定版，并让 `codex_model_catalog::tests::bundled_manifest_carries_the_capability_fields_only` 与 §3.12 的名单跟上）：
+
+  ```bash
+  python3 - <<'EOF'
+  import json
+  keep = ("slug", "use_responses_lite", "prefer_websockets", "supported_in_api", "visibility", "minimal_client_version", "priority")
+  src = json.load(open("/opt/stacks/openai-codex/codex-rs/models-manager/models.json"))
+  models = [{k: m[k] for k in keep if k in m} for m in src["models"]]
+  out = json.dumps({"models": models}, indent=2, ensure_ascii=False) + "\n"
+  assert "instructions" not in out.lower()
+  open("apps/aether-gateway/src/codex_model_catalog/bundled.json", "w").write(out)
+  print(len(models), "models;", sum(1 for m in models if m.get("use_responses_lite")), "lite")
+  EOF
+  ```
 
 ## 6. 回滚与关闭
 
@@ -550,6 +609,7 @@ from (select (h.provider_request_headers::jsonb->>'x-codex-turn-metadata')::json
 3. **Redis 键**：`ap:{provider_id}:codex_rid:*` 都有 TTL，回滚后自然过期。不要手动清：清掉等于让所有活跃 thread 换身份，上游看到一批新 thread。
 4. **只关 `<environment_context>` 归一化（.122）**：给 `app` 容器加环境变量 `AETHER_CODEX_ENVIRONMENT_CONTEXT_REWRITE=off`（compose `environment:`）并只重建 `app`，秒级；身份合成不受影响。关掉后出站 `<timezone>` / `<current_date>` 立刻回到下游真实值，上游会看到该账号时区跳变一次。要换目标时区而不是关掉：改 `TZ`（或 `AETHER_CODEX_ENVIRONMENT_TIMEZONE`）后重建 `app`，中国时区会被拒绝并回退到 `America/New_York`（看 `codex_env_tz_rejected`）。
 5. **只关传输层保真（.130）**：给 `app` 容器加 `AETHER_CODEX_TRANSPORT_FIDELITY=off` 并只重建 `app`，秒级。关掉后出站头回到字母序、`/responses` 体回到明文、不再回放 CF cookie、`x-codex-installation-id` 头回到每个请求都带，四项一起关（没有单项开关；单项异常请回滚镜像）。WS 握手头顺序不受此开关影响（那是 WS 运行时的固定组装顺序，没有开关）。
+6. **只关 Responses Lite 名单运行时跟随（.133）**：给 `app` 容器加 `AETHER_CODEX_MODEL_CATALOG=off` 并只重建 `app`，秒级。关掉后不再拉 `/models`、不读 Redis 快照，lite 头与 WS 步骤体标记只按内置精简副本判定（即 `.132` 的静态名单行为）；WS 步骤体标记按目标模型置 / 删这条规则本身没有单独开关。`AETHER_CODEX_MODEL_CATALOG_INTERVAL_SECS` 调刷新间隔（下限 60）。Redis 键 `aether:codex:model_catalog:v1:*` 有 7 天 TTL，回滚后自然过期，不用清。
 
 ## 7. 已知限制（不需要处理，只需知道）
 
@@ -574,3 +634,4 @@ from (select h.provider_request_headers::jsonb oh from usage_http_audits h join 
 
 - **`<environment_context>` 时区 / 日期归一化（.122）的残余**：只改 `<timezone>` / `<current_date>`，`<cwd>` / `<shell>` 与出站 UA 的 OS 可能不一致（PowerShell 路径配 macOS UA），用户已接受。请求时刻本身改不了：`turn_started_at_unix_ms` 是 UTC epoch，上游始终看得到真实作息节律（14 天样本按美国时区 41–45% 落在本地 00–07 点），要治只能在调度层按账号分「活跃时段」，属独立计划。上线一刻正在进行的线程会被一次性改写历史（tz 换、部分日切块删 / 插），prompt cache 失一次后稳定。无 id 的旧客户端形状只能 best-effort。WS 增量步的状态只活在进程内：重启或换绑后的第一个增量步若正好跨午夜会漏一块，下一 turn 的全量回放会补上。宿主 `/etc/timezone` 陈旧为 `Europe/Berlin` 不影响容器（容器走 `TZ`）。详见 `docs/architecture/codex-environment-context-time-normalization-plan-2026-09-10.md` §9。
 - **传输层保真（.130）的残余**：（a）Cloudflare cookie jar 只在网关进程内存里（上限 4096 个账号×主机 jar、每 jar 32 个 cookie，会话 cookie 24h 不用即失效），重启后第一个请求又是无 cookie 的「新进程」形状；多实例部署各自一份 jar，同一账号跨实例会呈现两套 `__cf_bm`，与官方「一个进程一个 jar」的语义相比是可见但轻微的差异。（b）走 `aether-tunnel` 中继（`proxy.mode = tunnel`）的请求，头顺序在中继协议里被转成 `BTreeMap` 后丢失，中继出口仍是字母序；cookie / zstd 不受影响。直连与浏览器 wreq 后端保持顺序。（c）`x-openai-internal-codex-residency` / `x-oai-attestation` / `x-openai-memgen-request` 抓包里没有，位置按源码组装顺序排，若官方线缆顺序不同属可接受偏差。（d）官方 `/responses` 之外的 HTTP（compact、search）本来就不压缩，Aether 同样不压缩；若未来 codex-rs 扩大压缩范围需要跟进。（e）不做任何 TLS 指纹层面的改动：Codex profile 已是 native TLS 无 ALPN、HTTP/1.1，与官方一致。
+- **Responses Lite 名单运行时跟随（.133）的残余**：（a）新 lite 模型上线到网关知道之间最多一个刷新间隔（300 s）的空窗，这期间该模型的 lite body 不带头，与 `.132` 行为相同（后端接受不带头的 lite body）；官方靠 `/responses` 响应头 `X-Models-Etag` 即时触发重拉，网关暂不观测该头（落点在 `execution_runtime/stream/execution.rs`，另议）。（b）manifest 按被跟随版本拉，登记表最新版本若比线上多数客户端新，`hidden` 集合会变化但不影响决策（快照没列的 slug 退回内置）。（c）多实例各自一份进程内快照，靠同一份 Redis 文档与刷新锁收敛，最坏差一个刷新间隔。（d）模型同步（`upstream_models:*`）仍用 `0.128.0-alpha.1`，只能看到 3 个模型，与本机制无关，改它会让 `allowed_models` 关联膨胀，另议。

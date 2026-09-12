@@ -1,29 +1,41 @@
 use serde_json::Value;
 
+use crate::codex_model_catalog::CodexModelCatalogSnapshot;
 use crate::AiExecutionDecision;
 
 pub(crate) const HEADER: &str = "x-codex-routing-hint";
 pub(crate) const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 
-/// Slugs whose server manifest sets `use_responses_lite`. Mirror of codex-rs
-/// `models-manager/models.json` (7 entries as of 2026-09-12). Aether does not
-/// fetch the manifest at request time, so the capability lives here.
-const RESPONSES_LITE_MODELS: &[&str] = &[
-    "gpt-6-astra",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-    "gpt-daybreak-blue-latest",
-    "gpt-daybreak-red-latest",
-    "codex-auto-review",
-];
+/// codex-rs `client_metadata` key carrying the lite flag on a WebSocket step
+/// body (`core/src/client.rs`; the value is the string `"true"`, the map is
+/// `HashMap<String, String>` there).
+pub(crate) const WS_RESPONSES_LITE_METADATA_KEY: &str =
+    "ws_request_header_x_openai_internal_codex_responses_lite";
 
+/// Whether `model` is Responses Lite-capable according to the server manifest
+/// (`use_responses_lite`). Three sources in order (`codex_model_catalog`): the
+/// live manifest snapshot when it lists the slug, the bundled slim manifest
+/// when it does not, `false` when neither knows the slug.
 pub(crate) fn model_name_uses_responses_lite(model: &str) -> bool {
+    model_name_uses_responses_lite_with(
+        crate::codex_model_catalog::current_snapshot().as_deref(),
+        model,
+    )
+}
+
+/// Pure form: a live hit (`true` or `false`) wins, a miss falls back to the
+/// bundled manifest.
+pub(crate) fn model_name_uses_responses_lite_with(
+    live: Option<&CodexModelCatalogSnapshot>,
+    model: &str,
+) -> bool {
     let model = model.trim();
-    !model.is_empty()
-        && RESPONSES_LITE_MODELS
-            .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(model))
+    if model.is_empty() {
+        return false;
+    }
+    live.and_then(|snapshot| snapshot.uses_responses_lite(model))
+        .or_else(|| crate::codex_model_catalog::bundled_snapshot().uses_responses_lite(model))
+        .unwrap_or(false)
 }
 
 /// codex-rs flags a Responses Lite request in two places at once, both keyed
@@ -61,6 +73,24 @@ pub(crate) fn apply_responses_lite_header(
     body: Option<&Value>,
     target_model: Option<&str>,
 ) {
+    apply_responses_lite_header_with(
+        crate::codex_model_catalog::current_snapshot().as_deref(),
+        provider_type,
+        provider_api_format,
+        headers,
+        body,
+        target_model,
+    )
+}
+
+fn apply_responses_lite_header_with(
+    live: Option<&CodexModelCatalogSnapshot>,
+    provider_type: &str,
+    provider_api_format: &str,
+    headers: &mut std::collections::BTreeMap<String, String>,
+    body: Option<&Value>,
+    target_model: Option<&str>,
+) {
     if !provider_type.trim().eq_ignore_ascii_case("codex")
         || !matches!(
             crate::ai_serving::normalize_api_format_alias(provider_api_format).as_str(),
@@ -78,9 +108,50 @@ pub(crate) fn apply_responses_lite_header(
                 .and_then(Value::as_str)
         });
     if body.is_some_and(body_uses_responses_lite)
-        && target.is_some_and(model_name_uses_responses_lite)
+        && target.is_some_and(|target| model_name_uses_responses_lite_with(live, target))
     {
         headers.insert(RESPONSES_LITE_HEADER.to_string(), "true".to_string());
+    }
+}
+
+/// WebSocket step-body twin of [`apply_responses_lite_header`]. The WS
+/// handshake carries no lite header; codex-rs puts the flag into every step
+/// body as `client_metadata.ws_request_header_x_openai_internal_codex_responses_lite`
+/// (`"true"`), and the backend checks it against the served model exactly
+/// like the HTTP header. The inbound value is what the client shaped for its
+/// own alias; when the pool remaps a lite alias to a plain target that flag
+/// is the WS form of "header on a non-lite model" (400, client falls back to
+/// HTTP). Same rule: set when the body is lite-shaped and `mapped_model` is
+/// lite-capable, removed otherwise. A body without a `client_metadata` object
+/// is left without one.
+pub(crate) fn apply_codex_ws_responses_lite_flag(body: &mut Value, mapped_model: &str) {
+    apply_codex_ws_responses_lite_flag_with(
+        crate::codex_model_catalog::current_snapshot().as_deref(),
+        body,
+        mapped_model,
+    )
+}
+
+fn apply_codex_ws_responses_lite_flag_with(
+    live: Option<&CodexModelCatalogSnapshot>,
+    body: &mut Value,
+    mapped_model: &str,
+) {
+    let lite =
+        body_uses_responses_lite(body) && model_name_uses_responses_lite_with(live, mapped_model);
+    let Some(metadata) = body
+        .get_mut("client_metadata")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if lite {
+        metadata.insert(
+            WS_RESPONSES_LITE_METADATA_KEY.to_string(),
+            Value::String("true".to_string()),
+        );
+    } else {
+        metadata.remove(WS_RESPONSES_LITE_METADATA_KEY);
     }
 }
 
@@ -209,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_lite_model_list_mirrors_the_manifest() {
+    fn responses_lite_model_list_mirrors_the_bundled_manifest() {
         for slug in [
             "gpt-6-astra",
             "gpt-5.6-sol",
@@ -220,11 +291,145 @@ mod tests {
             "codex-auto-review",
             " GPT-5.6-SOL ",
         ] {
-            assert!(model_name_uses_responses_lite(slug), "{slug}");
+            assert!(model_name_uses_responses_lite_with(None, slug), "{slug}");
         }
         for slug in ["gpt-5.5", "gpt-5.6-sol-mini", "gpt-5.6", "", "  "] {
-            assert!(!model_name_uses_responses_lite(slug), "{slug:?}");
+            assert!(!model_name_uses_responses_lite_with(None, slug), "{slug:?}");
         }
+    }
+
+    fn live_snapshot(entries: &[(&str, bool)]) -> CodexModelCatalogSnapshot {
+        CodexModelCatalogSnapshot::from_models(
+            "0.155.0",
+            None,
+            0,
+            entries
+                .iter()
+                .map(
+                    |(slug, lite)| crate::codex_model_catalog::CodexModelCapability {
+                        slug: slug.to_string(),
+                        use_responses_lite: *lite,
+                        ..Default::default()
+                    },
+                )
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn responses_lite_follows_the_live_manifest_before_the_bundled_copy() {
+        let live = live_snapshot(&[
+            ("gpt-5.7-nova", true),
+            ("gpt-5.6-luna", false),
+            ("gpt-5.5", false),
+        ]);
+        // A lite model the bundled copy does not know yet: live wins.
+        assert!(model_name_uses_responses_lite_with(
+            Some(&live),
+            "gpt-5.7-nova"
+        ));
+        assert!(!model_name_uses_responses_lite_with(None, "gpt-5.7-nova"));
+        // Live says luna is no longer lite: overrides the bundled `true`.
+        assert!(!model_name_uses_responses_lite_with(
+            Some(&live),
+            "gpt-5.6-luna"
+        ));
+        // Not listed live (version gate): the bundled copy answers.
+        assert!(model_name_uses_responses_lite_with(
+            Some(&live),
+            "gpt-5.6-sol"
+        ));
+        assert!(!model_name_uses_responses_lite_with(Some(&live), "gpt-5.5"));
+        assert!(!model_name_uses_responses_lite_with(
+            Some(&live),
+            "gpt-5.5-unknown"
+        ));
+        assert!(!model_name_uses_responses_lite_with(Some(&live), " "));
+
+        // Through the header rule: a lite body for nova gets the header only
+        // once the live snapshot knows the model.
+        let body = json!({"model":"gpt-5.7-nova","reasoning":{"context":"all_turns"}});
+        for (live, expected) in [(Some(&live), true), (None, false)] {
+            let mut headers = std::collections::BTreeMap::new();
+            apply_responses_lite_header_with(
+                live,
+                "codex",
+                "openai:responses",
+                &mut headers,
+                Some(&body),
+                Some("gpt-5.7-nova"),
+            );
+            assert_eq!(headers.contains_key(RESPONSES_LITE_HEADER), expected);
+        }
+    }
+
+    fn ws_step_body(model: &str, lite_body: bool, inbound_flag: Option<&str>) -> Value {
+        let mut body = json!({
+            "type": "response.create",
+            "model": model,
+            "input": [],
+            "reasoning": {"effort": "high"},
+            "client_metadata": {"x-codex-ws-stream-request-start-ms": "1"}
+        });
+        if lite_body {
+            body["reasoning"]["context"] = json!("all_turns");
+        }
+        if let Some(flag) = inbound_flag {
+            body["client_metadata"][WS_RESPONSES_LITE_METADATA_KEY] = json!(flag);
+        }
+        body
+    }
+
+    #[test]
+    fn ws_step_body_lite_flag_follows_the_body_and_the_target_model() {
+        // Lite alias served as itself, client lost the flag: restored as the
+        // string codex-rs sends.
+        let mut body = ws_step_body("gpt-5.6-luna", true, None);
+        apply_codex_ws_responses_lite_flag_with(None, &mut body, "gpt-5.6-luna");
+        assert_eq!(
+            body["client_metadata"][WS_RESPONSES_LITE_METADATA_KEY],
+            json!("true")
+        );
+
+        // Lite alias remapped to a plain target: the flag goes, the body stays.
+        let mut body = ws_step_body("gpt-5.6-luna", true, Some("true"));
+        apply_codex_ws_responses_lite_flag_with(None, &mut body, "gpt-5.5");
+        assert!(body["client_metadata"]
+            .get(WS_RESPONSES_LITE_METADATA_KEY)
+            .is_none());
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert_eq!(
+            body["client_metadata"]["x-codex-ws-stream-request-start-ms"],
+            "1"
+        );
+
+        // Plain body for a lite model (third-party client): flag dropped.
+        let mut body = ws_step_body("gpt-5.6-luna", false, Some("true"));
+        apply_codex_ws_responses_lite_flag_with(None, &mut body, "gpt-5.6-luna");
+        assert!(body["client_metadata"]
+            .get(WS_RESPONSES_LITE_METADATA_KEY)
+            .is_none());
+
+        // No `client_metadata`: nothing is created.
+        let mut body = ws_step_body("gpt-5.6-luna", true, None);
+        body.as_object_mut().unwrap().remove("client_metadata");
+        apply_codex_ws_responses_lite_flag_with(None, &mut body, "gpt-5.6-luna");
+        assert!(body.get("client_metadata").is_none());
+
+        // A non-object `client_metadata` is left alone.
+        let mut body = ws_step_body("gpt-5.6-luna", true, None);
+        body["client_metadata"] = json!("opaque");
+        apply_codex_ws_responses_lite_flag_with(None, &mut body, "gpt-5.6-luna");
+        assert_eq!(body["client_metadata"], "opaque");
+
+        // The live manifest decides for a model the bundled copy does not know.
+        let live = live_snapshot(&[("gpt-5.7-nova", true)]);
+        let mut body = ws_step_body("gpt-5.7-nova", true, None);
+        apply_codex_ws_responses_lite_flag_with(Some(&live), &mut body, "gpt-5.7-nova");
+        assert_eq!(
+            body["client_metadata"][WS_RESPONSES_LITE_METADATA_KEY],
+            json!("true")
+        );
     }
 
     #[test]

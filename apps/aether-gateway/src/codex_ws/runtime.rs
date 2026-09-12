@@ -3319,6 +3319,12 @@ fn materialize_codex_ws_step_body(
             user_agent.as_deref(),
         );
     }
+    // Responses Lite flag of the step body follows the HTTP header rule
+    // (`codex_routing_hint`): kept only for a lite-shaped body headed to a
+    // lite-capable target. The inbound flag is what the client shaped for its
+    // own alias; a pool remapping `gpt-5.6-luna` to `gpt-5.5` must not forward
+    // it (the backend answers 400 and the client falls back to HTTP).
+    crate::codex_routing_hint::apply_codex_ws_responses_lite_flag(&mut body, mapped_model);
     // Model-visible host clock (`<timezone>` / `<current_date>`), after the
     // identity pass so synthesized ids are seeded by the outbound thread.
     let mut env_context_state = None;
@@ -4978,6 +4984,86 @@ mod tests {
             crate::codex_routing_hint::from_body(&hint_body).as_deref(),
             Some("model=gpt-5.6-sol;tier=priority")
         );
+    }
+
+    fn lite_step_body(
+        model: &str,
+        lite_body: bool,
+        inbound_flag: Option<&str>,
+    ) -> serde_json::Value {
+        let mut body = json!({
+            "type": "response.create",
+            "model": model,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}]
+            }],
+            "reasoning": {"effort": "high"},
+            "client_metadata": {"x-codex-ws-stream-request-start-ms": "1"}
+        });
+        if lite_body {
+            body["reasoning"]["context"] = json!("all_turns");
+        }
+        if let Some(flag) = inbound_flag {
+            body["client_metadata"][crate::codex_routing_hint::WS_RESPONSES_LITE_METADATA_KEY] =
+                json!(flag);
+        }
+        body
+    }
+
+    fn materialize_lite_step(body: serde_json::Value, mapped_model: &str) -> serde_json::Value {
+        materialize_codex_ws_step_body(
+            body,
+            mapped_model,
+            false,
+            None,
+            &HeaderMap::new(),
+            false,
+            None,
+            &[],
+            None,
+            None,
+            crate::orchestration::ResponsesWebSocketAdapter::Codex,
+            "codex",
+            None,
+            None,
+        )
+        .expect("body should materialize")
+        .json
+    }
+
+    #[test]
+    fn materialized_step_body_lite_flag_matches_the_body_and_the_target_model() {
+        let key = crate::codex_routing_hint::WS_RESPONSES_LITE_METADATA_KEY;
+
+        // Lite alias served as itself: the flag is present even if the client
+        // dropped it, as the string codex-rs sends.
+        let out = materialize_lite_step(lite_step_body("gpt-5.6-luna", true, None), "gpt-5.6-luna");
+        assert_eq!(out["client_metadata"][key], json!("true"));
+
+        // Lite alias remapped to a plain target: inbound flag removed, the
+        // lite body itself is forwarded unchanged.
+        let out = materialize_lite_step(
+            lite_step_body("gpt-5.6-luna", true, Some("true")),
+            "gpt-5.5",
+        );
+        assert!(out["client_metadata"].get(key).is_none(), "{out}");
+        assert_eq!(out["reasoning"]["context"], "all_turns");
+        assert_eq!(out["model"], "gpt-5.5");
+
+        // Plain body for a lite model: flag removed.
+        let out = materialize_lite_step(
+            lite_step_body("gpt-5.6-luna", false, Some("true")),
+            "gpt-5.6-luna",
+        );
+        assert!(out["client_metadata"].get(key).is_none(), "{out}");
+
+        // No `client_metadata` on the step: none is created.
+        let mut body = lite_step_body("gpt-5.6-luna", true, None);
+        body.as_object_mut().unwrap().remove("client_metadata");
+        let out = materialize_lite_step(body, "gpt-5.6-luna");
+        assert!(out.get("client_metadata").is_none(), "{out}");
     }
 
     #[test]

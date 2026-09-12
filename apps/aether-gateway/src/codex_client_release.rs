@@ -459,6 +459,28 @@ impl<'a> ClientReleaseStore<'a> {
         Ok(records)
     }
 
+    /// Every originator family with a registry key under this provider,
+    /// sorted. Scans the provider's key prefix; the key layout is
+    /// `{domain}:{provider_id}:{family}`.
+    pub(crate) async fn families(&self) -> Result<Vec<String>, String> {
+        self.check()?;
+        let prefix = format!("{RELEASE_KEY_DOMAIN}:{}:", self.provider_id);
+        let keys = self
+            .runtime
+            .scan_keys(&format!("{prefix}*"), 100)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut families = keys
+            .iter()
+            .filter_map(|key| key.strip_prefix(prefix.as_str()))
+            .filter(|family| !family.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        families.sort();
+        families.dedup();
+        Ok(families)
+    }
+
     /// Records `version` as seen at `observed_at`. The member carries the
     /// version's first-seen stamp (kept from its first observation, because
     /// the adoption lag is measured from it) and its last-seen stamp (moved

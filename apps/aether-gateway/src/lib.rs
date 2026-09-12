@@ -37,6 +37,7 @@ mod client_session_affinity;
 mod clock;
 mod codex_client_release;
 mod codex_environment_context;
+mod codex_model_catalog;
 mod codex_profile;
 mod codex_routing_hint;
 mod codex_runtime_identity;

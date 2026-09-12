@@ -165,6 +165,22 @@ pub async fn build_standard_models_fetch_execution_plan(
     .await
 }
 
+/// The Codex model manifest fetch as the client build `client_version`
+/// names: `GET {base}/models?client_version=<major.minor.patch>`, the request
+/// codex-rs `models-manager` sends at session start. Same auth, account
+/// header, header rules and proxy as the standard fetch; only the version is
+/// the caller's instead of the model-sync default (the server hides every
+/// model whose `minimal_client_version` is above the asked version).
+pub async fn build_codex_models_manifest_execution_plan(
+    runtime: &(impl ModelFetchTransportRuntime + ?Sized),
+    transport: &GatewayProviderTransportSnapshot,
+    client_version: &str,
+) -> Result<ExecutionPlan, String> {
+    let mut plan = build_standard_models_fetch_execution_plan(runtime, transport, None).await?;
+    plan.url = set_query_param(plan.url, "client_version", client_version);
+    Ok(plan)
+}
+
 pub async fn build_antigravity_fetch_available_models_plan(
     runtime: &(impl ModelFetchTransportRuntime + ?Sized),
     transport: &GatewayProviderTransportSnapshot,
@@ -624,6 +640,40 @@ fn append_query_param(mut url: String, key: &str, value: &str) -> String {
     url
 }
 
+/// Sets `key=value` on `url`, replacing any existing `key` (whatever its
+/// case) and keeping the other parameters in order.
+fn set_query_param(url: String, key: &str, value: &str) -> String {
+    let key = key.trim();
+    let value = value.trim();
+    if key.is_empty() || value.is_empty() {
+        return url;
+    }
+    let (base, query) = match url.split_once('?') {
+        Some((base, query)) => (base.to_string(), Some(query.to_string())),
+        None => (url, None),
+    };
+    let mut params = query
+        .as_deref()
+        .map(|query| {
+            query
+                .split('&')
+                .filter(|part| !part.trim().is_empty())
+                .filter(|part| {
+                    !part
+                        .split_once('=')
+                        .map(|(name, _)| name)
+                        .unwrap_or(part)
+                        .trim()
+                        .eq_ignore_ascii_case(key)
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    params.push(format!("{key}={value}"));
+    format!("{base}?{}", params.join("&"))
+}
+
 fn extract_codex_account_id(transport: &GatewayProviderTransportSnapshot) -> Option<String> {
     let raw = transport.key.decrypted_auth_config.as_deref()?.trim();
     if raw.is_empty() {
@@ -678,10 +728,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_antigravity_fetch_available_models_plan, build_gemini_cli_load_code_assist_plan,
-        build_kiro_list_available_models_plan, build_models_fetch_execution_plan,
-        build_standard_models_fetch_execution_plan, build_vertex_models_fetch_execution_plan,
-        ModelFetchTransportRuntime,
+        build_antigravity_fetch_available_models_plan, build_codex_models_manifest_execution_plan,
+        build_gemini_cli_load_code_assist_plan, build_kiro_list_available_models_plan,
+        build_models_fetch_execution_plan, build_standard_models_fetch_execution_plan,
+        build_vertex_models_fetch_execution_plan, set_query_param, ModelFetchTransportRuntime,
     };
 
     struct TestRuntime {
@@ -898,6 +948,77 @@ mod tests {
         assert_eq!(
             plan.headers.get("accept").map(String::as_str),
             Some("application/json")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_manifest_plan_asks_with_the_followed_client_version() {
+        let runtime = TestRuntime {
+            oauth_auth: Some(
+                aether_provider_transport::LocalResolvedOAuthRequestAuth::Header {
+                    name: "authorization".to_string(),
+                    value: "Bearer access-token".to_string(),
+                },
+            ),
+            proxy: None,
+        };
+        let mut transport = sample_transport("codex", "openai:responses", "oauth");
+        transport.endpoint.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+        transport.key.decrypted_auth_config = Some(r#"{"account_id":"account-1"}"#.to_string());
+
+        let plan = build_codex_models_manifest_execution_plan(&runtime, &transport, "0.154.0")
+            .await
+            .expect("plan");
+
+        assert_eq!(
+            plan.url,
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.154.0"
+        );
+        assert_eq!(plan.method, "GET");
+        assert_eq!(
+            plan.headers.get("authorization").map(String::as_str),
+            Some("Bearer access-token")
+        );
+        assert_eq!(
+            plan.headers.get("chatgpt-account-id").map(String::as_str),
+            Some("account-1")
+        );
+        assert_eq!(
+            plan.headers.get("accept").map(String::as_str),
+            Some("application/json")
+        );
+        // The model-sync default is untouched for the standard fetch.
+        let standard = build_models_fetch_execution_plan(&runtime, &transport)
+            .await
+            .expect("standard plan");
+        assert!(standard.url.ends_with("client_version=0.128.0-alpha.1"));
+    }
+
+    #[test]
+    fn set_query_param_replaces_or_appends() {
+        assert_eq!(
+            set_query_param(
+                "https://h/models?client_version=0.128.0-alpha.1".to_string(),
+                "client_version",
+                "0.154.0"
+            ),
+            "https://h/models?client_version=0.154.0"
+        );
+        assert_eq!(
+            set_query_param(
+                "https://h/models?a=1&Client_Version=x&b=2".to_string(),
+                "client_version",
+                "0.154.0"
+            ),
+            "https://h/models?a=1&b=2&client_version=0.154.0"
+        );
+        assert_eq!(
+            set_query_param("https://h/models".to_string(), "client_version", "0.154.0"),
+            "https://h/models?client_version=0.154.0"
+        );
+        assert_eq!(
+            set_query_param("https://h/models?a=1".to_string(), "client_version", " "),
+            "https://h/models?a=1"
         );
     }
 
