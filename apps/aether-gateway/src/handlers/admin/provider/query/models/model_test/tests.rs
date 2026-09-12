@@ -390,6 +390,43 @@ fn provider_query_direct_key_availability_test_only_for_direct_mode_with_selecte
 }
 
 #[test]
+fn provider_query_relax_transport_for_direct_test_forces_active_states() {
+    let disabled = || {
+        let mut transport = sample_openai_image_transport("custom");
+        transport.provider.is_active = false;
+        transport.endpoint.is_active = false;
+        transport.key.is_active = false;
+        transport
+    };
+
+    // Direct single-key availability probe: a disabled provider/endpoint/key must
+    // not block the probe, so the local snapshot is forced active before the
+    // transport-support gate classifies it.
+    let mut transport = disabled();
+    provider_query_relax_transport_for_direct_test(
+        &json!({ "mode": "direct", "api_key_ids": ["key-1"] }),
+        &mut transport,
+    );
+    assert!(transport.provider.is_active);
+    assert!(transport.endpoint.is_active);
+    assert!(transport.key.is_active);
+
+    // Scheduling simulations (and direct mode without an explicit key selection)
+    // keep honouring disabled state: the snapshot is left untouched.
+    for payload in [
+        json!({ "mode": "pool", "api_key_ids": ["key-1"] }),
+        json!({ "mode": "global", "api_key_ids": ["key-1"] }),
+        json!({ "mode": "direct" }),
+    ] {
+        let mut transport = disabled();
+        provider_query_relax_transport_for_direct_test(&payload, &mut transport);
+        assert!(!transport.provider.is_active);
+        assert!(!transport.endpoint.is_active);
+        assert!(!transport.key.is_active);
+    }
+}
+
+#[test]
 fn provider_query_standard_test_resolves_codex_responses_upstream_streaming() {
     assert!(provider_query_resolve_standard_test_upstream_is_stream(
         None,

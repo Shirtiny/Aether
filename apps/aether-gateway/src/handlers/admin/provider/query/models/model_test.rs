@@ -453,6 +453,38 @@ fn provider_query_is_direct_key_availability_test(
     provider_query_test_mode(payload).eq_ignore_ascii_case("direct") && selected_key_ids.is_some()
 }
 
+/// Force the transport `is_active` flags on a *local* snapshot copy. These flags
+/// only drive the transport support/scheduling classification (never request
+/// shaping — see `codex_ws.rs` which mutates them the same way), so overriding
+/// them lets the shared transport-support policy treat an explicitly disabled
+/// provider/endpoint/key as serviceable without loosening that policy for the
+/// real serving path.
+fn provider_query_force_transport_active_states(
+    transport: &mut AdminGatewayProviderTransportSnapshot,
+) {
+    transport.provider.is_active = true;
+    transport.endpoint.is_active = true;
+    transport.key.is_active = true;
+}
+
+/// A direct single-key availability probe must reach the upstream even when the
+/// provider, endpoint, or key is disabled: the operator explicitly asked to test
+/// *these* keys. This relaxes the local snapshot for that case only; the `.134`
+/// key-state bypass covered candidate filtering, this extends the same intent to
+/// the transport-support gate (provider/endpoint/key `_inactive` reasons). No-op
+/// for the `pool`/`global` scheduling simulations.
+fn provider_query_relax_transport_for_direct_test(
+    payload: &Value,
+    transport: &mut AdminGatewayProviderTransportSnapshot,
+) {
+    if provider_query_is_direct_key_availability_test(
+        payload,
+        provider_query_extract_api_key_ids(payload).as_ref(),
+    ) {
+        provider_query_force_transport_active_states(transport);
+    }
+}
+
 fn provider_query_should_apply_model_mapping(payload: &Value) -> bool {
     payload
         .get("apply_model_mapping")
@@ -905,12 +937,18 @@ async fn provider_query_select_preferred_non_kiro_endpoint(
                 {
                     continue;
                 }
-                let Ok(Some(transport)) = state
+                let Ok(Some(mut transport)) = state
                     .read_provider_transport_snapshot(&provider.id, &endpoint.id, &key.id)
                     .await
                 else {
                     continue;
                 };
+                // `allow_inactive_keys` marks a direct availability probe, which
+                // must ignore disabled provider/endpoint/key state in the
+                // support gate just as it ignores it in the key filter above.
+                if allow_inactive_keys {
+                    provider_query_force_transport_active_states(&mut transport);
+                }
                 if provider_query_transport_supports_model_test_execution(
                     state,
                     &transport,
@@ -1746,7 +1784,7 @@ async fn provider_query_execute_kiro_test_candidate(
     trace_id: &str,
     requested_model: &str,
 ) -> Result<ProviderQueryExecutionOutcome, GatewayError> {
-    let Some(transport) = state
+    let Some(mut transport) = state
         .read_provider_transport_snapshot(&provider.id, &candidate.endpoint.id, &candidate.key.id)
         .await?
     else {
@@ -1755,6 +1793,7 @@ async fn provider_query_execute_kiro_test_candidate(
             "Provider transport snapshot is unavailable",
         ));
     };
+    provider_query_relax_transport_for_direct_test(payload, &mut transport);
 
     if !supports_local_kiro_request_transport_with_network(&transport) {
         return Ok(provider_query_skipped_execution_outcome(
@@ -2076,7 +2115,7 @@ async fn provider_query_execute_openai_image_test_candidate(
     trace_id: &str,
     requested_model: &str,
 ) -> Result<ProviderQueryExecutionOutcome, GatewayError> {
-    let Some(transport) = state
+    let Some(mut transport) = state
         .read_provider_transport_snapshot(&provider.id, &candidate.endpoint.id, &candidate.key.id)
         .await?
     else {
@@ -2085,6 +2124,7 @@ async fn provider_query_execute_openai_image_test_candidate(
             "Provider transport snapshot is unavailable",
         ));
     };
+    provider_query_relax_transport_for_direct_test(payload, &mut transport);
 
     if let Some(reason) = crate::provider_transport::openai_image_transport_unsupported_reason(
         &transport,
@@ -2424,7 +2464,7 @@ async fn provider_query_execute_antigravity_test_candidate(
     trace_id: &str,
     requested_model: &str,
 ) -> Result<ProviderQueryExecutionOutcome, GatewayError> {
-    let Some(transport) = state
+    let Some(mut transport) = state
         .read_provider_transport_snapshot(&provider.id, &candidate.endpoint.id, &candidate.key.id)
         .await?
     else {
@@ -2433,6 +2473,7 @@ async fn provider_query_execute_antigravity_test_candidate(
             "Provider transport snapshot is unavailable",
         ));
     };
+    provider_query_relax_transport_for_direct_test(payload, &mut transport);
 
     let mut request_body = provider_query_build_test_request_body_for_route(
         payload,
@@ -2626,6 +2667,10 @@ async fn provider_query_execute_standard_test_candidate(
             "Provider transport snapshot is unavailable",
         ));
     };
+    // A direct availability probe must not be blocked by a disabled
+    // provider/endpoint/key at the transport-support gate below (or the windsurf
+    // gate it may dispatch into). Relax the local snapshot before either check.
+    provider_query_relax_transport_for_direct_test(payload, &mut transport);
     let provider_api_format = candidate.endpoint.api_format.as_str();
     let normalized_provider_api_format =
         crate::ai_serving::normalize_api_format_alias(provider_api_format);
