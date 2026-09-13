@@ -337,7 +337,7 @@ describe('getOpenAiImageModelTestMaxGenerationCount', () => {
 })
 
 describe('isModelTestableEndpoint', () => {
-  it('requires at least one active key compatible with the endpoint format', () => {
+  it('accepts disabled compatible keys while requiring an active testable endpoint', () => {
     const keys = [
       {
         api_formats: ['openai:chat'],
@@ -355,6 +355,14 @@ describe('isModelTestableEndpoint', () => {
     }, keys)).toBe(true)
     expect(isModelTestableEndpoint({
       api_format: 'claude:messages',
+      is_active: true,
+    }, keys)).toBe(true)
+    expect(isModelTestableEndpoint({
+      api_format: 'claude:messages',
+      is_active: false,
+    }, keys)).toBe(false)
+    expect(isModelTestableEndpoint({
+      api_format: 'openai:responses',
       is_active: true,
     }, keys)).toBe(false)
   })

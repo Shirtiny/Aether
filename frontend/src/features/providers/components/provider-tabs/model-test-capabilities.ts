@@ -63,8 +63,7 @@ export function modelTestKeySupportsEndpoint(
   endpoint: ModelTestEndpointSource,
   providerType?: string | null,
 ): boolean {
-  if (key.is_active === false) return false
-
+  // Disabled keys can still be selected for an explicit availability test.
   const endpointFormat = normalizeApiFormatAlias(endpoint.api_format)
   if (!isModelTestableApiFormat(endpointFormat)) return false
 

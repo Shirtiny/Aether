@@ -35,7 +35,11 @@ export function useModelTestKeys(options: {
 
   function label(key: EndpointAPIKey): string {
     const primary = key.name?.trim() || key.api_key_masked?.trim() || key.id
-    const suffix = [key.api_key_masked?.trim() !== primary ? key.api_key_masked?.trim() : '', key.auth_type?.trim()].filter(Boolean)
+    const suffix = [
+      key.api_key_masked?.trim() !== primary ? key.api_key_masked?.trim() : '',
+      key.auth_type?.trim(),
+      key.is_active === false ? '已禁用' : '',
+    ].filter(Boolean)
     return suffix.length ? `${primary} · ${suffix.join(' · ')}` : primary
   }
 

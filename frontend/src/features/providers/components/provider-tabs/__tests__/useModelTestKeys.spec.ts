@@ -28,21 +28,31 @@ describe('model test key selection', () => {
   beforeEach(() => vi.resetAllMocks())
   afterEach(() => scopes.splice(0).forEach(scope => scope.stop()))
 
-  it('loads the full list, filters incompatible/disabled keys and prunes selection after switching endpoints', async () => {
-    getKeys.mockResolvedValue([key('b'), key('a'), key('a'), key('chat', 'openai:chat'), { ...key('off'), is_active: false }])
+  it('includes disabled keys, filters incompatible keys and prunes selection after switching endpoints', async () => {
+    getKeys.mockResolvedValue([
+      key('b'), key('a'), key('a'), key('chat', 'openai:chat'),
+      { ...key('off'), is_active: false },
+      { ...key('off-chat', 'openai:chat'), is_active: false },
+    ])
     const { state, endpoint } = setup()
     await state.load()
-    expect(state.keyOptions.value.map(item => item.value)).toEqual(['a', 'b'])
-    state.select([' a ', 'a', 'b', 'off', 'chat'])
-    expect(state.selectedIds.value).toEqual(['a', 'b'])
+    expect(state.keyOptions.value.map(item => item.value)).toEqual(['a', 'b', 'off'])
+    expect(state.keyOptions.value.find(item => item.value === 'off')?.label).toContain('已禁用')
+    expect(state.keyOptions.value.find(item => item.value === 'a')?.label).not.toContain('已禁用')
+    state.select(['off'])
+    expect(state.selectedIds.value).toEqual(['off'])
+    state.select([' a ', 'a', 'b', 'off', 'chat', 'off-chat'])
+    expect(state.selectedIds.value).toEqual(['a', 'b', 'off'])
     endpoint.value = { id: 'chat', api_format: 'openai:chat' }
     await nextTick()
     expect(state.selectedIds.value).toEqual([])
-    expect(state.keyOptions.value.map(item => item.value)).toEqual(['chat'])
+    expect(state.keyOptions.value.map(item => item.value)).toEqual(['chat', 'off-chat'])
   })
 
-  it('does not truncate a list containing more than a hundred keys', async () => {
-    getKeys.mockResolvedValue(Array.from({ length: 150 }, (_, i) => key(`key-${i}`)))
+  it('selects all keys for a batch, including disabled keys, without truncating a large list', async () => {
+    getKeys.mockResolvedValue(Array.from({ length: 150 }, (_, i) => ({
+      ...key(`key-${i}`), is_active: i % 2 === 0,
+    })))
     const { state } = setup()
     await state.load()
     state.select(state.keyOptions.value.map(item => item.value))
