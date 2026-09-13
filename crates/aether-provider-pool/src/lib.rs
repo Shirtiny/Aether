@@ -193,9 +193,18 @@ mod tests {
             spec.headers.get("authorization").map(String::as_str),
             Some("Bearer access")
         );
+        // codex-rs reaches this route through `BackendClient`, which sets no
+        // explicit `accept`; reqwest's default goes on the wire (capture
+        // `http-0009`).
+        assert_eq!(spec.headers.get("accept").map(String::as_str), Some("*/*"));
+        // Every ChatGPT-auth TUI advertises Reserve support here
+        // (`tui/src/app/background_requests.rs:811` ->
+        // `backend-client/src/client/rate_limit_resets.rs:75-77`).
         assert_eq!(
-            spec.headers.get("accept").map(String::as_str),
-            Some("application/json")
+            spec.headers
+                .get("x-openai-codex-luna-reserve")
+                .map(String::as_str),
+            Some("1")
         );
         assert_eq!(spec.model_name.as_deref(), Some("codex-wham-usage"));
     }

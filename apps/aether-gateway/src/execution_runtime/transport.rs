@@ -7,7 +7,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aether_contracts::{
     ExecutionPlan, ExecutionResult, ExecutionTelemetry, ProxySnapshot, ResolvedTransportProfile,
-    ResponseBody, EXECUTION_COOKIE_JAR_CHATGPT_CLOUDFLARE, EXECUTION_HEADER_ORDER_CODEX_CLI,
+    ResponseBody, EXECUTION_COOKIE_JAR_CHATGPT_CLOUDFLARE,
+    EXECUTION_HEADER_ORDER_CODEX_BACKEND_CLIENT, EXECUTION_HEADER_ORDER_CODEX_CLI,
     EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER, EXECUTION_REQUEST_BODY_ENCODING_HEADER,
     EXECUTION_REQUEST_BODY_ENCODING_ZSTD, EXECUTION_REQUEST_CONTROL_HEADER_PREFIX,
     EXECUTION_REQUEST_COOKIE_JAR_HEADER, EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER,
@@ -223,6 +224,9 @@ pub(crate) enum ExecutionHeaderOrder {
     PlanOrder,
     /// The order codex-rs puts its `/backend-api/codex/*` headers on the wire.
     CodexCli,
+    /// The order codex-rs `BackendClient` puts its `/backend-api/wham/*`
+    /// headers on the wire.
+    CodexBackendClient,
 }
 
 /// Wire encoding of a JSON request body
@@ -1840,6 +1844,9 @@ pub(crate) fn build_request_headers(
     Ok(match controls.header_order {
         ExecutionHeaderOrder::PlanOrder => out,
         ExecutionHeaderOrder::CodexCli => order_request_headers_like_codex_cli(out),
+        ExecutionHeaderOrder::CodexBackendClient => {
+            order_request_headers_like_codex_backend_client(out)
+        }
     })
 }
 
@@ -1876,6 +1883,13 @@ fn resolve_execution_transport_controls(
                     .eq_ignore_ascii_case(EXECUTION_HEADER_ORDER_CODEX_CLI) =>
             {
                 ExecutionHeaderOrder::CodexCli
+            }
+            Some(value)
+                if value
+                    .trim()
+                    .eq_ignore_ascii_case(EXECUTION_HEADER_ORDER_CODEX_BACKEND_CLIENT) =>
+            {
+                ExecutionHeaderOrder::CodexBackendClient
             }
             _ => ExecutionHeaderOrder::PlanOrder,
         },
@@ -2031,6 +2045,49 @@ const CODEX_CLI_TRAILING_HEADER_ORDER: &[&str] = &[
     "x-openai-internal-codex-residency",
     "cookie",
 ];
+
+/// Header names codex-rs `BackendClient` puts on `/backend-api/wham/*`, in
+/// wire order.
+///
+/// `BackendClient::headers` (`backend-client/src/client.rs:245-265`) inserts
+/// `user-agent`, then the auth provider's `authorization`, then
+/// `chatgpt-account-id`; `get_rate_limit_status`
+/// (`backend-client/src/client/rate_limit_resets.rs:75-77`) appends
+/// `x-openai-codex-luna-reserve` after that map, and reqwest's default
+/// `accept` plus the cookie jar follow. This path never adds `originator` or
+/// `version` — unlike `core/src/client.rs`, which is why this order exists
+/// separately from [`CODEX_CLI_TRAILING_HEADER_ORDER`]. Matches capture
+/// `http-0009` of the 0.154.0 session.
+const CODEX_BACKEND_CLIENT_HEADER_ORDER: &[&str] = &[
+    "user-agent",
+    "authorization",
+    "chatgpt-account-id",
+    "x-openai-fedramp",
+    "x-openai-codex-luna-reserve",
+    "accept",
+    "content-type",
+    "cookie",
+];
+
+/// Known names in list order first, then anything unknown in arrival order.
+/// `BackendClient` builds a short, fully known header set, so unlike the
+/// `/responses` order there is no leading bucket to preserve.
+fn order_request_headers_like_codex_backend_client(headers: HeaderMap) -> HeaderMap {
+    fn rank(name: &HeaderName) -> (u8, usize) {
+        CODEX_BACKEND_CLIENT_HEADER_ORDER
+            .iter()
+            .position(|known| *known == name.as_str())
+            .map_or((1, 0), |index| (0, index))
+    }
+
+    let mut entries = drain_header_entries(headers);
+    entries.sort_by_key(|(name, _)| rank(name));
+    let mut ordered = HeaderMap::with_capacity(entries.len());
+    for (name, value) in entries {
+        ordered.append(name, value);
+    }
+    ordered
+}
 
 /// Leading names first (in list order), then everything else in the order it
 /// came, then the trailing names (in list order). A stable sort keeps the
@@ -2276,13 +2333,13 @@ mod tests {
         apply_request_cookie_jar, build_browser_wreq_client, build_client,
         build_direct_tunnel_request_meta, build_execution_response_body,
         build_plan_request_headers, build_request_body, build_request_headers, execute_sync_plan,
-        ingest_response_cookies, order_request_headers_like_codex_cli,
-        record_manual_proxy_request_failure, record_manual_proxy_request_outcome,
-        record_manual_proxy_request_success, record_manual_proxy_stream_error,
-        resolve_execution_transport_controls, resolve_non_stream_total_timeout,
-        resolve_stream_first_byte_timeout, response_body_is_json, DirectSyncExecutionRuntime,
-        ExecutionCookieJar, ExecutionHeaderOrder, ExecutionRequestBodyEncoding,
-        ExecutionRuntimeTransportError, ExecutionTransportControls,
+        ingest_response_cookies, order_request_headers_like_codex_backend_client,
+        order_request_headers_like_codex_cli, record_manual_proxy_request_failure,
+        record_manual_proxy_request_outcome, record_manual_proxy_request_success,
+        record_manual_proxy_stream_error, resolve_execution_transport_controls,
+        resolve_non_stream_total_timeout, resolve_stream_first_byte_timeout, response_body_is_json,
+        DirectSyncExecutionRuntime, ExecutionCookieJar, ExecutionHeaderOrder,
+        ExecutionRequestBodyEncoding, ExecutionRuntimeTransportError, ExecutionTransportControls,
     };
     use crate::constants::{
         EXECUTION_RUNTIME_LOOP_GUARD_HEADER, EXECUTION_RUNTIME_LOOP_GUARD_VIA_TOKEN,
@@ -2550,6 +2607,60 @@ mod tests {
                 "x-a=a2",
                 "user-agent=ua",
             ]
+        );
+    }
+
+    #[test]
+    fn codex_backend_client_header_order_matches_the_captured_wham_usage_wire_order() {
+        // Arrival order deliberately scrambled, and seeded from the alphabetical
+        // `BTreeMap` order a quota plan actually carries.
+        let mut headers = HeaderMap::new();
+        headers.append("accept", HeaderValue::from_static("*/*"));
+        headers.append("authorization", HeaderValue::from_static("Bearer t"));
+        headers.append("chatgpt-account-id", HeaderValue::from_static("acct"));
+        headers.append("cookie", HeaderValue::from_static("cf=1"));
+        headers.append("user-agent", HeaderValue::from_static("codex-tui/0.154.0"));
+        headers.append("x-openai-codex-luna-reserve", HeaderValue::from_static("1"));
+
+        let ordered = order_request_headers_like_codex_backend_client(headers);
+        let keys = ordered
+            .iter()
+            .map(|(name, _)| name.as_str().to_string())
+            .collect::<Vec<_>>();
+        // Capture `http-0009` of the 0.154.0 session, minus `host` (hyper adds it).
+        assert_eq!(
+            keys,
+            vec![
+                "user-agent",
+                "authorization",
+                "chatgpt-account-id",
+                "x-openai-codex-luna-reserve",
+                "accept",
+                "cookie",
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_backend_client_order_differs_from_the_responses_order() {
+        // Guards against collapsing the two orders back together: `BackendClient`
+        // leads with `user-agent`, `core/src/client.rs` trails with it.
+        let seed = || {
+            let mut headers = HeaderMap::new();
+            headers.append("accept", HeaderValue::from_static("*/*"));
+            headers.append("authorization", HeaderValue::from_static("Bearer t"));
+            headers.append("user-agent", HeaderValue::from_static("ua"));
+            headers
+        };
+        let backend = order_request_headers_like_codex_backend_client(seed());
+        let responses = order_request_headers_like_codex_cli(seed());
+        assert_eq!(
+            backend.iter().next().map(|(name, _)| name.as_str()),
+            Some("user-agent")
+        );
+        assert_eq!(
+            responses.iter().next().map(|(name, _)| name.as_str()),
+            Some("accept")
         );
     }
 

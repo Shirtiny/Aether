@@ -449,9 +449,22 @@ async fn gateway_refreshes_codex_oauth_reset_credits_into_quota_snapshot() {
         quota_plan.headers.get("user-agent").map(String::as_str),
         Some("codex-reset-test/1.0")
     );
+    // The wham routes go through codex-rs `BackendClient`, whose `headers()`
+    // sends the user-agent alongside auth and nothing else; capture `http-0009`
+    // shows no `originator` and no `version`. Only `/backend-api/codex/*`
+    // carries the full identity trio.
+    assert_eq!(quota_plan.headers.get("originator"), None);
+    assert_eq!(quota_plan.headers.get("version"), None);
     assert_eq!(
-        quota_plan.headers.get("originator").map(String::as_str),
-        Some("codex-reset-test")
+        quota_plan.headers.get("accept").map(String::as_str),
+        Some("*/*")
+    );
+    assert_eq!(
+        quota_plan
+            .headers
+            .get("x-openai-codex-luna-reserve")
+            .map(String::as_str),
+        Some("1")
     );
 
     let reset_credits_plan = plans
@@ -469,13 +482,8 @@ async fn gateway_refreshes_codex_oauth_reset_credits_into_quota_snapshot() {
             .map(String::as_str),
         Some("codex-1")
     );
-    assert_eq!(
-        reset_credits_plan
-            .headers
-            .get("originator")
-            .map(String::as_str),
-        Some("codex-reset-test")
-    );
+    assert_eq!(reset_credits_plan.headers.get("originator"), None);
+    assert_eq!(reset_credits_plan.headers.get("version"), None);
     assert_eq!(
         reset_credits_plan
             .headers

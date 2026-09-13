@@ -14,6 +14,10 @@ pub const EXECUTION_REQUEST_CONTROL_HEADER_PREFIX: &str = "x-aether-execution-";
 /// order instead of the plan's alphabetical map order.
 pub const EXECUTION_REQUEST_HEADER_ORDER_HEADER: &str = "x-aether-execution-header-order";
 pub const EXECUTION_HEADER_ORDER_CODEX_CLI: &str = "codex-cli";
+/// codex-rs reaches `/backend-api/wham/*` through `BackendClient`, not through
+/// `core/src/client.rs`, so those requests carry a different wire order than
+/// [`EXECUTION_HEADER_ORDER_CODEX_CLI`].
+pub const EXECUTION_HEADER_ORDER_CODEX_BACKEND_CLIENT: &str = "codex-backend-client";
 /// Requests the transport to compress a JSON request body on the wire
 /// (`content-encoding`), the way the named client does.
 pub const EXECUTION_REQUEST_BODY_ENCODING_HEADER: &str = "x-aether-execution-request-body-encoding";

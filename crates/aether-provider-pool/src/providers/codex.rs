@@ -85,7 +85,17 @@ pub fn build_codex_pool_quota_request(
     auth_config: Option<&Value>,
 ) -> Result<ProviderPoolQuotaRequestSpec, String> {
     let mut headers = BTreeMap::new();
-    headers.insert("accept".to_string(), "application/json".to_string());
+    // codex-rs reaches this endpoint through `BackendClient`, which sets no
+    // explicit `accept`; reqwest's default `*/*` goes on the wire instead
+    // (capture `http-0009`). `application/json` here would be a shape no codex
+    // client produces.
+    headers.insert("accept".to_string(), "*/*".to_string());
+    // `get_rate_limit_status` sends this whenever the caller supports Reserve,
+    // which every ChatGPT-auth TUI does
+    // (`backend-client/src/client/rate_limit_resets.rs:75-77`,
+    // `tui/src/app/background_requests.rs:811`). Additive on the response side:
+    // `parse_codex_wham_usage_response` picks named fields and ignores the rest.
+    headers.insert("x-openai-codex-luna-reserve".to_string(), "1".to_string());
 
     if let Some((name, value)) = resolved_oauth_auth {
         headers.insert(name.to_ascii_lowercase(), value);
