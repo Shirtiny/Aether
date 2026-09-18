@@ -1926,19 +1926,19 @@ fn codex_client_release_seed_secs() -> u64 {
 }
 
 #[tokio::test]
-async fn congming_turn_state_override_runs_after_turn_sanitation_and_header_rules() {
+async fn turn_state_override_runs_after_turn_sanitation_and_header_rules() {
     use crate::codex_runtime_identity::CodexRuntimeIdentitySurface;
     let runtime = aether_runtime_state::RuntimeState::memory(
         aether_runtime_state::MemoryRuntimeStateConfig::default(),
     );
     let ticket = "a".repeat(292);
-    crate::congming_turn_state::tests::seed_ticket(&runtime, &ticket, 0).await;
+    crate::turn_state::tests::seed_ticket(&runtime, &ticket, 0).await;
     for identity_enabled in [false, true] {
         let mut transport = sample_transport(
             "codex",
             Some(json!({"pool_advanced": {
                 "codex_runtime_identity": {"enabled": identity_enabled},
-                "congming_turn_state_override": true
+                "turn_state_source_provider_id": "source"
             }})),
         );
         transport.endpoint.header_rules = Some(json!([
@@ -1962,23 +1962,27 @@ async fn congming_turn_state_override_runs_after_turn_sanitation_and_header_rule
                 surface,
             )
             .await;
-            assert_eq!(headers[crate::congming_turn_state::HEADER], ticket);
+            assert_eq!(headers[crate::turn_state::HEADER], ticket);
         }
     }
     for (provider_type, config) in [
         ("codex", json!({"pool_advanced": {}})),
         (
             "codex",
-            json!({"pool_advanced": {"congming_turn_state_override": false}}),
+            json!({"pool_advanced": {"turn_state_source_provider_id": null}}),
         ),
         (
             "custom",
+            json!({"pool_advanced": {"turn_state_source_provider_id": "source"}}),
+        ),
+        ("codex", json!({"turn_state_source_provider_id": "source"})),
+        (
+            "codex",
             json!({"pool_advanced": {"congming_turn_state_override": true}}),
         ),
-        ("codex", json!({"congming_turn_state_override": true})),
     ] {
         let transport = sample_transport(provider_type, Some(config));
-        assert!(!crate::congming_turn_state::override_enabled(&transport));
+        assert!(crate::turn_state::source_provider_id(&transport).is_none());
         let mut headers = BTreeMap::from([("x-codex-turn-state".into(), "original".into())]);
         super::apply_codex_pool_runtime_identity(
             &runtime,
@@ -1991,5 +1995,36 @@ async fn congming_turn_state_override_runs_after_turn_sanitation_and_header_rule
         )
         .await;
         assert_eq!(headers["x-codex-turn-state"], "original");
+    }
+}
+
+#[tokio::test]
+async fn turn_state_source_switch_and_missing_source_never_use_another_channels_ticket() {
+    let runtime = aether_runtime_state::RuntimeState::memory(
+        aether_runtime_state::MemoryRuntimeStateConfig::default(),
+    );
+    crate::turn_state::tests::seed_ticket(&runtime, "source-ticket", 0).await;
+    for (source_id, expected) in [
+        (json!("source"), "source-ticket"),
+        (json!("missing"), "client-ticket"),
+        (Value::Null, "client-ticket"),
+    ] {
+        let transport = sample_transport(
+            "codex",
+            Some(json!({"pool_advanced": {"turn_state_source_provider_id": source_id}})),
+        );
+        let mut body = json!({"model": "test-model"});
+        let mut headers = BTreeMap::from([("x-codex-turn-state".into(), "client-ticket".into())]);
+        super::apply_codex_pool_runtime_identity(
+            &runtime,
+            &transport,
+            &mut headers,
+            Some(&mut body),
+            &HeaderMap::new(),
+            None,
+            crate::codex_runtime_identity::CodexRuntimeIdentitySurface::HttpResponses,
+        )
+        .await;
+        assert_eq!(headers["x-codex-turn-state"], expected);
     }
 }

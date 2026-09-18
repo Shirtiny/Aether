@@ -31,7 +31,7 @@ pub(crate) async fn seed_ticket(runtime: &RuntimeState, value: &str, age: u64) {
 }
 
 async fn load_ticket(runtime: &RuntimeState, enabled: bool) -> Option<String> {
-    load_tickets(runtime, enabled)
+    load_tickets(runtime, enabled.then_some("source"))
         .await?
         .for_model("test-model")
         .map(str::to_owned)
@@ -39,10 +39,10 @@ async fn load_ticket(runtime: &RuntimeState, enabled: bool) -> Option<String> {
 
 fn source(enabled: bool) -> StoredProviderCatalogProvider {
     let mut provider =
-        StoredProviderCatalogProvider::new("source".into(), "聪明".into(), None, "custom".into())
+        StoredProviderCatalogProvider::new("source".into(), "Source".into(), None, "custom".into())
             .unwrap();
     provider.config =
-        Some(json!({"congming_turn_state": {"enabled": enabled, "models": ["test-model"]}}));
+        Some(json!({"turn_state_collection": {"enabled": enabled, "models": ["test-model"]}}));
     provider
 }
 
@@ -64,16 +64,16 @@ fn state(
 fn config_is_opt_in_and_strictly_validated() {
     assert!(validate_config(&Map::new()).is_ok());
     for value in [
-        json!({"congming_turn_state": true}),
-        json!({"congming_turn_state": {"enabled": true}}),
-        json!({"congming_turn_state": {"enabled": true, "models": [" "]}}),
-        json!({"congming_turn_state": {"enabled": "true", "models": ["test-model"]}}),
-        json!({"pool_advanced": {"congming_turn_state_override": "true"}}),
+        json!({"turn_state_collection": true}),
+        json!({"turn_state_collection": {"enabled": true}}),
+        json!({"turn_state_collection": {"enabled": true, "models": [" "]}}),
+        json!({"turn_state_collection": {"enabled": "true", "models": ["test-model"]}}),
+        json!({"pool_advanced": {"turn_state_source_provider_id": true}}),
     ] {
         assert!(validate_config(value.as_object().unwrap()).is_err());
     }
     assert!(validate_config(
-        json!({"congming_turn_state": {"enabled": false, "models": []}})
+        json!({"turn_state_collection": {"enabled": false, "models": []}})
             .as_object()
             .unwrap()
     )
@@ -85,15 +85,21 @@ fn config_is_opt_in_and_strictly_validated() {
 }
 
 #[test]
-fn only_exact_host_and_bounded_printable_ascii_tickets_are_accepted() {
-    assert!(is_congming_url("https://sub2.congmingai.com/v1/responses"));
+fn http_sources_and_bounded_printable_ascii_tickets_are_accepted() {
     for url in [
-        "http://sub2.congmingai.com",
-        "https://sub2.congmingai.com.evil.test",
-        "https://example.test",
-        "https://user@sub2.congmingai.com",
+        "https://provider-a.example/v1/responses",
+        "https://provider-b.example/custom",
+        "http://127.0.0.1:1234/v1",
     ] {
-        assert!(!is_congming_url(url));
+        assert!(is_collection_url(url));
+    }
+    for url in [
+        "ftp://provider.example",
+        "file:///tmp/test",
+        "https://user@provider.example",
+        "not-a-url",
+    ] {
+        assert!(!is_collection_url(url));
     }
     for length in [1, 128, 292, 384, 4096] {
         assert!(valid_ticket(&"a".repeat(length)));
@@ -208,25 +214,118 @@ async fn scan_refreshes_once_per_forty_minutes_and_shares_the_new_ticket() {
 }
 
 #[tokio::test]
-async fn disabled_or_multiple_sources_clear_ticket_without_sending_requests() {
-    for providers in [
-        vec![source(false)],
-        vec![source(true), {
-            let mut other = source(true);
-            other.id = "other".into();
-            other
-        }],
-    ] {
+async fn disabled_or_deleted_sources_clear_only_their_own_tickets_without_fetching() {
+    for providers in [vec![source(false)], vec![]] {
         let (state, _) = state(providers);
         seed_ticket(&state.runtime_state, &"a".repeat(292), 0).await;
-        let _ = scan_with_fetch(&state, async |_: &AppState, _: &str, _: &str| {
-            panic!("disabled or ambiguous sources must never fetch");
+        scan_with_fetch(&state, async |_: &AppState, _: &str, _: &str| {
+            panic!("disabled/deleted source must not fetch");
             #[allow(unreachable_code)]
             Ok(String::new())
         })
-        .await;
-        assert!(load_ticket(&state.runtime_state, true).await.is_none());
+        .await
+        .unwrap();
+        assert!(load_tickets(&state.runtime_state, Some("source"))
+            .await
+            .is_none());
     }
+}
+
+#[tokio::test]
+async fn multiple_sources_keep_same_model_tickets_and_schedules_isolated() {
+    let mut other = source(true);
+    other.id = "other".into();
+    let (state, repo) = state(vec![source(true), other.clone()]);
+    let calls = AtomicUsize::new(0);
+    let fetch = async |_: &AppState, provider: &str, model: &str| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Ok(format!("{provider}-{model}-ticket"))
+    };
+    for _ in 0..3 {
+        scan_with_fetch(&state, &fetch).await.unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    for provider in ["source", "other"] {
+        let cache = load_tickets(&state.runtime_state, Some(provider))
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.for_model("test-model"),
+            Some(format!("{provider}-test-model-ticket").as_str())
+        );
+    }
+    assert!(load_tickets(&state.runtime_state, None).await.is_none());
+    assert!(load_tickets(&state.runtime_state, Some("missing"))
+        .await
+        .is_none());
+    repo.update_provider(&source(false)).await.unwrap();
+    scan_with_fetch(&state, &fetch).await.unwrap();
+    assert!(load_tickets(&state.runtime_state, Some("source"))
+        .await
+        .is_none());
+    assert!(load_tickets(&state.runtime_state, Some("other"))
+        .await
+        .is_some());
+    repo.delete_provider("other").await.unwrap();
+    scan_with_fetch(&state, &fetch).await.unwrap();
+    assert!(load_tickets(&state.runtime_state, Some("other"))
+        .await
+        .is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn failed_source_does_not_stop_other_sources() {
+    let mut other = source(true);
+    other.id = "other".into();
+    let (state, _) = state(vec![source(true), other]);
+    let result = scan_with_fetch(&state, async |_: &AppState, provider: &str, _: &str| {
+        if provider == "source" {
+            Err("failed".into())
+        } else {
+            Ok("other-ticket".into())
+        }
+    })
+    .await;
+    assert!(result.is_err());
+    assert!(load_tickets(&state.runtime_state, Some("source"))
+        .await
+        .unwrap()
+        .tickets
+        .is_empty());
+    assert_eq!(
+        load_tickets(&state.runtime_state, Some("other"))
+            .await
+            .unwrap()
+            .for_model("test-model"),
+        Some("other-ticket")
+    );
+}
+
+#[test]
+fn legacy_collection_is_read_but_explicit_generic_setting_wins() {
+    let mut provider = source(true);
+    provider.config = Some(json!({"congming_turn_state": {"enabled": true, "models": ["old"]}}));
+    assert_eq!(source_config(&provider).unwrap().models, ["old"]);
+    provider.config.as_mut().unwrap()["turn_state_collection"] =
+        json!({"enabled": false, "models": []});
+    assert!(source_config(&provider).is_none());
+    provider.config.as_mut().unwrap()["turn_state_collection"] = Value::Null;
+    assert!(source_config(&provider).is_none());
+}
+
+#[tokio::test]
+async fn corrupted_source_identity_cannot_cross_channel_boundary() {
+    let runtime = runtime();
+    runtime
+        .kv_set(
+            &cache_key("other"),
+            serde_json::to_string(&ticket_cache("test-model", "source-ticket", 0)).unwrap(),
+            Some(TICKET_TTL),
+        )
+        .await
+        .unwrap();
+    assert!(load_tickets(&runtime, Some("other")).await.is_none());
 }
 
 #[tokio::test]
@@ -269,7 +368,7 @@ async fn disabling_source_during_fetch_does_not_republish_credential() {
 async fn models_are_refreshed_and_selected_independently() {
     let mut provider = source(true);
     provider.config =
-        Some(json!({"congming_turn_state": {"enabled": true, "models": ["model-a", "model-b"]}}));
+        Some(json!({"turn_state_collection": {"enabled": true, "models": ["model-a", "model-b"]}}));
     let (state, repo) = state(vec![provider.clone()]);
     let calls = AtomicUsize::new(0);
     let fetch = async |_: &AppState, _: &str, model: &str| {
@@ -280,7 +379,9 @@ async fn models_are_refreshed_and_selected_independently() {
         scan_with_fetch(&state, &fetch).await.unwrap();
     }
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    let cache = load_tickets(&state.runtime_state, true).await.unwrap();
+    let cache = load_tickets(&state.runtime_state, Some("source"))
+        .await
+        .unwrap();
     assert_eq!(
         cache.for_body(&json!({"model": "model-a"})),
         Some("ticket-for-model-a")
@@ -293,10 +394,12 @@ async fn models_are_refreshed_and_selected_independently() {
     assert!(cache.for_body(&json!({})).is_none());
     // Removing model-a revokes its override without waiting for expiry.
     provider.config =
-        Some(json!({"congming_turn_state": {"enabled": true, "models": ["model-b"]}}));
+        Some(json!({"turn_state_collection": {"enabled": true, "models": ["model-b"]}}));
     repo.update_provider(&provider).await.unwrap();
     scan_with_fetch(&state, &fetch).await.unwrap();
-    let cache = load_tickets(&state.runtime_state, true).await.unwrap();
+    let cache = load_tickets(&state.runtime_state, Some("source"))
+        .await
+        .unwrap();
     assert!(cache.for_model("model-a").is_none());
     assert_eq!(cache.for_model("model-b"), Some("ticket-for-model-b"));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -324,7 +427,7 @@ async fn fetch_plan_reuses_channel_credentials_and_responses_path_without_networ
         true,
     )
     .unwrap();
-    endpoint.base_url = "https://sub2.congmingai.com".into();
+    endpoint.base_url = "https://provider-a.example".into();
     endpoint.custom_path = Some("/v1/responses".into());
     endpoint.header_rules = Some(json!([
         {"action": "set", "key": "x-codex-turn-state", "value": "must-not-send-old-ticket"},
@@ -358,7 +461,7 @@ async fn fetch_plan_reuses_channel_credentials_and_responses_path_without_networ
     let plan = build_fetch_plan(&state, &transport, " model-a ")
         .await
         .unwrap();
-    assert_eq!(plan.url, "https://sub2.congmingai.com/v1/responses");
+    assert_eq!(plan.url, "https://provider-a.example/v1/responses");
     assert_eq!(plan.method, "POST");
     assert!(plan.stream);
     assert_eq!(plan.headers["authorization"], "Bearer test-only-key");
@@ -373,5 +476,75 @@ async fn fetch_plan_reuses_channel_credentials_and_responses_path_without_networ
     transport.endpoint.base_url = "https://unrelated.example".into();
     assert!(build_fetch_plan(&state, &transport, "model-a")
         .await
+        .is_ok());
+    transport.endpoint.base_url = "ftp://unrelated.example".into();
+    assert!(build_fetch_plan(&state, &transport, "model-a")
+        .await
         .is_err());
+}
+
+#[test]
+fn source_selection_accepts_only_explicit_ids_or_off() {
+    for value in [
+        Value::Null,
+        json!("source"),
+        json!("e7db605a-c99c-431e-bb23-389b36626890"),
+    ] {
+        assert!(validate_config(
+            json!({"pool_advanced": {OVERRIDE_CONFIG: value}})
+                .as_object()
+                .unwrap()
+        )
+        .is_ok());
+    }
+    for value in [
+        json!(true),
+        json!(false),
+        json!(42),
+        json!(""),
+        json!(" source "),
+        json!("*"),
+        json!("a:b"),
+        json!([]),
+        json!({}),
+        json!("a".repeat(129)),
+    ] {
+        assert!(validate_config(
+            json!({"pool_advanced": {OVERRIDE_CONFIG: value}})
+                .as_object()
+                .unwrap()
+        )
+        .is_err());
+    }
+}
+
+#[tokio::test]
+async fn overlapping_scans_do_not_duplicate_a_sources_paid_request() {
+    let (state, _) = state(vec![source(true)]);
+    let entered = tokio::sync::Notify::new();
+    let finish = tokio::sync::Notify::new();
+    let calls = AtomicUsize::new(0);
+    let fetch = async |_: &AppState, _: &str, _: &str| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        entered.notify_one();
+        finish.notified().await;
+        Ok("ticket".into())
+    };
+    let (first, ()) = tokio::join!(scan_with_fetch(&state, &fetch), async {
+        entered.notified().await;
+        scan_with_fetch(&state, async |_: &AppState, _: &str, _: &str| {
+            panic!("another replica must not duplicate the collection request");
+            #[allow(unreachable_code)]
+            Ok(String::new())
+        })
+        .await
+        .unwrap();
+        finish.notify_one();
+    });
+    first.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        load_ticket(&state.runtime_state, true).await.as_deref(),
+        Some("ticket")
+    );
 }

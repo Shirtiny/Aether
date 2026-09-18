@@ -322,7 +322,7 @@ pub(crate) async fn build_admin_update_provider_record(
         }
     }
     validate_responses_websocket_config(&config_map)?;
-    crate::congming_turn_state::validate_config(&config_map)?;
+    crate::turn_state::validate_config(&config_map)?;
 
     updated.config = (!config_map.is_empty()).then_some(serde_json::Value::Object(config_map));
     updated.updated_at_unix_secs = SystemTime::now()

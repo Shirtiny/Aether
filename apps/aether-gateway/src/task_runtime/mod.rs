@@ -23,7 +23,7 @@ pub(crate) const TASK_KEY_USAGE_QUEUE_WORKER: &str = "usage.queue.worker";
 pub(crate) const TASK_KEY_USAGE_COUNTER_FLUSH: &str = "usage.counter.flush.worker";
 pub(crate) const TASK_KEY_VIDEO_TASK_POLLER: &str = "video.task.poller";
 pub(crate) const TASK_KEY_MODEL_FETCH_WORKER: &str = "model.fetch.worker";
-pub(crate) const TASK_KEY_CONGMING_TURN_STATE: &str = "codex.congming_turn_state.worker";
+pub(crate) const TASK_KEY_TURN_STATE_COLLECTION: &str = "codex.turn_state.collection.worker";
 pub(crate) const TASK_KEY_CODEX_MODEL_CATALOG_WORKER: &str = "codex.model_catalog.worker";
 pub(crate) const TASK_KEY_PROVIDER_QUOTA_RESET: &str = "provider.quota.reset.worker";
 pub(crate) const TASK_KEY_ACCOUNT_SELF_CHECK: &str = "account.self_check.worker";
@@ -118,7 +118,7 @@ const TASK_DEFINITIONS: &[TaskDefinition] = &[
         RETRY_ONCE,
     ),
     TaskDefinition::new(
-        TASK_KEY_CONGMING_TURN_STATE,
+        TASK_KEY_TURN_STATE_COLLECTION,
         TaskKind::Scheduled,
         "interval",
         true,

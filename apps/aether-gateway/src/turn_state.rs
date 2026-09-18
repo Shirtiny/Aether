@@ -1,4 +1,4 @@
-//! Opt-in Congming turn-state collection and Codex pool egress override.
+//! Opt-in provider turn-state collection and Codex pool egress override.
 //! Tickets are credentials: never log them or put them in provider config.
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -13,10 +13,10 @@ use crate::provider_transport::GatewayProviderTransportSnapshot;
 use crate::AppState;
 
 pub(crate) const HEADER: &str = "x-codex-turn-state";
-const SOURCE_CONFIG: &str = "congming_turn_state";
-const OVERRIDE_CONFIG: &str = "congming_turn_state_override";
-const TICKET_KEY: &str = "aether:congming_turn_state:v1:ticket";
-const LOCK_KEY: &str = "aether:congming_turn_state:v1:scan";
+const SOURCE_CONFIG: &str = "turn_state_collection";
+const LEGACY_SOURCE_CONFIG: &str = "congming_turn_state";
+const OVERRIDE_CONFIG: &str = "turn_state_source_provider_id";
+const CACHE_PREFIX: &str = "aether:turn_state:v1:source:";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(40 * 60);
 // User-observed lifetime is approximately one hour, not a verified upstream SLA.
 // This is a local maximum age, never a promise that upstream accepts the ticket.
@@ -32,7 +32,11 @@ struct SourceConfig {
 }
 
 pub(crate) fn validate_config(config: &Map<String, Value>) -> Result<(), String> {
-    if let Some(value) = config.get(SOURCE_CONFIG).filter(|value| !value.is_null()) {
+    if let Some(value) = config
+        .get(SOURCE_CONFIG)
+        .or_else(|| config.get(LEGACY_SOURCE_CONFIG))
+        .filter(|value| !value.is_null())
+    {
         parse_source_config(value)?;
     }
 
@@ -40,16 +44,17 @@ pub(crate) fn validate_config(config: &Map<String, Value>) -> Result<(), String>
         .get("pool_advanced")
         .and_then(|pool| pool.get(OVERRIDE_CONFIG))
     {
-        if !value.is_boolean() {
-            return Err("congming_turn_state_override 必须是布尔值".into());
+        if !value.is_null() && !value.as_str().is_some_and(valid_source_id) {
+            return Err("turn_state_source_provider_id 必须是渠道 ID 字符串或 null（关闭）".into());
         }
     }
     Ok(())
 }
 
 fn parse_source_config(value: &Value) -> Result<SourceConfig, String> {
-    let mut source: SourceConfig = serde_json::from_value(value.clone())
-        .map_err(|_| "聪明票据采集配置须包含 enabled 布尔值和 models 字符串列表".to_string())?;
+    let mut source: SourceConfig = serde_json::from_value(value.clone()).map_err(|_| {
+        "Turn-State 票据采集配置须包含 enabled 布尔值和 models 字符串列表".to_string()
+    })?;
     if source.models.len() > 64
         || source.models.iter().any(|model| {
             model.trim().is_empty() || model.len() > 200 || model.chars().any(char::is_control)
@@ -65,30 +70,55 @@ fn parse_source_config(value: &Value) -> Result<SourceConfig, String> {
     source.models.sort();
     source.models.dedup();
     if source.enabled && source.models.is_empty() {
-        return Err("启用聪明票据采集时必须填写模型列表".into());
+        return Err("启用 Turn-State 票据采集时必须填写模型列表".into());
     }
     Ok(source)
 }
 
+/// Read the old collection setting until the channel is next saved. The old
+/// pool boolean is deliberately NOT interpreted as a source: never guess.
+pub(crate) fn collection_config(config: &Map<String, Value>) -> Option<&Value> {
+    config
+        .get(SOURCE_CONFIG)
+        .or_else(|| config.get(LEGACY_SOURCE_CONFIG))
+}
+
 fn source_config(provider: &StoredProviderCatalogProvider) -> Option<SourceConfig> {
-    let config = parse_source_config(provider.config.as_ref()?.get(SOURCE_CONFIG)?).ok()?;
+    let config =
+        parse_source_config(collection_config(provider.config.as_ref()?.as_object()?)?).ok()?;
     (provider.is_active && config.enabled).then_some(config)
 }
 
-pub(crate) fn override_enabled(transport: &GatewayProviderTransportSnapshot) -> bool {
-    transport
+fn valid_source_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.trim() == value
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+}
+
+pub(crate) fn source_provider_id(transport: &GatewayProviderTransportSnapshot) -> Option<&str> {
+    if !transport
         .provider
         .provider_type
         .trim()
         .eq_ignore_ascii_case("codex")
-        && transport
-            .provider
-            .config
-            .as_ref()
-            .and_then(|config| config.get("pool_advanced"))
-            .and_then(|pool| pool.get(OVERRIDE_CONFIG))
-            .and_then(Value::as_bool)
-            == Some(true)
+    {
+        return None;
+    }
+    transport
+        .provider
+        .config
+        .as_ref()?
+        .get("pool_advanced")?
+        .get(OVERRIDE_CONFIG)?
+        .as_str()
+        .filter(|value| valid_source_id(value))
+}
+
+fn cache_key(provider_id: &str) -> String {
+    format!("{CACHE_PREFIX}{provider_id}")
 }
 
 fn valid_ticket(value: &str) -> bool {
@@ -124,12 +154,14 @@ impl TicketCache {
     }
 }
 
-pub(crate) async fn load_tickets(runtime: &RuntimeState, enabled: bool) -> Option<TicketCache> {
-    if !enabled {
-        return None;
-    }
-    let raw = runtime.kv_get(TICKET_KEY).await.ok()??;
-    serde_json::from_str(&raw).ok()
+pub(crate) async fn load_tickets(
+    runtime: &RuntimeState,
+    source_id: Option<&str>,
+) -> Option<TicketCache> {
+    let source_id = source_id.filter(|value| valid_source_id(value))?;
+    let raw = runtime.kv_get(&cache_key(source_id)).await.ok()??;
+    let cache: TicketCache = serde_json::from_str(&raw).ok()?;
+    (cache.source_provider_id == source_id).then_some(cache)
 }
 
 /// Must run AFTER runtime identity sanitation and endpoint rules. No inbound
@@ -166,10 +198,10 @@ pub(crate) fn apply_ticket(
     }
 }
 
-fn is_congming_url(raw: &str) -> bool {
+fn is_collection_url(raw: &str) -> bool {
     url::Url::parse(raw).ok().is_some_and(|url| {
-        url.scheme() == "https"
-            && url.host_str() == Some("sub2.congmingai.com")
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
             && url.username().is_empty()
             && url.password().is_none()
     })
@@ -200,7 +232,7 @@ async fn build_fetch_plan(
     // builds a plan only and does NOT issue a /models request.
     let mut plan = aether_model_fetch::build_models_fetch_execution_plan(state, transport)
         .await
-        .map_err(|_| "聪明渠道认证或传输配置无效")?;
+        .map_err(|_| "来源渠道认证或传输配置无效")?;
     // The collection request is a Codex Responses conversation, not a model
     // listing. Use the shared bundled client identity unless the endpoint
     // has explicitly configured its own UA/originator.
@@ -245,11 +277,11 @@ async fn build_fetch_plan(
             kiro_api_region: None,
         },
     )
-    .ok_or_else(|| "聪明渠道 Responses 端点无效".to_string())?;
-    if !is_congming_url(&plan.url) {
-        return Err("票据采集只允许 https://sub2.congmingai.com 的 Responses 端点".into());
+    .ok_or_else(|| "来源渠道 Responses 端点无效".to_string())?;
+    if !is_collection_url(&plan.url) {
+        return Err("票据采集需要有效的 HTTP(S) Responses 端点".into());
     }
-    plan.request_id = format!("congming-turn-state-{}", uuid::Uuid::new_v4());
+    plan.request_id = format!("turn-state-collection-{}", uuid::Uuid::new_v4());
     plan.method = "POST".into();
     plan.headers
         .retain(|name, _| !name.eq_ignore_ascii_case(HEADER));
@@ -269,20 +301,20 @@ async fn fetch_ticket(state: &AppState, provider_id: &str, model: &str) -> Resul
     let endpoints = state
         .list_provider_catalog_endpoints_by_provider_ids(&ids)
         .await
-        .map_err(|_| "读取聪明渠道端点失败")?;
+        .map_err(|_| "读取来源渠道端点失败")?;
     let endpoint = endpoints
         .iter()
         .find(|endpoint| {
             endpoint.is_active
                 && crate::ai_serving::normalize_api_format_alias(&endpoint.api_format)
                     == "openai:responses"
-                && is_congming_url(&endpoint.base_url)
+                && is_collection_url(&endpoint.base_url)
         })
-        .ok_or("聪明渠道没有启用的 Responses 端点")?;
+        .ok_or("来源渠道没有启用的 Responses 端点")?;
     let keys = state
         .list_provider_catalog_keys_by_provider_ids(&ids)
         .await
-        .map_err(|_| "读取聪明渠道密钥失败")?;
+        .map_err(|_| "读取来源渠道密钥失败")?;
     let now = crate::codex_client_release::unix_now_secs();
     let key = keys
         .iter()
@@ -313,32 +345,17 @@ async fn fetch_ticket(state: &AppState, provider_id: &str, model: &str) -> Resul
                         })
                     })
         })
-        .ok_or("聪明渠道没有可用于采集模型的启用密钥")?;
+        .ok_or("来源渠道没有可用于采集模型的启用密钥")?;
     let transport = state
         .read_provider_transport_snapshot(provider_id, &endpoint.id, &key.id)
         .await
-        .map_err(|_| "读取聪明渠道传输配置失败")?
-        .ok_or("聪明渠道传输配置不存在")?;
+        .map_err(|_| "读取来源渠道传输配置失败")?
+        .ok_or("来源渠道传输配置不存在")?;
     let plan = build_fetch_plan(state, &transport, model).await?;
     let result = crate::execution_runtime::execute_execution_runtime_sync_plan(state, None, &plan)
         .await
-        .map_err(|_| "聪明票据采集请求失败")?;
+        .map_err(|_| "Turn-State 票据采集请求失败")?;
     ticket_from_response(&result)
-}
-
-async fn selected_source(state: &AppState) -> Result<Option<(String, SourceConfig)>, String> {
-    let providers = state
-        .list_provider_catalog_providers(true)
-        .await
-        .map_err(|_| "读取票据采集开关失败")?;
-    let mut sources = providers
-        .iter()
-        .filter_map(|provider| source_config(provider).map(|config| (provider.id.clone(), config)));
-    let source = sources.next();
-    if sources.next().is_some() {
-        return Err("只能启用一个聪明票据采集渠道".into());
-    }
-    Ok(source)
 }
 
 async fn scan(state: &AppState) -> Result<(), String> {
@@ -347,27 +364,109 @@ async fn scan(state: &AppState) -> Result<(), String> {
 
 async fn scan_with_fetch(
     state: &AppState,
-    fetch: impl AsyncFn(&AppState, &str, &str) -> Result<String, String>,
+    fetch: impl AsyncFn(&AppState, &str, &str) -> Result<String, String> + Sync,
+) -> Result<(), String> {
+    use futures_util::{stream, StreamExt};
+    let providers = state
+        .list_provider_catalog_providers(false)
+        .await
+        .map_err(|_| "读取票据采集渠道失败")?;
+    let runtime = &state.runtime_state;
+    // Deleted channels must not leave usable credentials behind. Do not
+    // delete unrelated runtime keys or the previous version's global cache.
+    let cached_keys = runtime
+        .scan_keys(&format!("{CACHE_PREFIX}*"), 100)
+        .await
+        .map_err(|_| "读取票据缓存目录失败")?;
+    for key in &cached_keys {
+        let key = runtime.strip_namespace(key);
+        if !providers
+            .iter()
+            .any(|provider| cache_key(&provider.id) == key)
+        {
+            runtime
+                .kv_delete(key)
+                .await
+                .map_err(|_| "清除已删除来源票据失败")?;
+        }
+    }
+    let sources: Vec<_> = providers
+        .into_iter()
+        .filter(|provider| {
+            source_config(provider).is_some()
+                || cached_keys
+                    .iter()
+                    .any(|key| runtime.strip_namespace(key) == cache_key(&provider.id))
+        })
+        .collect();
+    let mut pending = Vec::new();
+    for provider in sources {
+        let fetch = &fetch;
+        pending.push(async move {
+            let provider_id = &provider.id;
+            let lock_key = format!("aether:turn_state:v1:scan:{provider_id}");
+            let lease = runtime
+                .lock_try_acquire(&lock_key, "turn_state_collection", Duration::from_secs(75))
+                .await
+                .map_err(|_| "获取票据采集锁失败".to_string())?;
+            let Some(lease) = lease else {
+                return Ok(());
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(60),
+                scan_source(state, &provider, fetch),
+            )
+            .await
+            .unwrap_or_else(|_| Err("票据采集请求超时".into()));
+            let _ = runtime.lock_release(&lease).await;
+            if let Err(reason) = &result {
+                tracing::warn!(provider_id, %reason, "turn-state collection failed");
+            }
+            result
+        });
+    }
+    let mut results = stream::iter(pending).buffer_unordered(4);
+    let mut failed = false;
+    while let Some(result) = results.next().await {
+        if result.is_err() {
+            failed = true;
+        }
+    }
+    if failed {
+        Err("部分渠道票据采集失败".into())
+    } else {
+        Ok(())
+    }
+}
+
+async fn scan_source(
+    state: &AppState,
+    provider: &StoredProviderCatalogProvider,
+    fetch: &impl AsyncFn(&AppState, &str, &str) -> Result<String, String>,
 ) -> Result<(), String> {
     let runtime = &state.runtime_state;
-    let source = selected_source(state).await;
-    let (provider_id, config) = match source {
-        Ok(Some(source)) => source,
-        other => {
-            runtime
-                .kv_delete(TICKET_KEY)
-                .await
-                .map_err(|_| "清除停用票据失败")?;
-            return other.map(|_| ());
-        }
+    let provider_id = &provider.id;
+    let key = cache_key(provider_id);
+    // Re-read under the source lock: a waiting scan must not resurrect a
+    // channel that was disabled while another scan was fetching it.
+    let current = state
+        .read_provider_catalog_providers_by_ids(std::slice::from_ref(provider_id))
+        .await
+        .map_err(|_| "读取票据采集开关失败")?;
+    let Some(config) = current.first().and_then(source_config) else {
+        runtime
+            .kv_delete(&key)
+            .await
+            .map_err(|_| "清除停用票据失败")?;
+        return Ok(());
     };
     let mut cache: TicketCache = runtime
-        .kv_get(TICKET_KEY)
+        .kv_get(&key)
         .await
         .map_err(|_| "读取票据缓存失败")?
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
-    if cache.source_provider_id != provider_id {
+    if cache.source_provider_id != *provider_id {
         cache = TicketCache {
             source_provider_id: provider_id.clone(),
             ..Default::default()
@@ -388,21 +487,25 @@ async fn scan_with_fetch(
         // replicas, errors and restarts. Only one model per scan keeps the
         // lock bounded; the others are picked up at the next 15-second tick.
         if !runtime
-            .kv_set_if_absent(&attempt_key(&provider_id, model), "1", REFRESH_INTERVAL)
+            .kv_set_if_absent(&attempt_key(provider_id, model), "1", REFRESH_INTERVAL)
             .await
             .map_err(|_| "读取票据采集调度状态失败")?
         {
             continue;
         }
         let started_at = crate::codex_client_release::unix_now_secs();
-        let value = fetch(state, &provider_id, model).await?;
+        let value = fetch(state, provider_id, model).await?;
         if !valid_ticket(&value) {
             return Err("采集响应票据无效".into());
         }
         // Do not republish after an in-flight source/model switch change.
-        if selected_source(state).await? != Some((provider_id.clone(), config.clone())) {
+        let current = state
+            .read_provider_catalog_providers_by_ids(std::slice::from_ref(provider_id))
+            .await
+            .map_err(|_| "读取票据采集开关失败")?;
+        if current.first().and_then(source_config).as_ref() != Some(&config) {
             runtime
-                .kv_delete(TICKET_KEY)
+                .kv_delete(&key)
                 .await
                 .map_err(|_| "清除停用票据失败")?;
             return Ok(());
@@ -415,7 +518,7 @@ async fn scan_with_fetch(
             },
         );
         save_cache(runtime, &cache).await?;
-        tracing::info!(provider_id, model, "congming turn-state refreshed");
+        tracing::info!(provider_id, model, "turn-state collection refreshed");
         break;
     }
     Ok(())
@@ -423,13 +526,13 @@ async fn scan_with_fetch(
 
 fn attempt_key(provider_id: &str, model: &str) -> String {
     let model_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, model.as_bytes());
-    format!("aether:congming_turn_state:v1:attempt:{provider_id}:{model_id}")
+    format!("aether:turn_state:v1:attempt:{provider_id}:{model_id}")
 }
 
 async fn save_cache(runtime: &RuntimeState, cache: &TicketCache) -> Result<(), String> {
     runtime
         .kv_set(
-            TICKET_KEY,
+            &cache_key(&cache.source_provider_id),
             serde_json::to_string(cache).map_err(|_| "编码票据失败")?,
             Some(TICKET_TTL),
         )
@@ -446,21 +549,9 @@ pub(crate) fn spawn_worker(state: AppState) -> Option<tokio::task::JoinHandle<()
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            // Fail closed for collection when shared coordination is unavailable.
-            let Ok(Some(lease)) = state
-                .runtime_state
-                .lock_try_acquire(LOCK_KEY, "congming_turn_state", Duration::from_secs(75))
-                .await
-            else {
-                continue;
-            };
-            let result = tokio::time::timeout(Duration::from_secs(60), scan(&state)).await;
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(reason)) => tracing::warn!(%reason, "congming turn-state collection failed"),
-                Err(_) => tracing::warn!("congming turn-state collection timed out"),
+            if let Err(reason) = scan(&state).await {
+                tracing::warn!(%reason, "turn-state collection scan failed");
             }
-            let _ = state.runtime_state.lock_release(&lease).await;
         }
     }))
 }

@@ -402,6 +402,22 @@ mod tests {
     }
 
     #[test]
+    fn turn_state_source_switch_or_disable_hard_fences_bound_connections() {
+        let before = provider(json!({
+            "pool_advanced": {"turn_state_source_provider_id": "source-a"}
+        }));
+        for source in [json!("source-b"), Value::Null] {
+            let after = provider(json!({
+                "pool_advanced": {"turn_state_source_provider_id": source}
+            }));
+            assert_eq!(
+                classify_provider_update(&before, &after),
+                Some(CatalogMutationImpact::HardFence)
+            );
+        }
+    }
+
+    #[test]
     fn display_and_timestamp_change_does_not_touch_bound_sessions() {
         let before = provider(json!({"pool_advanced": {"lru_enabled": true}}));
         let mut after = before.clone();

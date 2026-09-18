@@ -190,13 +190,15 @@ export interface RiskControlSessionAvoidanceProviderConfig {
   mode: RiskControlSessionAvoidanceMode
 }
 
-export interface CongmingTurnStateConfig {
+export interface TurnStateCollectionConfig {
   enabled: boolean
   models: string[]
 }
 
 export interface ProviderConfig {
-  congming_turn_state?: CongmingTurnStateConfig
+  turn_state_collection?: TurnStateCollectionConfig | null
+  /** @deprecated Read only until the channel is saved with the generic setting. */
+  congming_turn_state?: TurnStateCollectionConfig | null
   chat_pii_redaction?: ChatPiiRedactionProviderConfig
   responses_websocket?: ResponsesWebSocketProviderConfig
   risk_control_session_avoidance?: RiskControlSessionAvoidanceProviderConfig
@@ -791,6 +793,8 @@ export interface PoolAdvancedConfig {
   auto_remove_banned_keys?: boolean
   codex_client_headers?: PoolCodexClientHeadersConfig | null
   codex_runtime_identity?: PoolCodexRuntimeIdentityConfig | null
+  turn_state_source_provider_id?: string | null
+  /** @deprecated Does not activate overrides; explicitly select a source. */
   congming_turn_state_override?: boolean
 }
 
@@ -837,7 +841,9 @@ export interface FailoverRulesConfig {
 }
 
 export interface ProviderWithEndpointsSummary {
-  congming_turn_state?: CongmingTurnStateConfig | null
+  turn_state_collection?: TurnStateCollectionConfig | null
+  /** @deprecated Older server response. */
+  congming_turn_state?: TurnStateCollectionConfig | null
   id: string
   name: string
   provider_type?: ProviderType

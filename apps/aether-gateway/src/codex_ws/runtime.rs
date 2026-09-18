@@ -190,7 +190,7 @@ pub(crate) struct CodexWsCandidate {
     /// official identity on the wire unchanged. Never part of the binding
     /// identity or handshake fingerprint.
     pub(crate) runtime_identity: Option<Arc<CodexWsRuntimeIdentitySnapshot>>,
-    pub(crate) congming_turn_state_override: bool,
+    pub(crate) turn_state_source_provider_id: Option<String>,
     pub(crate) report_kind: String,
     pub(crate) binding_identity: UpstreamBindingIdentity,
     pub(crate) adapter: crate::orchestration::ResponsesWebSocketAdapter,
@@ -1695,9 +1695,8 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 account_profile,
                 handshake_user_agent: handshake_user_agent.clone(),
                 runtime_identity,
-                congming_turn_state_override: crate::congming_turn_state::override_enabled(
-                    &transport,
-                ),
+                turn_state_source_provider_id: crate::turn_state::source_provider_id(&transport)
+                    .map(str::to_owned),
                 report_kind,
                 binding_identity,
                 adapter,
@@ -2197,9 +2196,9 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             .await;
         let env_context =
             self.step_environment_context(candidate, &step.value, runtime_identity.as_ref());
-        let congming_tickets = crate::congming_turn_state::load_tickets(
+        let turn_state_tickets = crate::turn_state::load_tickets(
             &self.state.runtime_state,
-            candidate.congming_turn_state_override,
+            candidate.turn_state_source_provider_id.as_deref(),
         )
         .await;
         let body = std::mem::take(&mut step.value);
@@ -2249,7 +2248,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                         &provider_type,
                         runtime_identity.as_ref(),
                         env_context.as_ref(),
-                        congming_tickets.as_ref(),
+                        turn_state_tickets.as_ref(),
                     )?;
                     Ok::<_, StepPreparationError>((materialized_body, original_request_body))
                 })
@@ -2274,7 +2273,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                     &candidate.provider_type,
                     runtime_identity.as_ref(),
                     env_context.as_ref(),
-                    congming_tickets.as_ref(),
+                    turn_state_tickets.as_ref(),
                 )?;
                 (materialized_body, original_request_body)
             };
@@ -3216,7 +3215,7 @@ fn materialize_codex_ws_step_body(
     provider_type: &str,
     runtime_identity: Option<&CodexWsStepRuntimeIdentity>,
     env_context: Option<&CodexWsStepEnvironmentContext>,
-    congming_tickets: Option<&crate::congming_turn_state::TicketCache>,
+    turn_state_tickets: Option<&crate::turn_state::TicketCache>,
 ) -> Result<MaterializedCodexWsStepBody, StepPreparationError> {
     let explicit_session_key =
         crate::client_session_affinity::client_session_affinity_from_request(
@@ -3354,13 +3353,8 @@ fn materialize_codex_ws_step_body(
         log_environment_context_report("ws_step_body", &env_context.outbound_thread_id, &report);
         env_context_state = state;
     }
-    if let Some(ticket) = congming_tickets.and_then(|tickets| tickets.for_body(&body)) {
-        crate::congming_turn_state::apply_ticket(
-            &mut BTreeMap::new(),
-            Some(&mut body),
-            ticket,
-            true,
-        );
+    if let Some(ticket) = turn_state_tickets.and_then(|tickets| tickets.for_body(&body)) {
+        crate::turn_state::apply_ticket(&mut BTreeMap::new(), Some(&mut body), ticket, true);
     }
     let body_text = serde_json::to_string(&body)
         .map_err(|_| StepPreparationError::retain("account_profile_materialization_failed"))?;
@@ -4344,14 +4338,13 @@ mod tests {
     }
 
     #[test]
-    fn congming_turn_state_overrides_each_ws_step_after_identity_sanitation() {
+    fn turn_state_overrides_each_ws_step_after_identity_sanitation() {
         for value in ["a".repeat(292), "b".repeat(384)] {
             let body = step_body_with_client_metadata();
             let mut identity = step_runtime_identity(&body);
             identity.outbound.turn_source =
                 crate::codex_runtime_identity::OutboundTurnSource::Minted;
-            let tickets =
-                crate::congming_turn_state::tests::ticket_cache("gpt-5.6-terra", &value, 0);
+            let tickets = crate::turn_state::tests::ticket_cache("gpt-5.6-terra", &value, 0);
             let materialized = materialize_codex_ws_step_body(
                 body,
                 "gpt-5.6-terra",

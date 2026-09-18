@@ -564,21 +564,64 @@
           </div>
         </div>
 
-        <div class="flex items-start justify-between gap-3 rounded-xl border border-border/60 bg-muted/30 p-4">
-          <div class="space-y-1">
-            <Label for="congming-turn-state-override">聪明票据覆盖</Label>
-            <p class="text-xs leading-5 text-muted-foreground">
-              按请求最终上游模型，使用后台为该模型采集的票据覆盖本号池所有账号的 x-codex-turn-state。
-              HTTP Responses 每次请求、WebSocket 每次 response.create 均强制携带，无需客户端回传，也不受会话身份合成开关影响。
-              请先在聪明渠道启用定时采集；每模型 40 分钟刷新，无匹配或有效票据时沿用原逻辑，不跨模型混用。票据本地最长保留 1 小时，实际上游有效期尚未确认。
-            </p>
-          </div>
-          <Switch
-            id="congming-turn-state-override"
-            :model-value="congmingTurnStateOverride"
-            class="shrink-0"
-            @update:model-value="(v: boolean) => congmingTurnStateOverride = v"
-          />
+        <div class="space-y-3 rounded-xl border border-border/60 bg-muted/30 p-4">
+          <Label for="turn-state-source">Turn-State 票据覆盖来源</Label>
+          <Select
+            v-model="turnStateSourceId"
+            data-testid="turn-state-source-select"
+          >
+            <SelectTrigger id="turn-state-source">
+              <SelectValue placeholder="关闭（不覆盖）" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem :value="TURN_STATE_DISABLED">
+                关闭（不覆盖）
+              </SelectItem>
+              <SelectItem
+                v-for="source in turnStateSources"
+                :key="source.id"
+                :value="source.id"
+              >
+                {{ source.name }}{{ source.is_active && source.turn_state_collection?.enabled ? '' : '（未启用采集或已停用）' }}
+              </SelectItem>
+              <SelectItem
+                v-if="turnStateSourceId !== TURN_STATE_DISABLED && !turnStateSources.some(source => source.id === turnStateSourceId)"
+                :value="turnStateSourceId"
+              >
+                {{ turnStateSourceId }}（未加载或已删除）
+              </SelectItem>
+            </SelectContent>
+          </Select>
+          <p class="text-xs leading-5 text-muted-foreground">
+            选择关闭则不覆盖。选择渠道后，按「来源渠道 + 最终上游模型」匹配票据，覆盖本号池所有账号的 x-codex-turn-state。
+            HTTP Responses 每次请求、WebSocket 每次 response.create 均强制携带，无需客户端回传。
+            请在来源渠道启用定时采集；每模型 40 分钟刷新，无匹配或有效票据时沿用原逻辑，不会自动使用其他来源。票据本地最长保留 1 小时。
+          </p>
+          <p
+            v-if="loadingTurnStateSources"
+            class="text-xs text-muted-foreground"
+          >
+            正在加载来源渠道…
+          </p>
+          <p
+            v-if="turnStateSourcesError"
+            class="text-xs text-destructive"
+          >
+            {{ turnStateSourcesError }}，已选来源保持不变。
+            <button
+              type="button"
+              class="underline"
+              @click="loadTurnStateSources"
+            >
+              重试
+            </button>
+          </p>
+          <p
+            v-if="currentConfig?.congming_turn_state_override && !currentConfig?.turn_state_source_provider_id"
+            class="text-xs text-muted-foreground"
+          >
+            旧版聪明票据覆盖开关不再生效，请明确选择来源渠道后保存。
+          </p>
         </div>
 
         <div class="space-y-3 rounded-xl border border-border/60 bg-muted/30 p-4">
@@ -807,12 +850,13 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { CircleHelp, RefreshCw } from 'lucide-vue-next'
-import { Dialog, Button, Input, Label, Switch, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui'
+import { Dialog, Button, Input, Label, Switch, Select, SelectTrigger, SelectValue, SelectContent, SelectItem, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { parseApiError } from '@/utils/errorParser'
 import {
   getProvider,
+  getProvidersSummary,
   refreshCodexPoolClientProfiles,
   resolvePoolKeySelection,
   updateProvider,
@@ -914,7 +958,32 @@ interface CodexHeaderFormState {
   profiles: CodexHeaderProfileFormState[]
 }
 
-const congmingTurnStateOverride = ref(false)
+const TURN_STATE_DISABLED = '__disabled__'
+const turnStateSourceId = ref(TURN_STATE_DISABLED)
+const turnStateSources = ref<ProviderWithEndpointsSummary[]>([])
+const loadingTurnStateSources = ref(false)
+const turnStateSourcesError = ref('')
+let sourceLoadGeneration = 0
+
+async function loadTurnStateSources() {
+  const generation = ++sourceLoadGeneration
+  loadingTurnStateSources.value = true
+  turnStateSourcesError.value = ''
+  try {
+    const sources: ProviderWithEndpointsSummary[] = []
+    for (let page = 1; ; page += 1) {
+      const result = await getProvidersSummary({ page, page_size: 100 }, { cacheTtlMs: 0 })
+      if (generation !== sourceLoadGeneration || !props.modelValue) return
+      sources.push(...result.items)
+      if (sources.length >= result.total || result.items.length === 0) break
+    }
+    turnStateSources.value = sources
+  } catch (err) {
+    if (generation === sourceLoadGeneration) turnStateSourcesError.value = parseApiError(err)
+  } finally {
+    if (generation === sourceLoadGeneration) loadingTurnStateSources.value = false
+  }
+}
 
 const codexHeaderForm = ref<CodexHeaderFormState>({
   enabled: true,
@@ -1074,7 +1143,11 @@ function updateHealthToggleValue(key: PoolHealthToggleKey, value: boolean): void
 }
 
 watch(() => props.modelValue, (open) => {
-  if (!open) return
+  if (!open) {
+    sourceLoadGeneration += 1
+    return
+  }
+  if (isCodex.value) void loadTurnStateSources()
 
   const cfg = props.currentConfig
   const scoreRules = cfg?.score_rules
@@ -1120,7 +1193,7 @@ watch(() => props.modelValue, (open) => {
   }
 
   // 会话身份合成缺省关闭；数值缺失时展示推荐值，真正生效以保存后的配置为准。
-  congmingTurnStateOverride.value = cfg?.congming_turn_state_override === true
+  turnStateSourceId.value = cfg?.turn_state_source_provider_id || TURN_STATE_DISABLED
   const codexRuntimeIdentity = cfg?.codex_runtime_identity
   codexRuntimeIdentityForm.value = {
     enabled: codexRuntimeIdentity?.enabled === true,
@@ -1140,7 +1213,7 @@ watch(() => props.modelValue, (open) => {
     cache_ttl_override_target: cc?.cache_ttl_override_target ?? 'ephemeral',
     cli_only_enabled: cc?.cli_only_enabled ?? false,
   }
-})
+}, { immediate: true })
 
 async function handleSave() {
   loading.value = true
@@ -1208,8 +1281,9 @@ async function handleSave() {
       codex_quota_exhaustion_basis: form.value.codex_quota_weekly_basis ? 'weekly' : 'five_hour',
     }
 
+    delete poolAdvanced.congming_turn_state_override
     if (isCodex.value) {
-      poolAdvanced.congming_turn_state_override = congmingTurnStateOverride.value
+      poolAdvanced.turn_state_source_provider_id = turnStateSourceId.value === TURN_STATE_DISABLED ? null : turnStateSourceId.value
       poolAdvanced.codex_client_headers = buildCodexClientHeadersConfig(
         codexHeaderForm.value.enabled,
         codexHeaderForm.value.profiles,
@@ -1222,7 +1296,7 @@ async function handleSave() {
     } else {
       delete poolAdvanced.codex_client_headers
       delete poolAdvanced.codex_runtime_identity
-      delete poolAdvanced.congming_turn_state_override
+      delete poolAdvanced.turn_state_source_provider_id
     }
 
     const payload: Parameters<typeof updateProvider>[1] = {
