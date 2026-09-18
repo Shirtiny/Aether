@@ -148,7 +148,7 @@
                     <Input
                       :model-value="getEndpointEditState(endpoint.id)?.url ?? endpoint.base_url"
                       :placeholder="getEndpointBaseUrlPlaceholder(endpoint.api_format)"
-                      :disabled="isFixedProvider"
+                      :disabled="isBaseUrlReadOnly"
                       @update:model-value="(v) => updateEndpointField(endpoint.id, 'url', v)"
                     />
                   </div>
@@ -1797,6 +1797,10 @@ const isFixedProvider = computed(() => {
   return !!t && t !== 'custom'
 })
 
+const isBaseUrlReadOnly = computed(() => {
+  return isFixedProvider.value && props.provider?.provider_type !== 'codex'
+})
+
 const isEndpointConfigReadOnly = computed(() => {
   return (props.provider?.provider_type || '').trim().toLowerCase() === 'gemini_cli'
 })
@@ -3248,10 +3252,10 @@ async function saveEndpoint(endpoint: ProviderEndpoint) {
 
   savingEndpointId.value = endpoint.id
   try {
-    // 仅提交变更字段；fixed provider 锁定 base_url，但允许覆盖 custom_path。
+    // 仅提交变更字段；Codex 允许自定义 base_url，其他固定类型仍保持锁定。
     const payload: Record<string, unknown> = {}
 
-    if (!isFixedProvider.value) {
+    if (!isBaseUrlReadOnly.value) {
       if (state.url !== endpoint.base_url) payload.base_url = state.url
     }
     if (state.path !== (endpoint.custom_path || '')) payload.custom_path = state.path || null

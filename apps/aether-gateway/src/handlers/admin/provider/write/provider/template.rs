@@ -14,6 +14,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 const FIXED_PROVIDER_TEMPLATE_METADATA_KEY: &str = "_aether_fixed_provider_template";
+const OVERRIDE_BASE_URL: &str = "base_url";
 const OVERRIDE_BODY_RULES: &str = "body_rules";
 const OVERRIDE_FORMAT_ACCEPTANCE_CONFIG: &str = "format_acceptance_config";
 const OVERRIDE_HEADER_RULES: &str = "header_rules";
@@ -158,6 +159,16 @@ pub(crate) fn apply_admin_fixed_provider_endpoint_template_overrides(
         .unwrap_or_else(|| managed_fixed_provider_endpoint_metadata(template, endpoint_template));
     let mut overrides = metadata.overrides.clone();
 
+    if template.provider_type == "codex" {
+        sync_override_if_changed(
+            &mut overrides,
+            OVERRIDE_BASE_URL,
+            &existing_endpoint.base_url,
+            &updated_endpoint.base_url,
+            &defaults.base_url,
+        );
+    }
+
     sync_override_if_changed(
         &mut overrides,
         OVERRIDE_HEADER_RULES,
@@ -249,7 +260,9 @@ fn reconcile_fixed_provider_endpoint(
     updated.api_format = defaults.api_format.clone();
     updated.api_family = Some(defaults.api_family.clone());
     updated.endpoint_kind = Some(defaults.endpoint_kind.clone());
-    updated.base_url = defaults.base_url;
+    if template.provider_type != "codex" || !metadata.overrides.contains(OVERRIDE_BASE_URL) {
+        updated.base_url = defaults.base_url;
+    }
     updated.custom_path = defaults.custom_path;
 
     if !metadata.overrides.contains(OVERRIDE_HEADER_RULES) {
@@ -538,6 +551,95 @@ fn sync_override_if_changed<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_base_url_override_survives_reconcile_and_can_be_reset() {
+        let provider = StoredProviderCatalogProvider::new(
+            "provider-codex".to_string(),
+            "Codex".to_string(),
+            None,
+            "codex".to_string(),
+        )
+        .expect("provider should build");
+        let template = fixed_provider_template("codex").expect("codex template should exist");
+
+        for endpoint_template in template.endpoints {
+            let existing =
+                build_admin_fixed_provider_endpoint_record(&provider, template, endpoint_template)
+                    .expect("endpoint should build");
+            let mut updated = existing.clone();
+            updated.base_url = "https://proxy.example/custom/codex".to_string();
+            apply_admin_fixed_provider_endpoint_template_overrides(
+                &provider,
+                &existing,
+                &mut updated,
+            )
+            .expect("base URL override should apply");
+
+            // Subsequent edits (including replacing config) must retain the URL override.
+            let mut edited = updated.clone();
+            edited.max_retries = Some(7);
+            edited.config = Some(json!({"upstream_stream_policy": "force_stream"}));
+            apply_admin_fixed_provider_endpoint_template_overrides(
+                &provider,
+                &updated,
+                &mut edited,
+            )
+            .expect("unrelated endpoint edit should apply");
+            let reconciled =
+                reconcile_fixed_provider_endpoint(&provider, &edited, template, endpoint_template)
+                    .expect("endpoint should reconcile");
+            assert_eq!(reconciled.base_url, "https://proxy.example/custom/codex");
+            assert!(fixed_provider_endpoint_metadata(&reconciled)
+                .expect("metadata should exist")
+                .overrides
+                .contains(OVERRIDE_BASE_URL));
+
+            let mut reset = reconciled.clone();
+            reset.base_url = template.base_url.to_string();
+            apply_admin_fixed_provider_endpoint_template_overrides(
+                &provider,
+                &reconciled,
+                &mut reset,
+            )
+            .expect("default URL should clear override");
+            assert!(!fixed_provider_endpoint_metadata(&reset)
+                .expect("metadata should exist")
+                .overrides
+                .contains(OVERRIDE_BASE_URL));
+            let reconciled =
+                reconcile_fixed_provider_endpoint(&provider, &reset, template, endpoint_template)
+                    .expect("reset endpoint should reconcile");
+            assert_eq!(reconciled.base_url, "https://chatgpt.com/backend-api/codex");
+        }
+    }
+
+    #[test]
+    fn fixed_base_url_without_override_still_uses_template_default() {
+        for provider_type in ["codex", "claude_code", "gemini_cli"] {
+            let provider = StoredProviderCatalogProvider::new(
+                "provider-test".to_string(),
+                "Test".to_string(),
+                None,
+                provider_type.to_string(),
+            )
+            .expect("provider should build");
+            let template = fixed_provider_template(provider_type).expect("template should exist");
+            let endpoint_template = &template.endpoints[0];
+            let mut existing =
+                build_admin_fixed_provider_endpoint_record(&provider, template, endpoint_template)
+                    .expect("endpoint should build");
+            existing.base_url = "https://stale.example".to_string();
+            let reconciled = reconcile_fixed_provider_endpoint(
+                &provider,
+                &existing,
+                template,
+                endpoint_template,
+            )
+            .expect("endpoint should reconcile");
+            assert_eq!(reconciled.base_url, template.base_url);
+        }
+    }
 
     #[test]
     fn disabled_codex_search_endpoint_stays_disabled_after_template_reconcile() {

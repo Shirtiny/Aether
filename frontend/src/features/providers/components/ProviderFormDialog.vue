@@ -112,7 +112,7 @@
               v-if="!isEditMode && form.provider_type !== 'custom'"
               class="text-xs text-muted-foreground"
             >
-              反代使用固定端点且不可修改
+              {{ form.provider_type === 'codex' ? '自动创建官方端点，可在端点管理中自定义 Base URL' : '反代使用固定端点且不可修改' }}
             </p>
           </div>
           <div class="space-y-1.5">

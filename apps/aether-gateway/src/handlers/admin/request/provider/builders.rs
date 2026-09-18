@@ -316,7 +316,8 @@ impl<'a> AdminAppState<'a> {
         }
 
         if self.provider_type_is_fixed(&provider.provider_type)
-            && (fields.contains("base_url") || fields.contains("custom_path"))
+            && ((fields.contains("base_url") && provider_type != "codex")
+                || fields.contains("custom_path"))
         {
             return Err(
                 "固定类型 Provider 的 Endpoint 不允许修改 base_url/custom_path".to_string(),
@@ -395,5 +396,107 @@ impl<'a> AdminAppState<'a> {
             .map(|duration| duration.as_secs());
 
         Ok(updated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handlers::admin::provider::endpoints_admin::payloads::AdminProviderEndpointUpdatePatch;
+    use crate::handlers::admin::provider::write::provider::build_admin_fixed_provider_endpoint_record;
+    use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
+    use aether_provider_transport::provider_types::fixed_provider_template;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn codex_endpoint_base_url_is_editable_and_validated() {
+        let app = crate::AppState::new().expect("app should build");
+        let state = AdminAppState::new(&app);
+        let provider = StoredProviderCatalogProvider::new(
+            "provider-codex".to_string(),
+            "Codex".to_string(),
+            None,
+            "codex".to_string(),
+        )
+        .expect("provider should build");
+        let template = fixed_provider_template("codex").expect("template should exist");
+        let existing =
+            build_admin_fixed_provider_endpoint_record(&provider, template, &template.endpoints[0])
+                .expect("endpoint should build");
+
+        let patch = AdminProviderEndpointUpdatePatch::from_object(
+            json!({"base_url": " https://proxy.example/custom/codex/ "})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        let updated = state
+            .build_admin_update_provider_endpoint_record(&provider, &existing, patch)
+            .await
+            .expect("Codex base URL should be editable");
+        assert_eq!(updated.base_url, "https://proxy.example/custom/codex");
+        assert_eq!(updated.custom_path, existing.custom_path);
+        assert_eq!(updated.api_format, existing.api_format);
+        assert_eq!(
+            updated.config.as_ref().unwrap()["upstream_stream_policy"],
+            "force_stream"
+        );
+
+        for payload in [
+            json!({"base_url": ""}),
+            json!({"base_url": "not-a-url"}),
+            json!({"base_url": "ftp://proxy.example/codex"}),
+            json!({"base_url": null}),
+            json!({"custom_path": "/custom"}),
+            json!({"config": {"upstream_stream_policy": "auto"}}),
+        ] {
+            let patch =
+                AdminProviderEndpointUpdatePatch::from_object(payload.as_object().unwrap().clone())
+                    .unwrap();
+            assert!(
+                state
+                    .build_admin_update_provider_endpoint_record(&provider, &existing, patch)
+                    .await
+                    .is_err(),
+                "unexpectedly accepted {payload}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn other_fixed_endpoint_base_urls_remain_read_only() {
+        let app = crate::AppState::new().expect("app should build");
+        let state = AdminAppState::new(&app);
+        for provider_type in ["claude_code", "gemini_cli", "chatgpt_web", "kiro"] {
+            let provider = StoredProviderCatalogProvider::new(
+                "provider-test".to_string(),
+                "Test".to_string(),
+                None,
+                provider_type.to_string(),
+            )
+            .expect("provider should build");
+            let template = fixed_provider_template(provider_type).expect("template should exist");
+            let existing = build_admin_fixed_provider_endpoint_record(
+                &provider,
+                template,
+                &template.endpoints[0],
+            )
+            .expect("endpoint should build");
+            let patch = AdminProviderEndpointUpdatePatch::from_object(
+                json!({"base_url": "https://proxy.example"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+            assert!(
+                state
+                    .build_admin_update_provider_endpoint_record(&provider, &existing, patch)
+                    .await
+                    .is_err(),
+                "{provider_type} must remain read-only"
+            );
+        }
     }
 }
