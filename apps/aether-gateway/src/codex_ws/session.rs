@@ -3765,6 +3765,7 @@ mod tests {
             account_profile: None,
             handshake_user_agent: None,
             runtime_identity: None,
+            congming_turn_state_override: false,
             report_kind: "openai_responses_stream_success".to_string(),
             binding_identity: super::super::runtime::UpstreamBindingIdentity::for_test(
                 crate::orchestration::ResponsesWebSocketAdapter::Codex,

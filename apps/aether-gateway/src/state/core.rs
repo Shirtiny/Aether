@@ -1595,6 +1595,10 @@ impl AppState {
             };
 
         supervise_worker(
+            crate::task_runtime::TASK_KEY_CONGMING_TURN_STATE,
+            crate::congming_turn_state::spawn_worker(self.clone()),
+        );
+        supervise_worker(
             crate::task_runtime::TASK_KEY_USAGE_QUEUE_WORKER,
             self.usage_runtime.spawn_worker(self.data.clone()),
         );

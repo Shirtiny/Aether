@@ -283,6 +283,33 @@
           />
         </div>
 
+        <div class="space-y-3 rounded-lg border p-3">
+          <div class="flex items-center justify-between gap-3">
+            <Label for="congming-turn-state-enabled">聪明票据定时采集</Label>
+            <Switch
+              id="congming-turn-state-enabled"
+              :model-value="form.congming_turn_state_enabled"
+              @update:model-value="(v: boolean) => form.congming_turn_state_enabled = v"
+            />
+          </div>
+          <p class="text-xs text-muted-foreground">
+            仅在聪明渠道开启（全站限一个来源）。后台每 15 秒检查开关，每个已配置模型每 40 分钟采集一次；
+            使用 sub2.congmingai.com 的 Responses 端点和已有密钥，会产生少量上游用量。关闭后通常 15 秒内停止覆盖（正在采集时需等待请求结束）。
+          </p>
+          <div
+            v-if="form.congming_turn_state_enabled"
+            class="space-y-2"
+          >
+            <Label for="congming-turn-state-models">采集模型（每行一个，填写号池实际发送的上游模型名）</Label>
+            <Textarea
+              id="congming-turn-state-models"
+              v-model="form.congming_turn_state_models"
+              placeholder="填写需要覆盖的模型，每行一个；不自动采集其他模型"
+              :rows="3"
+            />
+          </div>
+        </div>
+
         <div
           class="flex items-center justify-between p-3 border rounded-lg bg-muted/50"
           data-testid="responses-websocket-setting"
@@ -422,6 +449,7 @@ import {
   Dialog,
   Button,
   Input,
+  Textarea,
   Label,
   Select,
   SelectTrigger,
@@ -486,6 +514,8 @@ const form = ref({
   provider_priority: 100,
   keep_priority_on_conversion: false,  // 格式转换时是否保持优先级
   responses_websocket_enabled: false,
+  congming_turn_state_enabled: false,
+  congming_turn_state_models: '',
   // 状态配置
   is_active: true,
   rate_limit: undefined as number | undefined,
@@ -520,6 +550,8 @@ function resetForm() {
     provider_priority: defaultPriority.value,
     keep_priority_on_conversion: false,
     responses_websocket_enabled: false,
+    congming_turn_state_enabled: false,
+    congming_turn_state_models: '',
     is_active: true,
     rate_limit: undefined,
     concurrent_limit: undefined,
@@ -557,6 +589,8 @@ function loadProviderData() {
     provider_priority: props.provider.provider_priority || 999,
     keep_priority_on_conversion: props.provider.keep_priority_on_conversion ?? false,
     responses_websocket_enabled: props.provider.responses_websocket_enabled ?? false,
+    congming_turn_state_enabled: props.provider.congming_turn_state?.enabled === true,
+    congming_turn_state_models: props.provider.congming_turn_state?.models?.join('\n') ?? '',
     is_active: props.provider.is_active,
     rate_limit: undefined,
     concurrent_limit: undefined,
@@ -620,6 +654,11 @@ const handleSubmit = async () => {
     return
   }
 
+  const collectionModels = [...new Set(form.value.congming_turn_state_models.split(/[\n,，]+/).map(model => model.trim()).filter(Boolean))]
+  if (form.value.congming_turn_state_enabled && collectionModels.length === 0) {
+    showError('请填写聪明票据采集模型列表')
+    return
+  }
   loading.value = true
   try {
     const currentPoolAdvanced = normalizePoolAdvancedConfig(props.provider?.pool_advanced)
@@ -631,6 +670,10 @@ const handleSubmit = async () => {
         }
       : null
     const providerConfig = {
+      congming_turn_state: {
+        enabled: form.value.congming_turn_state_enabled,
+        models: collectionModels,
+      },
       risk_control_session_avoidance: {
         mode: form.value.risk_control_session_avoidance_mode,
       },

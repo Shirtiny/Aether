@@ -1924,3 +1924,72 @@ fn codex_client_release_seed_secs() -> u64 {
     crate::codex_client_release::unix_now_secs()
         .saturating_sub(crate::codex_client_release::CLIENT_RELEASE_MAX_AGE_SECS / 2)
 }
+
+#[tokio::test]
+async fn congming_turn_state_override_runs_after_turn_sanitation_and_header_rules() {
+    use crate::codex_runtime_identity::CodexRuntimeIdentitySurface;
+    let runtime = aether_runtime_state::RuntimeState::memory(
+        aether_runtime_state::MemoryRuntimeStateConfig::default(),
+    );
+    let ticket = "a".repeat(292);
+    crate::congming_turn_state::tests::seed_ticket(&runtime, &ticket, 0).await;
+    for identity_enabled in [false, true] {
+        let mut transport = sample_transport(
+            "codex",
+            Some(json!({"pool_advanced": {
+                "codex_runtime_identity": {"enabled": identity_enabled},
+                "congming_turn_state_override": true
+            }})),
+        );
+        transport.endpoint.header_rules = Some(json!([
+            {"action": "drop", "key": "x-codex-turn-state"}
+        ]));
+        for surface in [
+            CodexRuntimeIdentitySurface::HttpResponses,
+            CodexRuntimeIdentitySurface::HttpCompact,
+        ] {
+            let original =
+                json!({"model": "test-model", "input": [{"role": "user", "content": "Hi"}]});
+            let mut body = original.clone();
+            let mut headers = BTreeMap::new();
+            super::apply_codex_pool_runtime_identity(
+                &runtime,
+                &transport,
+                &mut headers,
+                Some(&mut body),
+                &HeaderMap::new(),
+                Some(&original),
+                surface,
+            )
+            .await;
+            assert_eq!(headers[crate::congming_turn_state::HEADER], ticket);
+        }
+    }
+    for (provider_type, config) in [
+        ("codex", json!({"pool_advanced": {}})),
+        (
+            "codex",
+            json!({"pool_advanced": {"congming_turn_state_override": false}}),
+        ),
+        (
+            "custom",
+            json!({"pool_advanced": {"congming_turn_state_override": true}}),
+        ),
+        ("codex", json!({"congming_turn_state_override": true})),
+    ] {
+        let transport = sample_transport(provider_type, Some(config));
+        assert!(!crate::congming_turn_state::override_enabled(&transport));
+        let mut headers = BTreeMap::from([("x-codex-turn-state".into(), "original".into())]);
+        super::apply_codex_pool_runtime_identity(
+            &runtime,
+            &transport,
+            &mut headers,
+            None,
+            &HeaderMap::new(),
+            None,
+            CodexRuntimeIdentitySurface::HttpResponses,
+        )
+        .await;
+        assert_eq!(headers["x-codex-turn-state"], "original");
+    }
+}

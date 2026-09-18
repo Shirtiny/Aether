@@ -190,7 +190,13 @@ export interface RiskControlSessionAvoidanceProviderConfig {
   mode: RiskControlSessionAvoidanceMode
 }
 
+export interface CongmingTurnStateConfig {
+  enabled: boolean
+  models: string[]
+}
+
 export interface ProviderConfig {
+  congming_turn_state?: CongmingTurnStateConfig
   chat_pii_redaction?: ChatPiiRedactionProviderConfig
   responses_websocket?: ResponsesWebSocketProviderConfig
   risk_control_session_avoidance?: RiskControlSessionAvoidanceProviderConfig
@@ -785,6 +791,7 @@ export interface PoolAdvancedConfig {
   auto_remove_banned_keys?: boolean
   codex_client_headers?: PoolCodexClientHeadersConfig | null
   codex_runtime_identity?: PoolCodexRuntimeIdentityConfig | null
+  congming_turn_state_override?: boolean
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -830,6 +837,7 @@ export interface FailoverRulesConfig {
 }
 
 export interface ProviderWithEndpointsSummary {
+  congming_turn_state?: CongmingTurnStateConfig | null
   id: string
   name: string
   provider_type?: ProviderType

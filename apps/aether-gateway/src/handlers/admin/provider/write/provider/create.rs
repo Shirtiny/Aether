@@ -162,6 +162,7 @@ pub(crate) async fn build_admin_create_provider_record(
         }
     }
     validate_responses_websocket_config(&config_map)?;
+    crate::congming_turn_state::validate_config(&config_map)?;
     let config = (!config_map.is_empty()).then_some(serde_json::Value::Object(config_map));
 
     let now_unix_secs = SystemTime::now()

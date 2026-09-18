@@ -564,6 +564,23 @@
           </div>
         </div>
 
+        <div class="flex items-start justify-between gap-3 rounded-xl border border-border/60 bg-muted/30 p-4">
+          <div class="space-y-1">
+            <Label for="congming-turn-state-override">聪明票据覆盖</Label>
+            <p class="text-xs leading-5 text-muted-foreground">
+              按请求最终上游模型，使用后台为该模型采集的票据覆盖本号池所有账号的 x-codex-turn-state。
+              HTTP Responses 每次请求、WebSocket 每次 response.create 均强制携带，无需客户端回传，也不受会话身份合成开关影响。
+              请先在聪明渠道启用定时采集；每模型 40 分钟刷新，无匹配或有效票据时沿用原逻辑，不跨模型混用。票据本地最长保留 1 小时，实际上游有效期尚未确认。
+            </p>
+          </div>
+          <Switch
+            id="congming-turn-state-override"
+            :model-value="congmingTurnStateOverride"
+            class="shrink-0"
+            @update:model-value="(v: boolean) => congmingTurnStateOverride = v"
+          />
+        </div>
+
         <div class="space-y-3 rounded-xl border border-border/60 bg-muted/30 p-4">
           <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div class="space-y-1">
@@ -897,6 +914,8 @@ interface CodexHeaderFormState {
   profiles: CodexHeaderProfileFormState[]
 }
 
+const congmingTurnStateOverride = ref(false)
+
 const codexHeaderForm = ref<CodexHeaderFormState>({
   enabled: true,
   profiles: [],
@@ -1101,6 +1120,7 @@ watch(() => props.modelValue, (open) => {
   }
 
   // 会话身份合成缺省关闭；数值缺失时展示推荐值，真正生效以保存后的配置为准。
+  congmingTurnStateOverride.value = cfg?.congming_turn_state_override === true
   const codexRuntimeIdentity = cfg?.codex_runtime_identity
   codexRuntimeIdentityForm.value = {
     enabled: codexRuntimeIdentity?.enabled === true,
@@ -1189,6 +1209,7 @@ async function handleSave() {
     }
 
     if (isCodex.value) {
+      poolAdvanced.congming_turn_state_override = congmingTurnStateOverride.value
       poolAdvanced.codex_client_headers = buildCodexClientHeadersConfig(
         codexHeaderForm.value.enabled,
         codexHeaderForm.value.profiles,
@@ -1201,6 +1222,7 @@ async function handleSave() {
     } else {
       delete poolAdvanced.codex_client_headers
       delete poolAdvanced.codex_runtime_identity
+      delete poolAdvanced.congming_turn_state_override
     }
 
     const payload: Parameters<typeof updateProvider>[1] = {

@@ -655,6 +655,24 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
         original_body,
         Some(original_headers),
     );
+    if let Some(tickets) = crate::congming_turn_state::load_tickets(
+        runtime,
+        crate::congming_turn_state::override_enabled(transport),
+    )
+    .await
+    {
+        if let Some(ticket) = provider_request_body
+            .as_deref()
+            .and_then(|body| tickets.for_body(body))
+        {
+            crate::congming_turn_state::apply_ticket(
+                provider_request_headers,
+                provider_request_body.as_deref_mut(),
+                ticket,
+                false,
+            );
+        }
+    }
     // Transport-level fidelity (header order, body encoding, cookie jar) is
     // decided last: it depends only on where the request goes, never on the
     // identity switch, and the transport strips the controls before egress.
