@@ -22,6 +22,33 @@ mod status;
 pub(crate) use status::{collection_status, key_collection_status};
 
 pub(crate) const HEADER: &str = "x-codex-turn-state";
+// Internal plan control, stripped by the transport's x-aether-execution-* filter.
+// Freeze the policy at request planning; do not depend on a cache hit or reread
+// mutable provider configuration after the upstream request has completed.
+pub(crate) const HIDE_RESPONSE_HEADER: &str = "x-aether-execution-hide-turn-state";
+
+pub(crate) fn set_response_ticket_policy(headers: &mut BTreeMap<String, String>, enabled: bool) {
+    headers.retain(|name, _| !name.eq_ignore_ascii_case(HIDE_RESPONSE_HEADER));
+    if enabled {
+        headers.insert(HIDE_RESPONSE_HEADER.into(), "true".into());
+    }
+}
+
+pub(crate) fn hide_response_ticket(headers: &BTreeMap<String, String>) -> bool {
+    headers
+        .get(HIDE_RESPONSE_HEADER)
+        .is_some_and(|value| value == "true")
+}
+
+pub(crate) fn filter_response_headers(
+    request_headers: &BTreeMap<String, String>,
+    response_headers: &mut BTreeMap<String, String>,
+) {
+    if hide_response_ticket(request_headers) {
+        response_headers.retain(|name, _| !name.eq_ignore_ascii_case(HEADER));
+    }
+}
+
 const SOURCE_CONFIG: &str = "turn_state_collection";
 const LEGACY_SOURCE_CONFIG: &str = "congming_turn_state";
 const OVERRIDE_CONFIG: &str = "turn_state_source_provider_id";

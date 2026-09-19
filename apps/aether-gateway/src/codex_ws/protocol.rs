@@ -437,6 +437,61 @@ pub(crate) enum CodexRelayDirective {
     SuppressProviderPrivate,
 }
 
+/// Keep the upstream classification (including the private binding ticket),
+/// but remove tickets from every public frame before delivery, including
+/// terminal events and events expanded from Codex batch envelopes.
+pub(crate) fn hide_relay_turn_state(
+    classification: &mut ServerEventClassification,
+    original: &Bytes,
+) -> Result<(), ProtocolError> {
+    let frames = match &classification.codex_relay {
+        CodexRelayDirective::SuppressProviderPrivate => return Ok(()),
+        CodexRelayDirective::ForwardOriginal => vec![original.clone()],
+        CodexRelayDirective::ForwardEvents(frames) => frames.clone(),
+    };
+    let frames = frames
+        .into_iter()
+        .map(|frame| {
+            let mut value: Value = serde_json::from_slice(&frame)
+                .map_err(|_| ProtocolError::Upstream("invalid public response event"))?;
+            if strip_event_turn_state(&mut value) {
+                serde_json::to_vec(&value)
+                    .map(Bytes::from)
+                    .map_err(|_| ProtocolError::Upstream("invalid public response event"))
+            } else {
+                Ok(frame)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    classification.codex_relay = CodexRelayDirective::ForwardEvents(frames);
+    Ok(())
+}
+
+fn strip_event_turn_state(value: &mut Value) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let before = object.len();
+    object.retain(|key, _| {
+        !key.eq_ignore_ascii_case(crate::turn_state::HEADER)
+            && !key.eq_ignore_ascii_case("turn_state")
+    });
+    let mut changed = object.len() != before;
+    // Protocol envelopes only. Never recursively edit output, tool arguments,
+    // text deltas or arbitrary user data merely containing the same field name.
+    for key in ["headers", "metadata", "response"] {
+        if let Some(value) = object.get_mut(key) {
+            changed |= strip_event_turn_state(value);
+        }
+    }
+    if let Some(chunks) = object.get_mut("chunks").and_then(Value::as_array_mut) {
+        for chunk in chunks {
+            changed |= strip_event_turn_state(chunk);
+        }
+    }
+    changed
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct TerminalEventSummary {
     pub(crate) standardized_usage: Option<aether_contracts::StandardizedUsage>,

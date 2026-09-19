@@ -2463,6 +2463,10 @@ mod tests {
                 "chatgpt-cloudflare".into(),
             ),
             ("X-Aether-Execution-Future-Control".into(), "1".into()),
+            (
+                crate::turn_state::HIDE_RESPONSE_HEADER.into(),
+                "true".into(),
+            ),
             ("x-aether-other".into(), "kept".into()),
         ]);
 

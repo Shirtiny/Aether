@@ -9,6 +9,8 @@ pub(super) fn provider_query_test_attempt_payload(
     candidate: &ProviderQueryTestCandidate,
     execution: &ProviderQueryExecutionOutcome,
 ) -> Value {
+    let mut response_headers = execution.response_headers.clone();
+    crate::turn_state::filter_response_headers(&execution.request_headers, &mut response_headers);
     let endpoint_route = provider_query_endpoint_route_payload(candidate, execution);
     let endpoint_product = endpoint_route
         .get("product")
@@ -44,7 +46,7 @@ pub(super) fn provider_query_test_attempt_payload(
         "request_url": execution.request_url,
         "request_headers": redacted_provider_query_headers(&execution.request_headers),
         "request_body": redacted_provider_query_value(&execution.request_body),
-        "response_headers": redacted_provider_query_headers(&execution.response_headers),
+        "response_headers": redacted_provider_query_headers(&response_headers),
         "response_body": execution.response_body,
     })
 }
@@ -181,6 +183,7 @@ fn provider_query_endpoint_route_payload(
 fn redacted_provider_query_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     headers
         .iter()
+        .filter(|(key, _)| !key.eq_ignore_ascii_case(crate::turn_state::HIDE_RESPONSE_HEADER))
         .map(|(key, value)| {
             if provider_query_field_is_sensitive(key) {
                 (key.clone(), "[REDACTED]".to_string())

@@ -2477,10 +2477,8 @@ async fn execute_stream_from_frame_stream(
             "execution runtime stream must start with headers frame".to_string(),
         ));
     };
-    let mut report_context = attach_provider_response_headers_to_report_context(
-        report_context,
-        &headers,
-    );
+    let mut report_context =
+        attach_provider_response_headers_to_report_context(report_context, &headers);
     if status_code == 200 {
         seed_kiro_simulated_cache_enabled(state, &plan, &mut report_context).await;
         if kiro_simulated_cache_enabled_from_report_context(report_context.as_ref()) {
@@ -2852,9 +2850,14 @@ async fn execute_stream_from_frame_stream(
         )
         .await;
         if stream_error_finalize_kind.is_some() && !return_session_risk_control_block_response {
-            let response =
+            let mut response =
                 submit_local_core_error_or_sync_finalize(state, trace_id, decision, payload)
                     .await?;
+            // Error conversion can rebuild headers from the raw provider
+            // payload retained for auditing, rather than client_headers.
+            if crate::turn_state::hide_response_ticket(&plan.headers) {
+                response.headers_mut().remove(crate::turn_state::HEADER);
+            }
             return Ok(Some(attach_control_metadata_headers(
                 response,
                 Some(request_id),

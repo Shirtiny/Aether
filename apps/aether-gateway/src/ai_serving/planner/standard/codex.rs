@@ -655,11 +655,13 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
         original_body,
         Some(original_headers),
     );
-    if let Some(tickets) = crate::turn_state::load_tickets(
-        runtime,
-        crate::turn_state::selected_source_id(transport).as_deref(),
-    )
-    .await
+    let turn_state_source = crate::turn_state::selected_source_id(transport);
+    crate::turn_state::set_response_ticket_policy(
+        provider_request_headers,
+        turn_state_source.is_some(),
+    );
+    if let Some(tickets) =
+        crate::turn_state::load_tickets(runtime, turn_state_source.as_deref()).await
     {
         if let Some(ticket) = provider_request_body
             .as_deref()

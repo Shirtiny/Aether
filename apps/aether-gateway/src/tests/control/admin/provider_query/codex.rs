@@ -45,7 +45,7 @@ impl ModelTestGateway {
                         "request_id": plan.request_id,
                         "candidate_id": plan.candidate_id,
                         "status_code": 200,
-                        "headers": { "content-type": "application/json" },
+                        "headers": { "content-type": "application/json", "X-Codex-Turn-State": "upstream-ticket" },
                         "body": { "json_body": {
                             "id": "resp-model-test",
                             "model": plan.model_name,
@@ -425,9 +425,22 @@ async fn admin_codex_key_tests_apply_turn_state_override_for_both_direct_and_poo
         .await;
         for mode in ["direct", "pool"] {
             for key in ["key-one", "key-two"] {
-                let (plan, _) = gateway
+                let (plan, payload) = gateway
                     .request(mode, key, json!({}), json!({"input":"hello"}))
                     .await;
+                let hides_ticket = provider_type == "codex" && source.is_some();
+                let response_headers = payload["attempts"][0]["response_headers"]
+                    .as_object()
+                    .unwrap();
+                assert_eq!(
+                    response_headers
+                        .keys()
+                        .any(|k| k.eq_ignore_ascii_case(crate::turn_state::HEADER)),
+                    !hides_ticket
+                );
+                assert!(payload["attempts"][0]["request_headers"]
+                    .get(crate::turn_state::HIDE_RESPONSE_HEADER)
+                    .is_none());
                 assert_eq!(
                     plan.headers
                         .get(crate::turn_state::HEADER)

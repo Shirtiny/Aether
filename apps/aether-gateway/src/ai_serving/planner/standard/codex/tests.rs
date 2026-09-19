@@ -1963,6 +1963,7 @@ async fn turn_state_override_runs_after_turn_sanitation_and_header_rules() {
             )
             .await;
             assert_eq!(headers[crate::turn_state::HEADER], ticket);
+            assert!(crate::turn_state::hide_response_ticket(&headers));
         }
     }
     for (provider_type, config) in [
@@ -1995,6 +1996,7 @@ async fn turn_state_override_runs_after_turn_sanitation_and_header_rules() {
         )
         .await;
         assert_eq!(headers["x-codex-turn-state"], "original");
+        assert!(!crate::turn_state::hide_response_ticket(&headers));
     }
 }
 
@@ -2011,7 +2013,7 @@ async fn turn_state_source_switch_and_missing_source_never_use_another_channels_
     ] {
         let transport = sample_transport(
             "codex",
-            Some(json!({"pool_advanced": {"turn_state_source_provider_id": source_id}})),
+            Some(json!({"pool_advanced": {"turn_state_source_provider_id": source_id.clone()}})),
         );
         let mut body = json!({"model": "test-model"});
         let mut headers = BTreeMap::from([("x-codex-turn-state".into(), "client-ticket".into())]);
@@ -2026,6 +2028,10 @@ async fn turn_state_source_switch_and_missing_source_never_use_another_channels_
         )
         .await;
         assert_eq!(headers["x-codex-turn-state"], expected);
+        assert_eq!(
+            crate::turn_state::hide_response_ticket(&headers),
+            !source_id.is_null()
+        );
     }
 }
 
