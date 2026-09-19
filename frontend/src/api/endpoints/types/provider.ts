@@ -195,6 +195,25 @@ export interface TurnStateCollectionConfig {
   models: string[]
 }
 
+export interface TurnStateModelStatus {
+  model: string
+  result: 'disabled' | 'pending' | 'collecting' | 'success' | 'failed' | 'unknown'
+  last_attempt_at: number | null
+  last_success_at: number | null
+  next_attempt_at: number | null
+  error: string | null
+  ticket_valid: boolean
+  ticket_length: number | null
+  expires_at: number | null
+}
+
+export interface TurnStateCollectionStatus {
+  enabled: boolean
+  available: boolean
+  checked_at: number
+  models: TurnStateModelStatus[]
+}
+
 export interface ProviderConfig {
   turn_state_collection?: TurnStateCollectionConfig | null
   /** @deprecated Read only until the channel is saved with the generic setting. */
@@ -841,6 +860,7 @@ export interface FailoverRulesConfig {
 }
 
 export interface ProviderWithEndpointsSummary {
+  turn_state_collection_status?: TurnStateCollectionStatus
   turn_state_collection?: TurnStateCollectionConfig | null
   /** @deprecated Older server response. */
   congming_turn_state?: TurnStateCollectionConfig | null

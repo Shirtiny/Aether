@@ -22,6 +22,16 @@ impl Drop for ModelTestGateway {
 
 impl ModelTestGateway {
     async fn new(api_format: &str, provider_type: &str, headers: bool, identity: bool) -> Self {
+        Self::with_turn_state(api_format, provider_type, headers, identity, None).await
+    }
+
+    async fn with_turn_state(
+        api_format: &str,
+        provider_type: &str,
+        headers: bool,
+        identity: bool,
+        source: Option<&str>,
+    ) -> Self {
         let plans = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&plans);
         // Execute only against a loopback mock. Catalog and identity state are
@@ -51,6 +61,7 @@ impl ModelTestGateway {
         let mut provider = sample_provider("provider-codex-test", "Codex test", 10);
         provider.provider_type = provider_type.to_string();
         provider.config = Some(json!({ "pool_advanced": {
+            "turn_state_source_provider_id": source,
             "codex_client_headers": {
                 "enabled": headers,
                 "profiles": [{ "user_agent": CLIENT_UA, "originator": "codex-tui" }]
@@ -91,6 +102,13 @@ impl ModelTestGateway {
                 catalog,
                 DEVELOPMENT_ENCRYPTION_KEY.to_string(),
             ));
+        crate::turn_state::tests::seed_model_ticket(
+            state.runtime_state(),
+            "gpt-6-astra",
+            "test-collected-ticket",
+            0,
+        )
+        .await;
         let (url, gateway_handle) = start_server(build_router_with_state(state)).await;
         Self {
             url,
@@ -386,4 +404,38 @@ async fn admin_codex_model_test_identity_passes_ignore_other_provider_types() {
         .unwrap()
         .get("client_metadata")
         .is_none());
+}
+
+#[tokio::test]
+async fn admin_codex_key_tests_apply_turn_state_override_for_both_direct_and_pool_modes() {
+    for (source, provider_type, identity, expected) in [
+        (Some("source"), "codex", false, true),
+        (Some("source"), "codex", true, true),
+        (None, "codex", false, false),
+        (Some("missing-source"), "codex", false, false),
+        (Some("source"), "custom", false, false),
+    ] {
+        let gateway = ModelTestGateway::with_turn_state(
+            "openai:responses",
+            provider_type,
+            true,
+            identity,
+            source,
+        )
+        .await;
+        for mode in ["direct", "pool"] {
+            for key in ["key-one", "key-two"] {
+                let (plan, _) = gateway
+                    .request(mode, key, json!({}), json!({"input":"hello"}))
+                    .await;
+                assert_eq!(
+                    plan.headers
+                        .get(crate::turn_state::HEADER)
+                        .map(String::as_str),
+                    expected.then_some("test-collected-ticket"),
+                    "source={source:?}, provider={provider_type}, mode={mode}, key={key}"
+                );
+            }
+        }
+    }
 }

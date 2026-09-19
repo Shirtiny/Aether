@@ -12,6 +12,9 @@ use serde_json::{json, Map, Value};
 use crate::provider_transport::GatewayProviderTransportSnapshot;
 use crate::AppState;
 
+mod status;
+pub(crate) use status::collection_status;
+
 pub(crate) const HEADER: &str = "x-codex-turn-state";
 const SOURCE_CONFIG: &str = "turn_state_collection";
 const LEGACY_SOURCE_CONFIG: &str = "congming_turn_state";
@@ -137,6 +140,8 @@ struct Ticket {
 pub(crate) struct TicketCache {
     source_provider_id: String,
     tickets: BTreeMap<String, Ticket>,
+    #[serde(default)]
+    attempts: BTreeMap<String, status::CollectionAttempt>,
 }
 
 impl TicketCache {
@@ -217,8 +222,16 @@ fn ticket_from_response(result: &ExecutionResult) -> Result<String, String> {
         .filter(|(name, _)| name.eq_ignore_ascii_case(HEADER))
         .map(|(_, value)| value)
         .collect::<Vec<_>>();
+    if values.is_empty() {
+        return Err(format!(
+            "来源返回 HTTP {}，但未返回 x-codex-turn-state 响应头；请确认来源支持生成票据并开启该响应头透传。普通对话成功不代表采集成功。",
+            result.status_code
+        ));
+    }
     if values.len() != 1 || !valid_ticket(values[0]) {
-        return Err("采集响应缺少有效的 x-codex-turn-state（非空 ASCII，最多 4096 字节）".into());
+        return Err(
+            "来源返回的 x-codex-turn-state 无效（须为单个非空 ASCII 票据，最多 4096 字节）".into(),
+        );
     }
     Ok(values[0].clone())
 }
@@ -481,6 +494,9 @@ async fn scan_source(
                 .checked_sub(ticket.fetched_at)
                 .is_some_and(|age| age < TICKET_TTL.as_secs())
     });
+    cache
+        .attempts
+        .retain(|model, _| config.models.contains(model));
     save_cache(runtime, &cache).await?;
     for model in &config.models {
         // A shared, expiring marker prevents duplicate paid requests on
@@ -494,10 +510,23 @@ async fn scan_source(
             continue;
         }
         let started_at = crate::codex_client_release::unix_now_secs();
-        let value = fetch(state, provider_id, model).await?;
-        if !valid_ticket(&value) {
-            return Err("采集响应票据无效".into());
-        }
+        let attempt = cache.attempts.entry(model.clone()).or_default();
+        attempt.started_at = started_at;
+        attempt.finished_at = None;
+        attempt.error = None;
+        save_cache(runtime, &cache).await?;
+        // Leave time inside the outer source lease to persist a timeout result.
+        let result =
+            tokio::time::timeout(Duration::from_secs(50), fetch(state, provider_id, model))
+                .await
+                .unwrap_or_else(|_| Err("票据采集请求超时".into()))
+                .and_then(|value| {
+                    if valid_ticket(&value) {
+                        Ok(value)
+                    } else {
+                        Err("采集响应票据无效".into())
+                    }
+                });
         // Do not republish after an in-flight source/model switch change.
         let current = state
             .read_provider_catalog_providers_by_ids(std::slice::from_ref(provider_id))
@@ -510,13 +539,31 @@ async fn scan_source(
                 .map_err(|_| "清除停用票据失败")?;
             return Ok(());
         }
-        cache.tickets.insert(
-            model.clone(),
-            Ticket {
-                value,
-                fetched_at: started_at,
-            },
-        );
+        let attempt = cache
+            .attempts
+            .get_mut(model)
+            .expect("attempt recorded before fetching");
+        attempt.finished_at = Some(crate::codex_client_release::unix_now_secs());
+        match result {
+            Ok(value) => {
+                attempt.last_success_at = Some(started_at);
+                cache.tickets.insert(
+                    model.clone(),
+                    Ticket {
+                        value,
+                        fetched_at: started_at,
+                    },
+                );
+            }
+            Err(reason) => {
+                // fetch_ticket returns bounded, sanitized messages, never raw
+                // upstream bodies, header values or credentials.
+                attempt.error = Some(reason.clone());
+                save_cache(runtime, &cache).await?;
+                tracing::warn!(provider_id, model, %reason, "turn-state model collection failed");
+                return Err(reason);
+            }
+        }
         save_cache(runtime, &cache).await?;
         tracing::info!(provider_id, model, "turn-state collection refreshed");
         break;

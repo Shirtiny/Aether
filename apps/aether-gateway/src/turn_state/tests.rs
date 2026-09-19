@@ -21,11 +21,16 @@ pub(crate) fn ticket_cache(model: &str, value: &str, age: u64) -> TicketCache {
                 fetched_at: crate::codex_client_release::unix_now_secs() - age,
             },
         )]),
+        ..Default::default()
     }
 }
 
 pub(crate) async fn seed_ticket(runtime: &RuntimeState, value: &str, age: u64) {
-    save_cache(runtime, &ticket_cache("test-model", value, age))
+    seed_model_ticket(runtime, "test-model", value, age).await;
+}
+
+pub(crate) async fn seed_model_ticket(runtime: &RuntimeState, model: &str, value: &str, age: u64) {
+    save_cache(runtime, &ticket_cache(model, value, age))
         .await
         .unwrap();
 }
@@ -547,4 +552,161 @@ async fn overlapping_scans_do_not_duplicate_a_sources_paid_request() {
         load_ticket(&state.runtime_state, true).await.as_deref(),
         Some("ticket")
     );
+}
+
+#[tokio::test]
+async fn turn_state_status_exposes_progress_success_failure_and_schedule_without_secrets() {
+    let (state, _) = state(vec![source(true)]);
+    let provider = source(true);
+    let before = collection_status(&state.runtime_state, &provider).await;
+    assert_eq!(before["models"][0]["result"], "pending");
+    assert_eq!(before["models"][0]["ticket_valid"], false);
+    let secret = "never-expose-the-credential-in-the-admin-api";
+    scan_with_fetch(&state, async |_: &AppState, _: &str, _: &str| {
+        let in_flight = collection_status(&state.runtime_state, &provider).await;
+        assert_eq!(in_flight["models"][0]["result"], "collecting");
+        Ok(secret.into())
+    })
+    .await
+    .unwrap();
+    let success = collection_status(&state.runtime_state, &provider).await;
+    let row = &success["models"][0];
+    assert_eq!(row["result"], "success");
+    assert_eq!(row["ticket_valid"], true);
+    assert_eq!(row["ticket_length"], secret.len());
+    assert!(row["last_attempt_at"].as_u64().is_some());
+    assert!(row["last_success_at"].as_u64().is_some());
+    assert!(row["next_attempt_at"].as_u64().unwrap() > row["last_attempt_at"].as_u64().unwrap());
+    assert!(!success.to_string().contains(secret));
+    state
+        .runtime_state
+        .kv_delete(&attempt_key("source", "test-model"))
+        .await
+        .unwrap();
+    assert!(
+        scan_with_fetch(&state, async |_: &AppState, _: &str, _: &str| Err(
+            "missing header".into()
+        ))
+        .await
+        .is_err()
+    );
+    let failure = collection_status(&state.runtime_state, &provider).await;
+    assert_eq!(failure["models"][0]["result"], "failed");
+    assert_eq!(failure["models"][0]["error"], "missing header");
+    assert_eq!(
+        failure["models"][0]["ticket_valid"], true,
+        "a failed refresh does not revoke a valid cached ticket"
+    );
+    assert_eq!(
+        failure["models"][0]["last_success_at"],
+        row["last_success_at"]
+    );
+    assert!(!failure.to_string().contains(secret));
+    // Status reads must leave the paid-request scheduling marker untouched.
+    let ttl = state
+        .runtime_state
+        .kv_ttl_seconds(&attempt_key("source", "test-model"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!((2397..=2400).contains(&ttl));
+}
+
+#[tokio::test]
+async fn turn_state_status_handles_legacy_schedule_disabled_expired_and_corrupt_cache() {
+    let runtime = runtime();
+    runtime
+        .kv_set_if_absent(&attempt_key("source", "test-model"), "1", REFRESH_INTERVAL)
+        .await
+        .unwrap();
+    let legacy = collection_status(&runtime, &source(true)).await;
+    assert_eq!(legacy["models"][0]["result"], "unknown");
+    assert_eq!(legacy["models"][0]["last_attempt_at"], Value::Null);
+    seed_ticket(&runtime, "expired-secret", TICKET_TTL.as_secs()).await;
+    let expired = collection_status(&runtime, &source(true)).await;
+    assert_eq!(expired["models"][0]["ticket_valid"], false);
+    assert_eq!(expired["models"][0]["ticket_length"], Value::Null);
+    seed_ticket(&runtime, "valid-secret", 0).await;
+    let disabled = collection_status(&runtime, &source(false)).await;
+    assert_eq!(disabled["enabled"], false);
+    assert_eq!(disabled["models"][0]["result"], "disabled");
+    assert_eq!(disabled["models"][0]["ticket_valid"], false);
+    assert_eq!(disabled["models"][0]["next_attempt_at"], Value::Null);
+    runtime
+        .kv_set(&cache_key("source"), "bad-json", Some(TICKET_TTL))
+        .await
+        .unwrap();
+    assert_eq!(
+        collection_status(&runtime, &source(true)).await["available"],
+        false
+    );
+    let mut wrong = ticket_cache("test-model", "other-source-secret", 0);
+    wrong.source_provider_id = "other".into();
+    runtime
+        .kv_set(
+            &cache_key("source"),
+            serde_json::to_string(&wrong).unwrap(),
+            Some(TICKET_TTL),
+        )
+        .await
+        .unwrap();
+    let mismatch = collection_status(&runtime, &source(true)).await;
+    assert_eq!(mismatch["available"], false);
+    assert!(!mismatch.to_string().contains("other-source-secret"));
+}
+
+#[tokio::test]
+async fn turn_state_status_recovers_interrupted_attempt_without_stuck_collecting_label() {
+    let runtime = runtime();
+    let mut cache = ticket_cache("test-model", "valid-ticket", 300);
+    cache.attempts.insert(
+        "test-model".into(),
+        status::CollectionAttempt {
+            started_at: crate::codex_client_release::unix_now_secs() - 61,
+            ..Default::default()
+        },
+    );
+    save_cache(&runtime, &cache).await.unwrap();
+    let status = collection_status(&runtime, &source(true)).await;
+    assert_eq!(status["models"][0]["result"], "failed");
+    assert!(status["models"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("中断"));
+    assert_eq!(status["models"][0]["ticket_valid"], true);
+}
+
+#[tokio::test]
+async fn turn_state_http_collection_preserves_real_response_headers_and_diagnoses_missing_ticket() {
+    use axum::{routing::post, Router};
+    let upstream = Router::new().route("/responses", post(|axum::Json(body): axum::Json<Value>| async move {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        if body["model"] == "ticket-model" {
+            headers.insert(HEADER, "test-upstream-ticket".parse().unwrap());
+        }
+        (headers, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let raw = json!({
+        "request_id":"local-turn-state-probe", "provider_id":"source", "endpoint_id":"test", "key_id":"test",
+        "method":"POST", "url":format!("http://{addr}/responses"), "headers":{"content-type":"application/json"},
+        "content_type":"application/json", "body":{"json_body":{"model":"ticket-model","stream":true}},
+        "stream":true, "client_api_format":"openai:responses", "provider_api_format":"openai:responses"
+    });
+    let mut plan: ExecutionPlan = serde_json::from_value(raw).unwrap();
+    let runtime = crate::execution_runtime::DirectSyncExecutionRuntime::new();
+    let result = runtime.execute_sync(&plan).await.unwrap();
+    assert_eq!(
+        ticket_from_response(&result).unwrap(),
+        "test-upstream-ticket"
+    );
+    plan.body = RequestBody::from_json(json!({"model":"headerless-model","stream":true}));
+    let missing = runtime.execute_sync(&plan).await.unwrap();
+    let error = ticket_from_response(&missing).unwrap_err();
+    assert!(error.contains("HTTP 200"));
+    assert!(error.contains("透传"));
+    server.abort();
 }

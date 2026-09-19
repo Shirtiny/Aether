@@ -3,10 +3,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, ref, type App, type Component } from 'vue'
 import ProviderFormDialog from '../ProviderFormDialog.vue'
 import PoolAdvancedDialog from '@/features/pool/components/PoolAdvancedDialog.vue'
+import TurnStateCollectionStatusPanel from '../TurnStateCollectionStatusPanel.vue'
 
-const mocks = vi.hoisted(() => ({ updateProvider: vi.fn(), getProvidersSummary: vi.fn(), error: vi.fn() }))
+const mocks = vi.hoisted(() => ({ updateProvider: vi.fn(), getProvidersSummary: vi.fn(), getProvider: vi.fn(), error: vi.fn() }))
 vi.mock('@/api/endpoints', async (importOriginal) => ({
-  ...await importOriginal<Record<string, unknown>>(), updateProvider: mocks.updateProvider, getProvidersSummary: mocks.getProvidersSummary,
+  ...await importOriginal<Record<string, unknown>>(), updateProvider: mocks.updateProvider, getProvidersSummary: mocks.getProvidersSummary, getProvider: mocks.getProvider,
 }))
 vi.mock('@/composables/useToast', () => ({
   useToast: () => ({ success: vi.fn(), warning: vi.fn(), error: mocks.error }),
@@ -80,6 +81,7 @@ async function save() {
 beforeEach(() => {
   vi.resetAllMocks()
   mocks.updateProvider.mockResolvedValue({})
+  mocks.getProvider.mockResolvedValue({ turn_state_collection_status: { available: true, enabled: false, checked_at: 1789776600, models: [] } })
   mocks.getProvidersSummary.mockResolvedValue({ items: [
     { id: 'source-a', name: '渠道 A', is_active: true, turn_state_collection: { enabled: true, models: ['test-model'] } },
     { id: 'source-b', name: '渠道 B', is_active: true, turn_state_collection: { enabled: true, models: ['test-model'] } },
@@ -198,5 +200,67 @@ describe('Turn-State 票据开关', () => {
     await mount(PoolAdvancedDialog, { providerId: 'pool', providerType: 'custom', currentConfig: {} })
     expect(container.querySelector('[data-testid="turn-state-source-select"]')).toBeNull()
     expect(mocks.getProvidersSummary).not.toHaveBeenCalled()
+  })
+})
+
+
+describe('Turn-State 采集状态', () => {
+  const snapshot = {
+    available: true, enabled: true, checked_at: 1789776600,
+    models: [
+      { model: 'model-success', result: 'success', last_attempt_at: 1789776500, last_success_at: 1789776500,
+        next_attempt_at: 1789778900, error: null, ticket_valid: true, ticket_length: 384, expires_at: 1789780100 },
+      { model: 'model-failed', result: 'failed', last_attempt_at: 1789776500, last_success_at: null,
+        next_attempt_at: 1789778900, error: '来源返回 HTTP 200，但未返回 x-codex-turn-state 响应头', ticket_valid: false, ticket_length: null, expires_at: null },
+    ],
+  }
+  it('shows per-model success, failure, expiry and scheduling without collecting', async () => {
+    mocks.getProvider.mockResolvedValue({ turn_state_collection_status: snapshot })
+    await mount(TurnStateCollectionStatusPanel, { providerId: 'source-a' })
+    await nextTick()
+    expect(container.textContent).toContain('model-success')
+    expect(container.textContent).toContain('最近采集成功')
+    expect(container.textContent).toContain('有效票据：384 字符')
+    expect(container.textContent).toContain('model-failed')
+    expect(container.textContent).toContain('未返回 x-codex-turn-state')
+    expect(container.textContent).toContain('无可用票据，不执行覆盖')
+    expect(container.textContent).toContain('下次尝试')
+    expect(container.textContent).toContain('本地到期')
+    expect(mocks.getProvider).toHaveBeenCalledExactlyOnceWith('source-a')
+    expect(mocks.updateProvider).not.toHaveBeenCalled()
+  })
+
+  it('refreshes status and discards stale success if the refresh fails', async () => {
+    mocks.getProvider.mockResolvedValueOnce({ turn_state_collection_status: snapshot })
+    await mount(TurnStateCollectionStatusPanel, { providerId: 'source-a' })
+    await nextTick()
+    mocks.getProvider.mockRejectedValueOnce(new Error('offline'))
+    element<HTMLButtonElement>('button').click()
+    await nextTick()
+    await nextTick()
+    expect(container.textContent).toContain('采集状态读取失败')
+    expect(container.textContent).not.toContain('最近采集成功')
+    expect(mocks.getProvider).toHaveBeenCalledTimes(2)
+    expect(mocks.updateProvider).not.toHaveBeenCalled()
+  })
+
+  it('does not present an unavailable cache as empty or successful collection', async () => {
+    mocks.getProvider.mockResolvedValue({ turn_state_collection_status: { ...snapshot, available: false } })
+    await mount(TurnStateCollectionStatusPanel, { providerId: 'source-a' })
+    await nextTick()
+    expect(container.textContent).toContain('运行时缓存不可用')
+    expect(container.textContent).not.toContain('最近采集成功')
+  })
+
+  it('shows disabled collection and handles an older server without a status field', async () => {
+    await mount(TurnStateCollectionStatusPanel, { providerId: 'source-a' })
+    await nextTick()
+    expect(container.textContent).toContain('采集未启用')
+    expect(container.textContent).toContain('尚未配置采集模型')
+    mocks.getProvider.mockResolvedValueOnce({})
+    element<HTMLButtonElement>('button').click()
+    await nextTick()
+    await nextTick()
+    expect(container.textContent).toContain('当前服务未返回采集状态')
   })
 })

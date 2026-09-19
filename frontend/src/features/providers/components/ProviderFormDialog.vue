@@ -308,6 +308,10 @@
               :rows="3"
             />
           </div>
+          <TurnStateCollectionStatusPanel
+            v-if="modelValue && provider"
+            :provider-id="provider.id"
+          />
         </div>
 
         <div
@@ -444,6 +448,7 @@
 </template>
 
 <script setup lang="ts">
+import TurnStateCollectionStatusPanel from './TurnStateCollectionStatusPanel.vue'
 import { ref, computed, watch } from 'vue'
 import {
   Dialog,

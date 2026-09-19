@@ -57,7 +57,7 @@ pub(crate) async fn build_admin_provider_summary_payload(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    Some(build_admin_provider_summary_value(
+    let mut summary = build_admin_provider_summary_value(
         &provider,
         &endpoints,
         &keys,
@@ -65,7 +65,10 @@ pub(crate) async fn build_admin_provider_summary_payload(
         model_stats.as_ref(),
         active_global_model_ids,
         now_unix_secs,
-    ))
+    );
+    summary["turn_state_collection_status"] =
+        crate::turn_state::collection_status(state.runtime_state(), &provider).await;
+    Some(summary)
 }
 
 pub(crate) async fn build_admin_providers_summary_payload(
