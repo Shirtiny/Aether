@@ -98,6 +98,25 @@ pub(crate) async fn maybe_build_local_admin_provider_reads_response(
                 "Provider 不存在",
             )));
         };
+        if let Some(key_id) = query_param_value(request_context.query_string(), "turn_state_key_id")
+        {
+            let key = state
+                .read_provider_catalog_keys_by_ids(std::slice::from_ref(&key_id))
+                .await?
+                .into_iter()
+                .find(|key| key.provider_id == provider_id);
+            let provider = state
+                .read_provider_catalog_providers_by_ids(std::slice::from_ref(&provider_id))
+                .await?
+                .into_iter()
+                .next();
+            return Ok(Some(match (provider, key) {
+                (Some(provider), Some(key)) => Json(json!({
+                    "turn_state_collection_status": crate::turn_state::key_collection_status(state.as_ref().runtime_state(), &provider, &key).await,
+                })).into_response(),
+                _ => build_admin_provider_not_found_response("提供商或账号不存在"),
+            }));
+        }
         return Ok(Some(
             match state
                 .build_admin_provider_summary_payload(&provider_id)

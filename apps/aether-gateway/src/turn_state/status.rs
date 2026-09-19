@@ -20,12 +20,36 @@ pub(crate) async fn collection_status(
         .and_then(Value::as_object)
         .and_then(collection_config)
         .and_then(|v| parse_source_config(v).ok());
-    let enabled = config.as_ref().is_some_and(|c| c.enabled) && provider.is_active;
+    source_status(runtime, &provider.id, config, provider.is_active).await
+}
+
+pub(crate) async fn key_collection_status(
+    runtime: &RuntimeState,
+    provider: &StoredProviderCatalogProvider,
+    key: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey,
+) -> Value {
+    let config = key_collection_config(key).and_then(|v| parse_source_config(v).ok());
+    source_status(
+        runtime,
+        &account_source_id(&provider.id, &key.id),
+        config,
+        provider.is_active && key.provider_id == provider.id,
+    )
+    .await
+}
+
+async fn source_status(
+    runtime: &RuntimeState,
+    source_id: &str,
+    config: Option<SourceConfig>,
+    active: bool,
+) -> Value {
+    let enabled = config.as_ref().is_some_and(|c| c.enabled) && active;
     let now = crate::codex_client_release::unix_now_secs();
     let mut available = true;
-    let cache = match runtime.kv_get(&cache_key(&provider.id)).await {
+    let cache = match runtime.kv_get(&cache_key(source_id)).await {
         Ok(Some(raw)) => match serde_json::from_str::<TicketCache>(&raw) {
-            Ok(cache) if cache.source_provider_id == provider.id => Some(cache),
+            Ok(cache) if cache.source_provider_id == source_id => Some(cache),
             _ => {
                 available = false;
                 None
@@ -44,7 +68,7 @@ pub(crate) async fn collection_status(
         let valid = enabled && cache.as_ref().and_then(|c| c.for_model(&model)).is_some();
         let next_attempt_at = if enabled {
             match runtime
-                .kv_ttl_seconds(&attempt_key(&provider.id, &model))
+                .kv_ttl_seconds(&attempt_key(source_id, &model))
                 .await
             {
                 Ok(Some(ttl)) if ttl >= 0 => Some(now.saturating_add(ttl as u64)),

@@ -283,7 +283,7 @@ SELECT
   NULL::integer AS cache_ttl_minutes,
   NULL::integer AS max_probe_interval_minutes,
   NULL::jsonb AS proxy,
-  NULL::jsonb AS fingerprint,
+  jsonb_build_object('turn_state_collection', fingerprint::jsonb->'turn_state_collection') AS fingerprint,
   NULL::integer AS rpm_limit,
   NULL::integer AS concurrent_limit,
   NULL::integer AS learned_rpm_limit,
@@ -2754,6 +2754,14 @@ mod tests {
             assert!(sql.contains("total_tokens"));
             assert!(sql.contains("total_cost_usd"));
         }
+    }
+
+    #[test]
+    fn turn_state_summary_selects_only_collection_metadata_not_full_fingerprint() {
+        let sql = super::LIST_KEY_SUMMARIES_BY_PROVIDER_IDS_PREFIX;
+        assert!(sql.contains("jsonb_build_object('turn_state_collection', fingerprint::jsonb->'turn_state_collection') AS fingerprint"));
+        assert!(sql.contains("'summary' AS api_key"));
+        assert!(!sql.contains("\n  fingerprint,"));
     }
 
     #[test]

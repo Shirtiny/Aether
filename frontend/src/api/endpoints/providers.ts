@@ -8,6 +8,7 @@ import type {
   ProviderType,
   ProviderWithEndpointsSummary,
   ProxyConfig,
+  TurnStateCollectionStatus,
 } from './types'
 import {
   normalizeChatPiiRedactionProviderConfig as normalizeChatPiiRedactionProvider,
@@ -87,6 +88,14 @@ export async function getProvidersSummary(
 export async function getProvider(providerId: string): Promise<ProviderWithEndpointsSummary> {
   const response = await client.get<ProviderWithEndpointsSummary>(`/api/admin/providers/${providerId}/summary`)
   return normalizeProviderSummary(response.data)
+}
+
+/** Read-only account collection status; never starts a collection request. */
+export async function getAccountTurnStateStatus(providerId: string, keyId: string): Promise<TurnStateCollectionStatus> {
+  const response = await client.get<{ turn_state_collection_status: TurnStateCollectionStatus }>(
+    `/api/admin/providers/${providerId}/summary`, { params: { turn_state_key_id: keyId } },
+  )
+  return response.data.turn_state_collection_status
 }
 
 /**

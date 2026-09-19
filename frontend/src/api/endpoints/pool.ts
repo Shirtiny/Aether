@@ -2,6 +2,7 @@ import client from '../client'
 import { buildCacheKey, cachedRequest } from '@/utils/cache'
 import type {
   AllowedModels,
+  TurnStateCollectionConfig,
   OAuthOrganizationInfo,
   PoolCodexClientHeadersConfig,
   ProxyConfig,
@@ -111,6 +112,7 @@ export interface PoolPresetMeta {
 }
 
 export interface PoolKeyDetail {
+  turn_state_collection?: TurnStateCollectionConfig | null
   key_id: string
   key_name: string
   provider_type?: string | null

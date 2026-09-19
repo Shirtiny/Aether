@@ -1,10 +1,10 @@
 import client from '../client'
-import type { EndpointAPIKey, AllowedModels } from './types'
+import type { EndpointAPIKey, AllowedModels, TurnStateCollectionConfig } from './types'
 import type { QuotaStatusSnapshot } from './types'
 import { CODEX_WS_PROFILE_ID } from '@/constants/codexWs'
 
 // Re-export types for convenience
-export type { EndpointAPIKey, AllowedModels }
+export type { EndpointAPIKey, AllowedModels, TurnStateCollectionConfig }
 
 interface KeyRequestOptions {
   timeout?: number
@@ -164,6 +164,7 @@ export async function addProviderKey(
   data: {
     api_formats: string[]  // 支持的 API 格式列表（必填）
     api_key: string
+    turn_state_collection?: TurnStateCollectionConfig | null
     auth_type?: 'api_key' | 'service_account' | 'oauth' | 'bearer'  // 认证类型
     auth_type_by_format?: Record<string, 'api_key' | 'bearer'> | null
     allow_auth_channel_mismatch_formats?: string[] | null
@@ -195,6 +196,7 @@ export async function updateProviderKey(
   data: Partial<{
     api_formats: string[]  // 支持的 API 格式列表
     api_key: string
+    turn_state_collection?: TurnStateCollectionConfig | null
     auth_type: 'api_key' | 'service_account' | 'oauth' | 'bearer'  // 认证类型
     auth_type_by_format: Record<string, 'api_key' | 'bearer'> | null
     allow_auth_channel_mismatch_formats: string[] | null

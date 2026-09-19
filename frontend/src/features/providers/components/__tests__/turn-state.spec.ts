@@ -4,10 +4,11 @@ import { createApp, defineComponent, h, nextTick, ref, type App, type Component 
 import ProviderFormDialog from '../ProviderFormDialog.vue'
 import PoolAdvancedDialog from '@/features/pool/components/PoolAdvancedDialog.vue'
 import TurnStateCollectionStatusPanel from '../TurnStateCollectionStatusPanel.vue'
+import OAuthKeyEditDialog from '../OAuthKeyEditDialog.vue'
 
-const mocks = vi.hoisted(() => ({ updateProvider: vi.fn(), getProvidersSummary: vi.fn(), getProvider: vi.fn(), error: vi.fn() }))
+const mocks = vi.hoisted(() => ({ updateProvider: vi.fn(), getProvidersSummary: vi.fn(), getProvider: vi.fn(), updateProviderKey: vi.fn(), getAccountTurnStateStatus: vi.fn(), error: vi.fn() }))
 vi.mock('@/api/endpoints', async (importOriginal) => ({
-  ...await importOriginal<Record<string, unknown>>(), updateProvider: mocks.updateProvider, getProvidersSummary: mocks.getProvidersSummary, getProvider: mocks.getProvider,
+  ...await importOriginal<Record<string, unknown>>(), updateProvider: mocks.updateProvider, getProvidersSummary: mocks.getProvidersSummary, getProvider: mocks.getProvider, updateProviderKey: mocks.updateProviderKey, getAccountTurnStateStatus: mocks.getAccountTurnStateStatus,
 }))
 vi.mock('@/composables/useToast', () => ({
   useToast: () => ({ success: vi.fn(), warning: vi.fn(), error: mocks.error }),
@@ -81,6 +82,7 @@ async function save() {
 beforeEach(() => {
   vi.resetAllMocks()
   mocks.updateProvider.mockResolvedValue({})
+  mocks.getAccountTurnStateStatus.mockResolvedValue({ available: true, enabled: false, checked_at: 1789776600, models: [] })
   mocks.getProvider.mockResolvedValue({ turn_state_collection_status: { available: true, enabled: false, checked_at: 1789776600, models: [] } })
   mocks.getProvidersSummary.mockResolvedValue({ items: [
     { id: 'source-a', name: '渠道 A', is_active: true, turn_state_collection: { enabled: true, models: ['test-model'] } },
@@ -181,25 +183,81 @@ describe('Turn-State 票据开关', () => {
     mocks.getProvidersSummary.mockRejectedValue(new Error('load failed'))
     await mount(PoolAdvancedDialog, { providerId: 'pool', providerType: 'codex', currentConfig: { turn_state_source_provider_id: 'deleted-source' } })
     await nextTick()
-    expect(element<HTMLSelectElement>('[data-testid="turn-state-source-select"]').value).toBe('deleted-source')
+    expect(container.querySelector('option[value="deleted-source"]')).toBeNull()
+    expect(container.textContent).toContain('当前配置保留不变')
     expect(container.textContent).toContain('已选来源保持不变')
     await save()
     expect(mocks.updateProvider.mock.lastCall?.[1].pool_advanced.turn_state_source_provider_id).toBe('deleted-source')
   })
 
-  it('loads all source pages including disabled collection entries', async () => {
-    mocks.getProvidersSummary.mockResolvedValueOnce({ items: [{ id: 'first', name: 'First', is_active: true }], total: 2 })
+  it('loads all pages but lists only enabled provider/account collection sources', async () => {
+    mocks.getProvidersSummary.mockResolvedValueOnce({ items: [{ id: 'first', name: 'First', is_active: true, turn_state_account_sources: [{ key_id: 'collector', name: 'Account collector' }] }], total: 2 })
     mocks.getProvidersSummary.mockResolvedValueOnce({ items: [{ id: 'last', name: 'Last', is_active: false }], total: 2 })
     await mount(PoolAdvancedDialog, { providerId: 'pool', providerType: 'codex', currentConfig: {} })
     await nextTick()
     expect(mocks.getProvidersSummary).toHaveBeenCalledTimes(2)
-    expect(element<HTMLSelectElement>('[data-testid="turn-state-source-select"]').querySelector('option[value="last"]')).not.toBeNull()
+    expect(container.querySelector('option[value="last"]')).toBeNull()
+    expect(container.querySelector('option[value="first"]')).toBeNull()
+    expect(container.querySelector('option[value="account:first:collector"]')).not.toBeNull()
   })
 
   it('does not show the source selector for other provider types', async () => {
     await mount(PoolAdvancedDialog, { providerId: 'pool', providerType: 'custom', currentConfig: {} })
     expect(container.querySelector('[data-testid="turn-state-source-select"]')).toBeNull()
     expect(mocks.getProvidersSummary).not.toHaveBeenCalled()
+  })
+})
+
+
+describe('账号票据采集配置', () => {
+  it('selects an account and clears the account binding when switching to a provider or off', async () => {
+    mocks.getProvidersSummary.mockResolvedValue({ items: [{
+      id: 'source-a', name: 'Pool', is_active: true,
+      turn_state_collection: { enabled: true, models: ['test-model'] },
+      turn_state_account_sources: [{ key_id: 'key-a', name: 'Account A' }],
+    }], total: 1 })
+    await mount(PoolAdvancedDialog, { providerId: 'pool', providerType: 'codex', currentConfig: {
+      turn_state_source_provider_id: 'source-a', turn_state_source_key_id: 'key-a',
+    } })
+    await nextTick()
+    const select = element<HTMLSelectElement>('[data-testid="turn-state-source-select"]')
+    expect(select.value).toBe('account:source-a:key-a')
+    await save()
+    expect(mocks.updateProvider.mock.lastCall?.[1].pool_advanced).toEqual(expect.objectContaining({
+      turn_state_source_provider_id: 'source-a', turn_state_source_key_id: 'key-a',
+    }))
+    for (const value of ['source-a', '__disabled__']) {
+      select.value = value
+      select.dispatchEvent(new Event('change', { bubbles: true }))
+      await nextTick()
+      await save()
+      expect(mocks.updateProvider.mock.lastCall?.[1].pool_advanced.turn_state_source_key_id).toBeNull()
+    }
+  })
+
+  it('edits collection on an inactive OAuth account without enabling it', async () => {
+    await mount(OAuthKeyEditDialog, { open: true, editingKey: {
+      id: 'key-a', provider_id: 'source-a', name: 'Account A', is_active: false,
+      turn_state_collection: { enabled: false, models: [] },
+    } })
+    const checkbox = element<HTMLInputElement>('[data-testid="account-turn-state-switch"]')
+    expect(checkbox.checked).toBe(false)
+    checkbox.checked = true
+    checkbox.dispatchEvent(new Event('change', { bubbles: true }))
+    await nextTick()
+    await save()
+    expect(mocks.updateProviderKey).not.toHaveBeenCalled()
+    const models = element<HTMLTextAreaElement>('[data-testid="account-turn-state-models"]')
+    models.value = ' model-a\nmodel-a,model-b '
+    models.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    await save()
+    expect(mocks.updateProviderKey).toHaveBeenCalledWith('key-a', expect.objectContaining({
+      turn_state_collection: { enabled: true, models: ['model-a', 'model-b'] },
+    }))
+    expect(mocks.updateProviderKey.mock.lastCall?.[1]).not.toHaveProperty('is_active')
+    expect(mocks.updateProviderKey.mock.lastCall?.[1]).not.toHaveProperty('fingerprint')
+    expect(mocks.getAccountTurnStateStatus).toHaveBeenCalledWith('source-a', 'key-a')
   })
 })
 

@@ -571,7 +571,7 @@
             data-testid="turn-state-source-select"
           >
             <SelectTrigger id="turn-state-source">
-              <SelectValue placeholder="关闭（不覆盖）" />
+              <SelectValue :placeholder="turnStateSourceMissing ? '当前来源未启用采集或不可用' : '关闭（不覆盖）'" />
             </SelectTrigger>
             <SelectContent>
               <SelectItem :value="TURN_STATE_DISABLED">
@@ -582,26 +582,26 @@
                 :key="source.id"
                 :value="source.id"
               >
-                {{ source.name }}{{ source.is_active && source.turn_state_collection?.enabled ? '' : '（未启用采集或已停用）' }}
-              </SelectItem>
-              <SelectItem
-                v-if="turnStateSourceId !== TURN_STATE_DISABLED && !turnStateSources.some(source => source.id === turnStateSourceId)"
-                :value="turnStateSourceId"
-              >
-                {{ turnStateSourceId }}（未加载或已删除）
+                {{ source.name }}
               </SelectItem>
             </SelectContent>
           </Select>
+          <p
+            v-if="turnStateSourceMissing"
+            class="text-xs text-amber-600"
+          >
+            已保存来源未启用采集、已停用或尚未加载；当前配置保留不变，请重新选择有效来源或关闭。
+          </p>
           <p class="text-xs leading-5 text-muted-foreground">
-            选择关闭则不覆盖。选择渠道后，按「来源渠道 + 最终上游模型」匹配票据，覆盖本号池所有账号的 x-codex-turn-state。
+            选择关闭则不覆盖。选择提供商或账号后，按「来源提供商/账号 + 最终上游模型」匹配票据，覆盖本号池所有账号的 x-codex-turn-state。
             HTTP Responses 每次请求、WebSocket 每次 response.create 均强制携带，无需客户端回传。
-            请在来源渠道启用定时采集；每模型 40 分钟刷新，无匹配或有效票据时沿用原逻辑，不会自动使用其他来源。票据本地最长保留 1 小时。
+            下拉框仅列出已启用采集的来源；每模型 40 分钟刷新，无匹配或有效票据时沿用原逻辑，不会自动使用其他来源。票据本地最长保留 1 小时。
           </p>
           <p
             v-if="loadingTurnStateSources"
             class="text-xs text-muted-foreground"
           >
-            正在加载来源渠道…
+            正在加载采集来源…
           </p>
           <p
             v-if="turnStateSourcesError"
@@ -848,6 +848,7 @@
 </template>
 
 <script setup lang="ts">
+import { TURN_STATE_DISABLED, selectedTurnStateSource, turnStateSourceConfig, turnStateSourceOptions, type TurnStateSourceOption } from '@/features/providers/utils/turnState'
 import { computed, ref, watch } from 'vue'
 import { CircleHelp, RefreshCw } from 'lucide-vue-next'
 import { Dialog, Button, Input, Label, Switch, Select, SelectTrigger, SelectValue, SelectContent, SelectItem, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui'
@@ -958,9 +959,10 @@ interface CodexHeaderFormState {
   profiles: CodexHeaderProfileFormState[]
 }
 
-const TURN_STATE_DISABLED = '__disabled__'
+
 const turnStateSourceId = ref(TURN_STATE_DISABLED)
-const turnStateSources = ref<ProviderWithEndpointsSummary[]>([])
+const turnStateSources = ref<TurnStateSourceOption[]>([])
+const turnStateSourceMissing = computed(() => turnStateSourceId.value !== TURN_STATE_DISABLED && !turnStateSources.value.some(source => source.id === turnStateSourceId.value))
 const loadingTurnStateSources = ref(false)
 const turnStateSourcesError = ref('')
 let sourceLoadGeneration = 0
@@ -977,7 +979,7 @@ async function loadTurnStateSources() {
       sources.push(...result.items)
       if (sources.length >= result.total || result.items.length === 0) break
     }
-    turnStateSources.value = sources
+    turnStateSources.value = turnStateSourceOptions(sources)
   } catch (err) {
     if (generation === sourceLoadGeneration) turnStateSourcesError.value = parseApiError(err)
   } finally {
@@ -1193,7 +1195,7 @@ watch(() => props.modelValue, (open) => {
   }
 
   // 会话身份合成缺省关闭；数值缺失时展示推荐值，真正生效以保存后的配置为准。
-  turnStateSourceId.value = cfg?.turn_state_source_provider_id || TURN_STATE_DISABLED
+  turnStateSourceId.value = selectedTurnStateSource(cfg)
   const codexRuntimeIdentity = cfg?.codex_runtime_identity
   codexRuntimeIdentityForm.value = {
     enabled: codexRuntimeIdentity?.enabled === true,
@@ -1283,7 +1285,7 @@ async function handleSave() {
 
     delete poolAdvanced.congming_turn_state_override
     if (isCodex.value) {
-      poolAdvanced.turn_state_source_provider_id = turnStateSourceId.value === TURN_STATE_DISABLED ? null : turnStateSourceId.value
+      Object.assign(poolAdvanced, turnStateSourceConfig(turnStateSourceId.value))
       poolAdvanced.codex_client_headers = buildCodexClientHeadersConfig(
         codexHeaderForm.value.enabled,
         codexHeaderForm.value.profiles,
@@ -1297,6 +1299,7 @@ async function handleSave() {
       delete poolAdvanced.codex_client_headers
       delete poolAdvanced.codex_runtime_identity
       delete poolAdvanced.turn_state_source_provider_id
+      delete poolAdvanced.turn_state_source_key_id
     }
 
     const payload: Parameters<typeof updateProvider>[1] = {

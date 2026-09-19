@@ -46,6 +46,8 @@ pub(crate) struct AdminProviderKeyCreateRequest {
     pub(crate) model_exclude_patterns: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) fingerprint: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) turn_state_collection: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +100,8 @@ pub(crate) struct AdminProviderKeyUpdateRequest {
     pub(crate) proxy: Option<serde_json::Value>,
     #[serde(default)]
     pub(crate) fingerprint: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) turn_state_collection: Option<serde_json::Value>,
 }
 
 pub(crate) type AdminProviderKeyUpdatePatch = AdminTypedObjectPatch<AdminProviderKeyUpdateRequest>;

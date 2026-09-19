@@ -1609,6 +1609,12 @@ pub(super) fn build_admin_pool_key_payload(
     );
     payload.insert("proxy".to_string(), json!(key.proxy.clone()));
     payload.insert("fingerprint".to_string(), json!(key.fingerprint.clone()));
+    payload.insert(
+        "turn_state_collection".into(),
+        crate::turn_state::key_collection_config(key)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    );
     payload.insert("account_quota".to_string(), json!(account_quota));
     payload.insert("cooldown_reason".to_string(), json!(cooldown_reason));
     payload.insert(

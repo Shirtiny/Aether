@@ -190,7 +190,7 @@ pub(crate) struct CodexWsCandidate {
     /// official identity on the wire unchanged. Never part of the binding
     /// identity or handshake fingerprint.
     pub(crate) runtime_identity: Option<Arc<CodexWsRuntimeIdentitySnapshot>>,
-    pub(crate) turn_state_source_provider_id: Option<String>,
+    pub(crate) turn_state_source_id: Option<String>,
     pub(crate) report_kind: String,
     pub(crate) binding_identity: UpstreamBindingIdentity,
     pub(crate) adapter: crate::orchestration::ResponsesWebSocketAdapter,
@@ -1695,8 +1695,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
                 account_profile,
                 handshake_user_agent: handshake_user_agent.clone(),
                 runtime_identity,
-                turn_state_source_provider_id: crate::turn_state::source_provider_id(&transport)
-                    .map(str::to_owned),
+                turn_state_source_id: crate::turn_state::selected_source_id(&transport),
                 report_kind,
                 binding_identity,
                 adapter,
@@ -2198,7 +2197,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
             self.step_environment_context(candidate, &step.value, runtime_identity.as_ref());
         let turn_state_tickets = crate::turn_state::load_tickets(
             &self.state.runtime_state,
-            candidate.turn_state_source_provider_id.as_deref(),
+            candidate.turn_state_source_id.as_deref(),
         )
         .await;
         let body = std::mem::take(&mut step.value);

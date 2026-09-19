@@ -1982,7 +1982,7 @@ async fn turn_state_override_runs_after_turn_sanitation_and_header_rules() {
         ),
     ] {
         let transport = sample_transport(provider_type, Some(config));
-        assert!(crate::turn_state::source_provider_id(&transport).is_none());
+        assert!(crate::turn_state::selected_source_id(&transport).is_none());
         let mut headers = BTreeMap::from([("x-codex-turn-state".into(), "original".into())]);
         super::apply_codex_pool_runtime_identity(
             &runtime,
@@ -2026,5 +2026,41 @@ async fn turn_state_source_switch_and_missing_source_never_use_another_channels_
         )
         .await;
         assert_eq!(headers["x-codex-turn-state"], expected);
+    }
+}
+
+#[tokio::test]
+async fn turn_state_account_source_overrides_and_never_falls_back_to_provider_cache() {
+    let runtime = aether_runtime_state::RuntimeState::memory(
+        aether_runtime_state::MemoryRuntimeStateConfig::default(),
+    );
+    crate::turn_state::tests::seed_ticket(&runtime, "provider-ticket", 0).await;
+    crate::turn_state::tests::seed_account_ticket(
+        &runtime,
+        "source",
+        "account-a",
+        "account-ticket",
+    )
+    .await;
+    for (account, expected) in [("account-a", "account-ticket"), ("account-b", "original")] {
+        let transport = sample_transport(
+            "codex",
+            Some(json!({"pool_advanced": {
+                "turn_state_source_provider_id": "source", "turn_state_source_key_id": account
+            }})),
+        );
+        let mut body = json!({"model": "test-model", "input": []});
+        let mut headers = BTreeMap::from([("x-codex-turn-state".into(), "original".into())]);
+        super::apply_codex_pool_runtime_identity(
+            &runtime,
+            &transport,
+            &mut headers,
+            Some(&mut body),
+            &HeaderMap::new(),
+            None,
+            crate::codex_runtime_identity::CodexRuntimeIdentitySurface::HttpResponses,
+        )
+        .await;
+        assert_eq!(headers[crate::turn_state::HEADER], expected);
     }
 }

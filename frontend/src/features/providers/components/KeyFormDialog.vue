@@ -337,6 +337,12 @@
           </p>
         </div>
       </div>
+      <TurnStateAccountCollectionFields
+        v-model:enabled="form.turn_state_collection_enabled"
+        v-model:models="form.turn_state_collection_models"
+        :provider-id="providerId || ''"
+        :key-id="editingKey?.id"
+      />
     </form>
 
     <template #footer>
@@ -357,6 +363,8 @@
 </template>
 
 <script setup lang="ts">
+import TurnStateAccountCollectionFields from './TurnStateAccountCollectionFields.vue'
+import { turnStateCollectionConfig } from '../utils/turnState'
 import { ref, computed, watch } from 'vue'
 import {
   Dialog,
@@ -726,6 +734,8 @@ const form = ref({
   note: '',
   is_active: true,
   auto_fetch_models: false,
+  turn_state_collection_enabled: false,
+  turn_state_collection_models: '',
   model_include_patterns_text: '',  // 包含规则文本（逗号分隔）
   model_exclude_patterns_text: ''   // 排除规则文本（逗号分隔）
 })
@@ -821,6 +831,8 @@ function resetForm() {
     note: '',
     is_active: true,
     auto_fetch_models: defaultAutoFetchModels.value,
+    turn_state_collection_enabled: false,
+    turn_state_collection_models: '',
     model_include_patterns_text: '',
     model_exclude_patterns_text: ''
   }
@@ -832,6 +844,8 @@ function clearForNextAdd() {
   form.value.name = ''
   form.value.api_key = ''
   form.value.auth_config_text = ''
+  form.value.turn_state_collection_enabled = false
+  form.value.turn_state_collection_models = ''
   form.value.auth_type_by_format = sanitizeAuthTypeByFormat(form.value.auth_type_by_format)
   form.value.allow_auth_channel_mismatch_formats = sanitizeAllowAuthChannelMismatchFormats(
     form.value.allow_auth_channel_mismatch_formats
@@ -873,6 +887,8 @@ function loadKeyData() {
     note: props.editingKey.note || '',
     is_active: props.editingKey.is_active,
     auto_fetch_models: props.editingKey.auto_fetch_models ?? false,
+    turn_state_collection_enabled: props.editingKey.turn_state_collection?.enabled === true,
+    turn_state_collection_models: props.editingKey.turn_state_collection?.models.join('\n') ?? '',
     model_include_patterns_text: (props.editingKey.model_include_patterns || []).join(', '),
     model_exclude_patterns_text: (props.editingKey.model_exclude_patterns || []).join(', ')
   }
@@ -999,6 +1015,7 @@ async function handleSave() {
         is_active: form.value.is_active,
         allowed_models: shouldClearAllowedModels ? null : undefined,
         auto_fetch_models: form.value.auto_fetch_models,
+        turn_state_collection: turnStateCollectionConfig(form.value.turn_state_collection_enabled, form.value.turn_state_collection_models),
         model_include_patterns: parsePatternText(form.value.model_include_patterns_text),
         model_exclude_patterns: parsePatternText(form.value.model_exclude_patterns_text)
       }
@@ -1032,6 +1049,7 @@ async function handleSave() {
         max_probe_interval_minutes: form.value.max_probe_interval_minutes,
         note: form.value.note,
         auto_fetch_models: form.value.auto_fetch_models,
+        turn_state_collection: turnStateCollectionConfig(form.value.turn_state_collection_enabled, form.value.turn_state_collection_models),
         model_include_patterns: parsePatternText(form.value.model_include_patterns_text),
         model_exclude_patterns: parsePatternText(form.value.model_exclude_patterns_text)
       })

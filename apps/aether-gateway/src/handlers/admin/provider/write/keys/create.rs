@@ -188,6 +188,13 @@ pub(crate) async fn build_admin_create_provider_key_record(
         materialized_fingerprint,
     )
     .map_err(|err| err.to_string())?;
+    if payload.turn_state_collection.is_some() {
+        crate::turn_state::set_key_collection_config(
+            &mut key.fingerprint,
+            payload.turn_state_collection,
+        )?;
+    }
+    crate::turn_state::validate_key_collection_config(&key)?;
     key.note = payload
         .note
         .map(|value| value.trim().to_string())

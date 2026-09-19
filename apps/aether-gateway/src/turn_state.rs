@@ -12,8 +12,14 @@ use serde_json::{json, Map, Value};
 use crate::provider_transport::GatewayProviderTransportSnapshot;
 use crate::AppState;
 
+mod sources;
+use sources::*;
+pub(crate) use sources::{
+    account_sources, key_collection_config, set_key_collection_config,
+    validate_key_collection_config,
+};
 mod status;
-pub(crate) use status::collection_status;
+pub(crate) use status::{collection_status, key_collection_status};
 
 pub(crate) const HEADER: &str = "x-codex-turn-state";
 const SOURCE_CONFIG: &str = "turn_state_collection";
@@ -49,6 +55,18 @@ pub(crate) fn validate_config(config: &Map<String, Value>) -> Result<(), String>
     {
         if !value.is_null() && !value.as_str().is_some_and(valid_source_id) {
             return Err("turn_state_source_provider_id 必须是渠道 ID 字符串或 null（关闭）".into());
+        }
+    }
+    if let Some(pool) = config.get("pool_advanced") {
+        if let Some(value) = pool.get(KEY_OVERRIDE_CONFIG).filter(|v| !v.is_null()) {
+            if !value.as_str().is_some_and(valid_source_id)
+                || !pool
+                    .get(OVERRIDE_CONFIG)
+                    .and_then(Value::as_str)
+                    .is_some_and(valid_source_id)
+            {
+                return Err("账号票据来源须同时指定有效的提供商 ID 和账号 ID".into());
+            }
         }
     }
     Ok(())
@@ -101,7 +119,7 @@ fn valid_source_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
 }
 
-pub(crate) fn source_provider_id(transport: &GatewayProviderTransportSnapshot) -> Option<&str> {
+pub(crate) fn selected_source_id(transport: &GatewayProviderTransportSnapshot) -> Option<String> {
     if !transport
         .provider
         .provider_type
@@ -110,14 +128,18 @@ pub(crate) fn source_provider_id(transport: &GatewayProviderTransportSnapshot) -
     {
         return None;
     }
-    transport
-        .provider
-        .config
-        .as_ref()?
-        .get("pool_advanced")?
+    let pool = transport.provider.config.as_ref()?.get("pool_advanced")?;
+    let provider_id = pool
         .get(OVERRIDE_CONFIG)?
         .as_str()
-        .filter(|value| valid_source_id(value))
+        .filter(|id| valid_source_id(id))?;
+    match pool.get(KEY_OVERRIDE_CONFIG).filter(|v| !v.is_null()) {
+        Some(key) => Some(account_source_id(
+            provider_id,
+            key.as_str().filter(|id| valid_source_id(id))?,
+        )),
+        None => Some(provider_id.to_owned()),
+    }
 }
 
 fn cache_key(provider_id: &str) -> String {
@@ -163,7 +185,7 @@ pub(crate) async fn load_tickets(
     runtime: &RuntimeState,
     source_id: Option<&str>,
 ) -> Option<TicketCache> {
-    let source_id = source_id.filter(|value| valid_source_id(value))?;
+    let source_id = source_id.filter(|value| parse_source_id(value).is_some())?;
     let raw = runtime.kv_get(&cache_key(source_id)).await.ok()??;
     let cache: TicketCache = serde_json::from_str(&raw).ok()?;
     (cache.source_provider_id == source_id).then_some(cache)
@@ -258,7 +280,13 @@ async fn build_fetch_plan(
             "../../../resources/codex-client-header-profiles.json"
         ))
         .map_err(|_| "内置 Codex 客户端配置无效")?;
-        if let Some(profile) = profiles.first() {
+        let account_profile = transport
+            .key
+            .fingerprint
+            .as_ref()
+            .and_then(|v| v.get("codex_client_profile"))
+            .and_then(|v| v.get("client_headers"));
+        if let Some(profile) = account_profile.or_else(|| profiles.first()) {
             if let (Some(ua), Some(originator)) = (
                 profile["user_agent"].as_str(),
                 profile["originator"].as_str(),
@@ -309,7 +337,43 @@ async fn build_fetch_plan(
     Ok(plan)
 }
 
-async fn fetch_ticket(state: &AppState, provider_id: &str, model: &str) -> Result<String, String> {
+fn collection_key_eligible(
+    key: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey,
+    provider_id: &str,
+    selected_key_id: Option<&str>,
+    model: &str,
+    now: u64,
+) -> bool {
+    key.provider_id == provider_id
+        && selected_key_id.map_or(key.is_active, |id| key.id == id)
+        && key.oauth_invalid_at_unix_secs.is_none()
+        && key.expires_at_unix_secs.is_none_or(|expires| expires > now)
+        && key
+            .api_formats
+            .as_ref()
+            .filter(|v| !v.is_null())
+            .is_none_or(|value| {
+                value.as_array().is_some_and(|formats| {
+                    formats.iter().filter_map(Value::as_str).any(|format| {
+                        crate::ai_serving::normalize_api_format_alias(format) == "openai:responses"
+                    })
+                })
+            })
+        && key
+            .allowed_models
+            .as_ref()
+            .filter(|v| !v.is_null())
+            .is_none_or(|value| {
+                value.as_array().is_some_and(|models| {
+                    models
+                        .iter()
+                        .any(|allowed| allowed.as_str() == Some(model.trim()))
+                })
+            })
+}
+
+async fn fetch_ticket(state: &AppState, source_id: &str, model: &str) -> Result<String, String> {
+    let (provider_id, selected_key_id) = parse_source_id(source_id).ok_or("票据来源标识无效")?;
     let ids = [provider_id.to_string()];
     let endpoints = state
         .list_provider_catalog_endpoints_by_provider_ids(&ids)
@@ -324,41 +388,19 @@ async fn fetch_ticket(state: &AppState, provider_id: &str, model: &str) -> Resul
                 && is_collection_url(&endpoint.base_url)
         })
         .ok_or("来源渠道没有启用的 Responses 端点")?;
-    let keys = state
-        .list_provider_catalog_keys_by_provider_ids(&ids)
-        .await
-        .map_err(|_| "读取来源渠道密钥失败")?;
+    let keys = if let Some(key_id) = selected_key_id {
+        state
+            .read_provider_catalog_keys_by_ids(&[key_id.to_owned()])
+            .await
+    } else {
+        state.list_provider_catalog_keys_by_provider_ids(&ids).await
+    }
+    .map_err(|_| "读取来源渠道密钥失败")?;
     let now = crate::codex_client_release::unix_now_secs();
     let key = keys
         .iter()
-        .find(|key| {
-            key.is_active
-                && key.expires_at_unix_secs.is_none_or(|expires| expires > now)
-                && key
-                    .api_formats
-                    .as_ref()
-                    .filter(|v| !v.is_null())
-                    .is_none_or(|value| {
-                        value.as_array().is_some_and(|formats| {
-                            formats.iter().filter_map(Value::as_str).any(|format| {
-                                crate::ai_serving::normalize_api_format_alias(format)
-                                    == "openai:responses"
-                            })
-                        })
-                    })
-                && key
-                    .allowed_models
-                    .as_ref()
-                    .filter(|v| !v.is_null())
-                    .is_none_or(|value| {
-                        value.as_array().is_some_and(|models| {
-                            models
-                                .iter()
-                                .any(|allowed| allowed.as_str() == Some(model.trim()))
-                        })
-                    })
-        })
-        .ok_or("来源渠道没有可用于采集模型的启用密钥")?;
+        .find(|key| collection_key_eligible(key, provider_id, selected_key_id, model, now))
+        .ok_or("来源没有可用于采集模型的密钥（指定账号不会回退到其他账号）")?;
     let transport = state
         .read_provider_transport_snapshot(provider_id, &endpoint.id, &key.id)
         .await
@@ -385,38 +427,58 @@ async fn scan_with_fetch(
         .await
         .map_err(|_| "读取票据采集渠道失败")?;
     let runtime = &state.runtime_state;
-    // Deleted channels must not leave usable credentials behind. Do not
-    // delete unrelated runtime keys or the previous version's global cache.
+    let provider_ids = providers.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+    // Summary rows project only the collection setting, not encrypted secrets or
+    // large transport fingerprints. Actual credentials are loaded at fetch time.
+    let keys = state
+        .list_provider_catalog_key_summaries_by_provider_ids(&provider_ids)
+        .await
+        .map_err(|_| "读取账号采集配置失败")?;
+    let mut sources = providers.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+    sources.extend(
+        keys.iter()
+            .filter(|k| key_collection_config(k).is_some())
+            .map(|k| account_source_id(&k.provider_id, &k.id)),
+    );
     let cached_keys = runtime
         .scan_keys(&format!("{CACHE_PREFIX}*"), 100)
         .await
         .map_err(|_| "读取票据缓存目录失败")?;
     for key in &cached_keys {
         let key = runtime.strip_namespace(key);
-        if !providers
-            .iter()
-            .any(|provider| cache_key(&provider.id) == key)
-        {
+        if !sources.iter().any(|source_id| cache_key(source_id) == key) {
             runtime
                 .kv_delete(key)
                 .await
                 .map_err(|_| "清除已删除来源票据失败")?;
         }
     }
-    let sources: Vec<_> = providers
-        .into_iter()
-        .filter(|provider| {
-            source_config(provider).is_some()
-                || cached_keys
+    sources.retain(|source_id| {
+        let configured = parse_source_id(source_id).is_some_and(|(provider_id, key_id)| {
+            if let Some(key_id) = key_id {
+                keys.iter()
+                    .find(|k| k.id == key_id)
+                    .and_then(key_collection_config)
+                    .and_then(|v| parse_source_config(v).ok())
+                    .is_some_and(|c| c.enabled)
+            } else {
+                providers
                     .iter()
-                    .any(|key| runtime.strip_namespace(key) == cache_key(&provider.id))
-        })
-        .collect();
+                    .find(|p| p.id == provider_id)
+                    .and_then(source_config)
+                    .is_some()
+            }
+        });
+        configured
+            || cached_keys
+                .iter()
+                .any(|key| runtime.strip_namespace(key) == cache_key(source_id))
+    });
     let mut pending = Vec::new();
-    for provider in sources {
+    for source_id in sources {
         let fetch = &fetch;
         pending.push(async move {
-            let provider_id = &provider.id;
+            let provider_id = &source_id;
             let lock_key = format!("aether:turn_state:v1:scan:{provider_id}");
             let lease = runtime
                 .lock_try_acquire(&lock_key, "turn_state_collection", Duration::from_secs(75))
@@ -427,7 +489,7 @@ async fn scan_with_fetch(
             };
             let result = tokio::time::timeout(
                 Duration::from_secs(60),
-                scan_source(state, &provider, fetch),
+                scan_source(state, &source_id, fetch),
             )
             .await
             .unwrap_or_else(|_| Err("票据采集请求超时".into()));
@@ -454,19 +516,15 @@ async fn scan_with_fetch(
 
 async fn scan_source(
     state: &AppState,
-    provider: &StoredProviderCatalogProvider,
+    source_id: &str,
     fetch: &impl AsyncFn(&AppState, &str, &str) -> Result<String, String>,
 ) -> Result<(), String> {
     let runtime = &state.runtime_state;
-    let provider_id = &provider.id;
+    let provider_id = source_id;
     let key = cache_key(provider_id);
     // Re-read under the source lock: a waiting scan must not resurrect a
     // channel that was disabled while another scan was fetching it.
-    let current = state
-        .read_provider_catalog_providers_by_ids(std::slice::from_ref(provider_id))
-        .await
-        .map_err(|_| "读取票据采集开关失败")?;
-    let Some(config) = current.first().and_then(source_config) else {
+    let Some(config) = current_source_config(state, source_id).await? else {
         runtime
             .kv_delete(&key)
             .await
@@ -479,9 +537,9 @@ async fn scan_source(
         .map_err(|_| "读取票据缓存失败")?
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
-    if cache.source_provider_id != *provider_id {
+    if cache.source_provider_id != provider_id {
         cache = TicketCache {
-            source_provider_id: provider_id.clone(),
+            source_provider_id: provider_id.to_owned(),
             ..Default::default()
         };
     }
@@ -528,11 +586,7 @@ async fn scan_source(
                     }
                 });
         // Do not republish after an in-flight source/model switch change.
-        let current = state
-            .read_provider_catalog_providers_by_ids(std::slice::from_ref(provider_id))
-            .await
-            .map_err(|_| "读取票据采集开关失败")?;
-        if current.first().and_then(source_config).as_ref() != Some(&config) {
+        if current_source_config(state, source_id).await?.as_ref() != Some(&config) {
             runtime
                 .kv_delete(&key)
                 .await

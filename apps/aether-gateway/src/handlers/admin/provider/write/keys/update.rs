@@ -337,6 +337,13 @@ pub(crate) async fn build_admin_update_provider_key_record(
     if fields.contains("fingerprint") {
         updated.fingerprint = normalize_json_object(payload.fingerprint, "fingerprint")?;
     }
+    if fields.contains("turn_state_collection") {
+        crate::turn_state::set_key_collection_config(
+            &mut updated.fingerprint,
+            payload.turn_state_collection,
+        )?;
+    }
+    crate::turn_state::validate_key_collection_config(&updated)?;
     if auth_config_present && !auth_type_switch && !raw_secret_auth_type(&updated.auth_type) {
         updated.encrypted_auth_config = auth_config
             .as_ref()
@@ -386,4 +393,85 @@ fn raw_secret_auth_type(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "api_key" | "bearer"
     )
+}
+
+#[cfg(test)]
+mod turn_state_tests {
+    use super::*;
+    #[tokio::test]
+    async fn turn_state_account_collection_patch_preserves_profiles_and_inactive_scheduling() {
+        use crate::handlers::admin::provider::shared::payloads::AdminProviderKeyUpdatePatch;
+        use crate::handlers::admin::request::AdminAppState;
+        let provider = StoredProviderCatalogProvider::new(
+            "source".into(),
+            "Source".into(),
+            None,
+            "custom".into(),
+        )
+        .unwrap();
+        let mut key = StoredProviderCatalogKey::new(
+            "key".into(),
+            "source".into(),
+            "Account".into(),
+            "api_key".into(),
+            None,
+            false,
+        )
+        .unwrap();
+        key.fingerprint = Some(json!({}));
+        key.fingerprint.as_mut().unwrap()["transport_profile"] = json!({"profile_id": "keep"});
+        let repo = std::sync::Arc::new(
+            aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository::seed(
+                vec![provider.clone()],
+                vec![],
+                vec![key.clone()],
+            ),
+        );
+        let state = crate::AppState::new().unwrap().with_data_state_for_tests(
+            crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(repo),
+        );
+        let admin = AdminAppState::new(&state);
+        let patch = AdminProviderKeyUpdatePatch::from_object(
+            json!({"turn_state_collection": {"enabled": true, "models": ["test-model"]}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        let updated = admin
+            .build_admin_update_provider_key_record(&provider, &key, patch)
+            .await
+            .unwrap();
+        assert!(!updated.is_active);
+        assert_eq!(
+            updated.fingerprint.as_ref().unwrap()["transport_profile"],
+            key.fingerprint.as_ref().unwrap()["transport_profile"]
+        );
+        assert_eq!(
+            crate::turn_state::key_collection_config(&updated).unwrap()["enabled"],
+            true
+        );
+        let response = admin.build_admin_provider_key_response(
+            &updated,
+            "custom",
+            &["openai:responses".into()],
+            0,
+        );
+        assert_eq!(response["turn_state_collection"]["enabled"], true);
+        assert_eq!(
+            response["fingerprint"]["transport_profile"]["profile_id"],
+            "keep"
+        );
+        let bad = AdminProviderKeyUpdatePatch::from_object(
+            json!({"turn_state_collection": {"enabled": true, "models": []}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        assert!(admin
+            .build_admin_update_provider_key_record(&provider, &key, bad)
+            .await
+            .is_err());
+    }
 }

@@ -209,6 +209,7 @@ pub(crate) fn build_admin_provider_summary_value(
         "created_at": endpoint_timestamp_or_now(provider.created_at_unix_ms, now_unix_secs),
         "updated_at": endpoint_timestamp_or_now(provider.updated_at_unix_secs, now_unix_secs),
     });
+    summary["turn_state_account_sources"] = crate::turn_state::account_sources(provider, keys);
     summary["turn_state_collection"] = config
         .and_then(crate::turn_state::collection_config)
         .cloned()

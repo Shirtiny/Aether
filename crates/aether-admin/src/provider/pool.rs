@@ -825,6 +825,7 @@ pub fn build_admin_pool_key_payload(
         "model_exclude_patterns": admin_pool_string_list(key.model_exclude_patterns.as_ref()),
         "proxy": key.proxy.clone(),
         "fingerprint": key.fingerprint.clone(),
+        "turn_state_collection": key.fingerprint.as_ref().and_then(|v| v.get("turn_state_collection")),
         "cooldown_reason": context.cooldown_reason,
         "cooldown_ttl_seconds": context.cooldown_ttl_seconds,
         "cost_window_usage": context.cost_window_usage,

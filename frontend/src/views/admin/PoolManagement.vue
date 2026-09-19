@@ -2920,6 +2920,7 @@ function toEndpointApiKey(key: PoolKeyDetail): EndpointAPIKey {
     created_at: key.created_at || nowIso,
     updated_at: nowIso,
     auto_fetch_models: key.auto_fetch_models ?? false,
+    turn_state_collection: key.turn_state_collection ?? null,
     locked_models: key.locked_models || [],
     model_include_patterns: key.model_include_patterns || [],
     model_exclude_patterns: key.model_exclude_patterns || [],

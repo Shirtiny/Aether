@@ -418,6 +418,22 @@ mod tests {
     }
 
     #[test]
+    fn turn_state_account_switch_or_provider_fallback_hard_fences_bound_connections() {
+        let before = provider(json!({"pool_advanced": {
+            "turn_state_source_provider_id": "source", "turn_state_source_key_id": "account-a"
+        }}));
+        for key_id in [json!("account-b"), Value::Null] {
+            let after = provider(json!({"pool_advanced": {
+                "turn_state_source_provider_id": "source", "turn_state_source_key_id": key_id
+            }}));
+            assert_eq!(
+                classify_provider_update(&before, &after),
+                Some(CatalogMutationImpact::HardFence)
+            );
+        }
+    }
+
+    #[test]
     fn display_and_timestamp_change_does_not_touch_bound_sessions() {
         let before = provider(json!({"pool_advanced": {"lru_enabled": true}}));
         let mut after = before.clone();

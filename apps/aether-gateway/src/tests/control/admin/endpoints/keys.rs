@@ -2375,3 +2375,84 @@ async fn gateway_handles_admin_keys_grouped_by_format_locally_with_trusted_admin
     gateway_handle.abort();
     upstream_handle.abort();
 }
+
+#[tokio::test]
+async fn turn_state_account_status_and_sources_are_admin_only_and_provider_bound() {
+    let mut key = sample_key("collector", "source", "openai:responses", "test-secret");
+    key.is_active = false;
+    key.fingerprint =
+        Some(json!({"turn_state_collection": {"enabled": true, "models": ["test-model"]}}));
+    let mut off = key.clone();
+    off.id = "off".into();
+    off.fingerprint =
+        Some(json!({"turn_state_collection": {"enabled": false, "models": ["test-model"]}}));
+    let repo = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![
+            sample_provider("source", "custom", 10),
+            sample_provider("other", "custom", 10),
+        ],
+        vec![],
+        vec![key, off],
+    ));
+    let state = AppState::new().unwrap().with_data_state_for_tests(
+        GatewayDataState::with_provider_catalog_reader_for_tests(repo),
+    );
+    crate::turn_state::tests::seed_account_ticket(
+        state.runtime_state(),
+        "source",
+        "collector",
+        "private-ticket",
+    )
+    .await;
+    let (url, handle) = start_server(build_router_with_state(state)).await;
+    let client = reqwest::Client::new();
+    let admin_get = |path: &str| {
+        client
+            .get(format!("{url}{path}"))
+            .header(GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+    };
+    let summary: serde_json::Value = admin_get("/api/admin/providers/source/summary")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sources = summary["turn_state_account_sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["key_id"], "collector");
+    let status_response =
+        admin_get("/api/admin/providers/source/summary?turn_state_key_id=collector")
+            .send()
+            .await
+            .unwrap();
+    assert_eq!(status_response.status(), StatusCode::OK);
+    let status: serde_json::Value = status_response.json().await.unwrap();
+    assert_eq!(status["turn_state_collection_status"]["enabled"], true);
+    assert_eq!(
+        status["turn_state_collection_status"]["models"][0]["ticket_length"],
+        14
+    );
+    assert!(!status.to_string().contains("private-ticket"));
+    for path in [
+        "/api/admin/providers/other/summary?turn_state_key_id=collector",
+        "/api/admin/providers/source/summary?turn_state_key_id=missing",
+    ] {
+        assert_eq!(
+            admin_get(path).send().await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    let denied = client
+        .get(format!(
+            "{url}/api/admin/providers/source/summary?turn_state_key_id=collector"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(!denied.status().is_success());
+    handle.abort();
+}

@@ -2251,6 +2251,12 @@ pub(crate) fn build_admin_provider_key_response(
         key.rpm_limit
     };
     let mut payload = serde_json::Map::new();
+    payload.insert(
+        "turn_state_collection".into(),
+        crate::turn_state::key_collection_config(key)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    );
     payload.insert("id".to_string(), json!(key.id));
     payload.insert("provider_id".to_string(), json!(key.provider_id));
     payload.insert(

@@ -238,7 +238,7 @@ SELECT
   NULL AS cache_ttl_minutes,
   NULL AS max_probe_interval_minutes,
   NULL AS proxy,
-  NULL AS fingerprint,
+  json_object('turn_state_collection', json_extract(fingerprint, '$.turn_state_collection')) AS fingerprint,
   NULL AS rpm_limit,
   NULL AS concurrent_limit,
   NULL AS learned_rpm_limit,
@@ -2325,6 +2325,31 @@ mod tests {
             .await
             .expect("stats should load");
         assert_eq!(stats[0].active_keys, 1);
+    }
+
+    #[tokio::test]
+    async fn turn_state_key_summary_projects_config_without_credentials_or_transport_identity() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_sqlite_migrations(&pool).await.unwrap();
+        seed_rows(&pool).await;
+        let collection = json!({"enabled": true, "models": ["test-model"]});
+        sqlx::query("UPDATE provider_api_keys SET fingerprint = ?")
+            .bind(json!({"turn_state_collection": collection, "transport_profile": {"private": "not-in-summary"}}).to_string())
+            .execute(&pool).await.unwrap();
+        let repo = SqliteProviderCatalogReadRepository::new(pool);
+        let keys = repo
+            .list_key_summaries_by_provider_ids(&["provider-1".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            keys[0].fingerprint,
+            Some(json!({"turn_state_collection": collection}))
+        );
+        assert_eq!(keys[0].encrypted_api_key.as_deref(), Some("summary"));
     }
 
     #[tokio::test]

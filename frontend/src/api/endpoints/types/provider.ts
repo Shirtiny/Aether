@@ -265,6 +265,7 @@ export function isAllowedModelsList(value: AllowedModels): value is string[] {
 }
 
 export interface EndpointAPIKey {
+  turn_state_collection?: TurnStateCollectionConfig | null
   id: string
   provider_id: string
   api_formats: string[]  // 支持的 endpoint signature 列表（如 "openai:chat"）
@@ -558,6 +559,7 @@ export interface FormatCircuitBreakerData {
 }
 
 export interface EndpointAPIKeyUpdate {
+  turn_state_collection?: TurnStateCollectionConfig | null
   api_formats?: string[]  // 支持的 API 格式列表
   name?: string
   api_key?: string  // 仅在需要更新时提供
@@ -813,6 +815,7 @@ export interface PoolAdvancedConfig {
   codex_client_headers?: PoolCodexClientHeadersConfig | null
   codex_runtime_identity?: PoolCodexRuntimeIdentityConfig | null
   turn_state_source_provider_id?: string | null
+  turn_state_source_key_id?: string | null
   /** @deprecated Does not activate overrides; explicitly select a source. */
   congming_turn_state_override?: boolean
 }
@@ -860,6 +863,7 @@ export interface FailoverRulesConfig {
 }
 
 export interface ProviderWithEndpointsSummary {
+  turn_state_account_sources?: { key_id: string, name: string }[]
   turn_state_collection_status?: TurnStateCollectionStatus
   turn_state_collection?: TurnStateCollectionConfig | null
   /** @deprecated Older server response. */

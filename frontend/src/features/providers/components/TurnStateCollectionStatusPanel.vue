@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { onBeforeUnmount, ref, watch } from 'vue'
 import { Button } from '@/components/ui'
-import { getProvider, type TurnStateCollectionStatus } from '@/api/endpoints'
+import { getProvider, getAccountTurnStateStatus, type TurnStateCollectionStatus } from '@/api/endpoints'
 
-const props = defineProps<{ providerId: string }>()
+const props = defineProps<{ providerId: string, keyId?: string }>()
 const status = ref<TurnStateCollectionStatus | null>(null)
 const loading = ref(false)
 const error = ref('')
@@ -16,9 +16,11 @@ async function refresh() {
   // Do not keep displaying an old success after a failed status refresh.
   status.value = null
   try {
-    const provider = await getProvider(props.providerId)
+    const snapshot = props.keyId
+      ? await getAccountTurnStateStatus(props.providerId, props.keyId)
+      : (await getProvider(props.providerId)).turn_state_collection_status
     if (request !== generation) return
-    status.value = provider.turn_state_collection_status ?? null
+    status.value = snapshot ?? null
     if (!status.value) error.value = '当前服务未返回采集状态'
   } catch {
     if (request === generation) error.value = '采集状态读取失败，请重试'
@@ -26,7 +28,7 @@ async function refresh() {
     if (request === generation) loading.value = false
   }
 }
-watch(() => props.providerId, refresh, { immediate: true })
+watch(() => [props.providerId, props.keyId], refresh, { immediate: true })
 onBeforeUnmount(() => { generation += 1 })
 
 const labels = {

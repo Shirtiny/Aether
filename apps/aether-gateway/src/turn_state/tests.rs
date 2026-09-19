@@ -710,3 +710,296 @@ async fn turn_state_http_collection_preserves_real_response_headers_and_diagnose
     assert!(error.contains("透传"));
     server.abort();
 }
+
+fn account(
+    id: &str,
+    enabled: bool,
+) -> aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey {
+    let mut key =
+        aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey::new(
+            id.into(),
+            "source".into(),
+            format!("Account {id}"),
+            "api_key".into(),
+            None,
+            false,
+        )
+        .unwrap();
+    set_key_collection_config(
+        &mut key.fingerprint,
+        Some(json!({"enabled": enabled, "models": ["test-model"]})),
+    )
+    .unwrap();
+    key
+}
+
+fn state_with_accounts(
+    provider: StoredProviderCatalogProvider,
+    keys: Vec<aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey>,
+) -> (AppState, Arc<InMemoryProviderCatalogReadRepository>) {
+    let repo = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![],
+        keys,
+    ));
+    let state = AppState::new().unwrap().with_data_state_for_tests(
+        GatewayDataState::with_provider_catalog_reader_for_tests(repo.clone()),
+    );
+    (state, repo)
+}
+
+#[test]
+fn account_config_preserves_other_metadata_and_rejects_invalid_settings() {
+    let mut fingerprint = Some(json!({"transport_profile": {"profile_id": "keep"}, "unknown": 42}));
+    let before = fingerprint.clone();
+    assert!(set_key_collection_config(
+        &mut fingerprint,
+        Some(json!({"enabled": true, "models": []}))
+    )
+    .is_err());
+    assert_eq!(fingerprint, before);
+    set_key_collection_config(
+        &mut fingerprint,
+        Some(json!({"enabled": true, "models": ["test-model"]})),
+    )
+    .unwrap();
+    assert_eq!(fingerprint.as_ref().unwrap()["unknown"], 42);
+    set_key_collection_config(&mut fingerprint, None).unwrap();
+    assert_eq!(fingerprint, before);
+    assert!(validate_config(
+        json!({"pool_advanced": {KEY_OVERRIDE_CONFIG: "key"}})
+            .as_object()
+            .unwrap()
+    )
+    .is_err());
+    assert!(validate_config(
+        json!({"pool_advanced": {OVERRIDE_CONFIG: "source", KEY_OVERRIDE_CONFIG: "key"}})
+            .as_object()
+            .unwrap()
+    )
+    .is_ok());
+    for id in ["account:source:key", "source"] {
+        assert!(parse_source_id(id).is_some());
+    }
+    for id in [
+        "account:source:",
+        "account:source:key:other",
+        "account::key",
+        "account: source:key",
+    ] {
+        assert!(parse_source_id(id).is_none());
+    }
+}
+
+#[test]
+fn account_selection_is_pinned_and_independent_of_pool_scheduling() {
+    let now = crate::codex_client_release::unix_now_secs();
+    let mut key = account("key", true);
+    assert!(!key.is_active);
+    assert!(collection_key_eligible(
+        &key,
+        "source",
+        Some("key"),
+        "test-model",
+        now
+    ));
+    assert!(!collection_key_eligible(
+        &key,
+        "source",
+        None,
+        "test-model",
+        now
+    ));
+    key.is_active = true;
+    assert!(!collection_key_eligible(
+        &key,
+        "source",
+        Some("different-key"),
+        "test-model",
+        now
+    ));
+    assert!(!collection_key_eligible(
+        &key,
+        "another-provider",
+        Some("key"),
+        "test-model",
+        now
+    ));
+    key.allowed_models = Some(json!(["other-model"]));
+    assert!(!collection_key_eligible(
+        &key,
+        "source",
+        Some("key"),
+        "test-model",
+        now
+    ));
+    key.allowed_models = None;
+    key.api_formats = Some(json!(["openai:chat"]));
+    assert!(!collection_key_eligible(
+        &key,
+        "source",
+        Some("key"),
+        "test-model",
+        now
+    ));
+    key.api_formats = None;
+    key.oauth_invalid_at_unix_secs = Some(now);
+    assert!(!collection_key_eligible(
+        &key,
+        "source",
+        Some("key"),
+        "test-model",
+        now
+    ));
+    key.oauth_invalid_at_unix_secs = None;
+    key.expires_at_unix_secs = Some(now);
+    assert!(!collection_key_eligible(
+        &key,
+        "source",
+        Some("key"),
+        "test-model",
+        now
+    ));
+}
+
+#[tokio::test]
+async fn account_and_provider_caches_schedules_status_are_isolated() {
+    let keys = vec![
+        account("a", true),
+        account("b", true),
+        account("off", false),
+    ];
+    let provider = source(true);
+    let (state, _) = state_with_accounts(provider.clone(), keys.clone());
+    let calls = AtomicUsize::new(0);
+    let fetch = async |_: &AppState, source_id: &str, _: &str| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Ok(format!("secret-for-{source_id}"))
+    };
+    scan_with_fetch(&state, &fetch).await.unwrap();
+    scan_with_fetch(&state, &fetch).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    for id in ["source", "account:source:a", "account:source:b"] {
+        let cache = load_tickets(&state.runtime_state, Some(id)).await.unwrap();
+        assert_eq!(
+            cache.for_model("test-model"),
+            Some(format!("secret-for-{id}").as_str())
+        );
+        assert!(cache.for_model("other-model").is_none());
+    }
+    assert!(
+        load_tickets(&state.runtime_state, Some("account:source:off"))
+            .await
+            .is_none()
+    );
+    let status = key_collection_status(&state.runtime_state, &provider, &keys[0]).await;
+    assert_eq!(status["enabled"], true);
+    assert_eq!(status["models"][0]["result"], "success");
+    assert_eq!(status["models"][0]["ticket_valid"], true);
+    assert!(!status.to_string().contains("secret-for-"));
+    assert_eq!(
+        account_sources(&provider, &keys).as_array().unwrap().len(),
+        2
+    );
+    let mut stopped = provider.clone();
+    stopped.is_active = false;
+    assert_eq!(account_sources(&stopped, &keys), json!([]));
+}
+
+#[tokio::test]
+async fn account_disable_delete_and_parent_stop_clear_tickets_without_fallback() {
+    for change in ["disable", "remove_config", "delete", "stop_parent"] {
+        let key = account("a", true);
+        let (state, repo) = state_with_accounts(source(false), vec![key.clone()]);
+        scan_with_fetch(&state, async |_: &AppState, _: &str, _: &str| {
+            Ok("secret".into())
+        })
+        .await
+        .unwrap();
+        let id = "account:source:a";
+        assert!(load_tickets(&state.runtime_state, Some(id)).await.is_some());
+        match change {
+            "disable" => {
+                repo.update_key(&account("a", false)).await.unwrap();
+            }
+            "remove_config" => {
+                let mut key = key.clone();
+                key.fingerprint = None;
+                repo.update_key(&key).await.unwrap();
+            }
+            "delete" => {
+                repo.delete_key("a").await.unwrap();
+            }
+            _ => {
+                let mut provider = source(false);
+                provider.is_active = false;
+                repo.update_provider(&provider).await.unwrap();
+            }
+        }
+        scan_with_fetch(
+            &state,
+            async |_: &AppState, _: &str, _: &str| -> Result<String, String> {
+                panic!("must not fetch another account")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            load_tickets(&state.runtime_state, Some(id)).await.is_none(),
+            "{change}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn inflight_account_disable_does_not_republish_and_failed_refresh_preserves_good_ticket() {
+    let (state, repo) = state_with_accounts(source(false), vec![account("a", true)]);
+    let id = "account:source:a";
+    scan_with_fetch(&state, async |_: &AppState, _: &str, _: &str| {
+        Ok("good-secret".into())
+    })
+    .await
+    .unwrap();
+    state
+        .runtime_state
+        .kv_delete(&attempt_key(id, "test-model"))
+        .await
+        .unwrap();
+    assert!(
+        scan_with_fetch(&state, async |_: &AppState, _: &str, _: &str| Err(
+            "failed".into()
+        ))
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        load_tickets(&state.runtime_state, Some(id))
+            .await
+            .unwrap()
+            .for_model("test-model"),
+        Some("good-secret")
+    );
+    state
+        .runtime_state
+        .kv_delete(&attempt_key(id, "test-model"))
+        .await
+        .unwrap();
+    scan_with_fetch(&state, async |_: &AppState, _: &str, _: &str| {
+        repo.update_key(&account("a", false)).await.unwrap();
+        Ok("late-secret".into())
+    })
+    .await
+    .unwrap();
+    assert!(load_tickets(&state.runtime_state, Some(id)).await.is_none());
+}
+
+pub(crate) async fn seed_account_ticket(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_id: &str,
+    value: &str,
+) {
+    let mut cache = ticket_cache("test-model", value, 0);
+    cache.source_provider_id = account_source_id(provider_id, key_id);
+    save_cache(runtime, &cache).await.unwrap();
+}
