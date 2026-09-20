@@ -111,7 +111,9 @@ where
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
 
     for (name, value) in upstream_headers {
-        if should_skip_response_header(name.as_str()) {
+        if should_skip_response_header(name.as_str())
+            || name.eq_ignore_ascii_case(crate::turn_state::HEADER)
+        {
             continue;
         }
         let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -121,6 +123,9 @@ where
         response.headers_mut().insert(header_name, header_value);
     }
     mutate_headers(response.headers_mut())?;
+    // This is a client boundary, not an upstream transport filter: keep raw
+    // tickets available to collection/audits, but never expose them publicly.
+    response.headers_mut().remove(crate::turn_state::HEADER);
     apply_streaming_response_headers(response.headers_mut());
     insert_header_if_missing(response.headers_mut(), TRACE_ID_HEADER, trace_id)?;
     insert_header_if_missing(response.headers_mut(), GATEWAY_HEADER, "rust-phase3b")?;
@@ -356,9 +361,47 @@ pub(crate) fn build_local_overloaded_response(
 
 #[cfg(test)]
 mod tests {
-    use super::build_client_response_from_parts;
+    use super::{build_client_response_from_parts, build_client_response_from_parts_with_mutator};
     use axum::body::Body;
+    use http::HeaderValue;
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn client_response_never_exposes_turn_state_even_after_header_mutation() {
+        for content_type in ["application/json", "text/event-stream"] {
+            for status in [200, 400, 500] {
+                let upstream = BTreeMap::from([
+                    ("X-Codex-Turn-State".into(), "real-upstream-ticket".into()),
+                    ("content-type".into(), content_type.into()),
+                    ("x-request-id".into(), "keep-request-id".into()),
+                ]);
+                let response = build_client_response_from_parts_with_mutator(
+                    status,
+                    &upstream,
+                    Body::from("unchanged business data"),
+                    "test",
+                    None,
+                    |headers| {
+                        headers.insert(
+                            crate::turn_state::HEADER,
+                            HeaderValue::from_static("reinserted-ticket"),
+                        );
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert!(!response.headers().contains_key(crate::turn_state::HEADER));
+                assert_eq!(response.headers()["x-request-id"], "keep-request-id");
+                assert_eq!(upstream["X-Codex-Turn-State"], "real-upstream-ticket");
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), 1024)
+                        .await
+                        .unwrap(),
+                    "unchanged business data"
+                );
+            }
+        }
+    }
 
     #[test]
     fn sse_responses_disable_proxy_buffering() {

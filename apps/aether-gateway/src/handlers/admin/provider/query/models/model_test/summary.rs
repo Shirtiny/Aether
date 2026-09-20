@@ -10,7 +10,7 @@ pub(super) fn provider_query_test_attempt_payload(
     execution: &ProviderQueryExecutionOutcome,
 ) -> Value {
     let mut response_headers = execution.response_headers.clone();
-    crate::turn_state::filter_response_headers(&execution.request_headers, &mut response_headers);
+    crate::turn_state::filter_response_headers(&mut response_headers);
     let endpoint_route = provider_query_endpoint_route_payload(candidate, execution);
     let endpoint_product = endpoint_route
         .get("product")

@@ -163,32 +163,30 @@ async fn parse_response_create_with_cpu_budget(
     .map_err(|_| ProtocolError::Policy("large response.create processing failed"))?
 }
 
-fn classify_server_event_with_ticket_policy(
+fn classify_public_server_event(
     text: &Bytes,
     adapter: crate::orchestration::ResponsesWebSocketAdapter,
-    hide_turn_state: bool,
 ) -> Result<super::protocol::ServerEventClassification, ProtocolError> {
-    match adapter {
-        crate::orchestration::ResponsesWebSocketAdapter::Codex => {
-            let mut classification = classify_server_event(text)?;
-            if hide_turn_state {
-                super::protocol::hide_relay_turn_state(&mut classification, text)?;
-            }
-            Ok(classification)
-        }
+    let mut classification = match adapter {
+        crate::orchestration::ResponsesWebSocketAdapter::Codex => classify_server_event(text)?,
         crate::orchestration::ResponsesWebSocketAdapter::Standard => {
-            classify_standard_server_event(text)
+            let mut classification = classify_standard_server_event(text)?;
+            // Standard providers retain their original envelope semantics;
+            // only protocol ticket fields are removed, never Codex-unwrapped.
+            classification.codex_relay = CodexRelayDirective::ForwardOriginal;
+            classification
         }
-    }
+    };
+    super::protocol::hide_relay_turn_state(&mut classification, text)?;
+    Ok(classification)
 }
 
 async fn classify_server_event_with_cpu_budget(
     text: &Bytes,
     adapter: crate::orchestration::ResponsesWebSocketAdapter,
-    hide_turn_state: bool,
 ) -> Result<super::protocol::ServerEventClassification, ProtocolError> {
     if !super::cpu_budget::requires_large_frame_cpu_budget(text.len()) {
-        return classify_server_event_with_ticket_policy(text, adapter, hide_turn_state);
+        return classify_public_server_event(text, adapter);
     }
     let permit = super::cpu_budget::acquire_large_frame_cpu_budget(text.len())
         .await
@@ -196,7 +194,7 @@ async fn classify_server_event_with_cpu_budget(
     let text = text.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        classify_server_event_with_ticket_policy(&text, adapter, hide_turn_state)
+        classify_public_server_event(&text, adapter)
     })
     .await
     .map_err(|_| ProtocolError::Upstream("large official frame processing failed"))?
@@ -1170,7 +1168,6 @@ pub(crate) async fn run_codex_ws_session(
             &step,
             runtime,
             candidate.adapter,
-            candidate.turn_state_source_id.is_some(),
             &candidate.key_id,
             candidate.selected_scheduler_epoch,
             &execution_lease_status,
@@ -1789,7 +1786,7 @@ async fn receive_idle_step(
                                 None,
                             )));
                         }
-                        let classification = classify_server_event_with_cpu_budget(&text, adapter, false)
+                        let classification = classify_server_event_with_cpu_budget(&text, adapter)
                             .await
                             .map_err(UpstreamProtocolFailure::protocol)
                             .map_err(IdleStepError::Upstream)?;
@@ -2109,7 +2106,6 @@ async fn relay_one_response<F>(
     step: &ResponseCreateStep,
     runtime: &dyn CodexWsRuntimePort,
     adapter: crate::orchestration::ResponsesWebSocketAdapter,
-    hide_turn_state: bool,
     key_id: &str,
     selected_scheduler_epoch: u64,
     execution_lease_status: &StepExecutionLeaseStatus,
@@ -2245,7 +2241,7 @@ where
                             )
                             .await;
                         }
-                        let classification = match classify_server_event_with_cpu_budget(&text, adapter, hide_turn_state).await {
+                        let classification = match classify_server_event_with_cpu_budget(&text, adapter).await {
                             Ok(classification) => classification,
                             Err(error) => {
                                 let reason = error.message();
@@ -2281,16 +2277,10 @@ where
                             terminal_event,
                             codex_relay,
                         } = classification;
-                        let relay_frames = match (adapter, codex_relay) {
-                            (
-                                crate::orchestration::ResponsesWebSocketAdapter::Codex,
-                                CodexRelayDirective::ForwardEvents(events),
-                            ) => events,
-                            (
-                                crate::orchestration::ResponsesWebSocketAdapter::Codex,
-                                CodexRelayDirective::SuppressProviderPrivate,
-                            ) => Vec::new(),
-                            _ => vec![text],
+                        let relay_frames = match codex_relay {
+                            CodexRelayDirective::ForwardEvents(events) => events,
+                            CodexRelayDirective::SuppressProviderPrivate => Vec::new(),
+                            CodexRelayDirective::ForwardOriginal => vec![text],
                         };
                         if adapter == crate::orchestration::ResponsesWebSocketAdapter::Codex
                             && !provider_headers.is_empty()
@@ -3112,7 +3102,8 @@ mod tests {
         sticky_binding_established: AtomicBool,
         connect_delays: Mutex<VecDeque<Duration>>,
         handshake_turn_state: Mutex<Option<String>>,
-        hide_turn_state: AtomicBool,
+        turn_state_override: AtomicBool,
+        standard_adapter: AtomicBool,
         prepare_delay: Mutex<Option<Duration>>,
         prepared_body: Mutex<Option<String>>,
         timeouts: Mutex<Option<aether_contracts::ExecutionTimeouts>>,
@@ -3169,7 +3160,8 @@ mod tests {
                 sticky_binding_established: AtomicBool::new(false),
                 connect_delays: Mutex::new(VecDeque::new()),
                 handshake_turn_state: Mutex::new(None),
-                hide_turn_state: AtomicBool::new(false),
+                turn_state_override: AtomicBool::new(false),
+                standard_adapter: AtomicBool::new(false),
                 prepare_delay: Mutex::new(None),
                 prepared_body: Mutex::new(None),
                 timeouts: Mutex::new(None),
@@ -3274,8 +3266,11 @@ mod tests {
                 attempt.plan.timeouts = Some(timeouts);
                 candidate.timeouts = CodexWsTimeouts::from_plan(&attempt.plan);
             }
-            if self.hide_turn_state.load(Ordering::Relaxed) {
+            if self.turn_state_override.load(Ordering::Relaxed) {
                 candidate.turn_state_source_id = Some("source".into());
+            }
+            if self.standard_adapter.load(Ordering::Relaxed) {
+                candidate.adapter = crate::orchestration::ResponsesWebSocketAdapter::Standard;
             }
             candidate
         }
@@ -6007,57 +6002,61 @@ mod tests {
     #[tokio::test]
     async fn turn_state_response_policy_filters_ws_delivery_but_keeps_business_frames() {
         for enabled in [false, true] {
-            let created = json!({"type":"response.created", "response":{"id":"resp-1"},
+            for standard_adapter in [false, true] {
+                let created = json!({"type":"response.created", "response":{"id":"resp-1"},
                 "headers":{"x-codex-turn-state":"upstream-ticket", "x-request-id":"keep"}})
-            .to_string();
-            let delta = json!({"type":"response.output_text.delta", "response_id":"resp-1",
+                .to_string();
+                let delta = json!({"type":"response.output_text.delta", "response_id":"resp-1",
                 "delta":"text mentioning x-codex-turn-state stays unchanged"})
-            .to_string();
-            let terminal = json!({"type":"response.completed", "turn_state":"upstream-ticket",
+                .to_string();
+                let terminal = json!({"type":"response.completed", "turn_state":"upstream-ticket",
                 "response":{"id":"resp-1", "usage":{"input_tokens":3,"output_tokens":1}}})
-            .to_string();
-            let (official, _) = ScriptedPeer::new([
-                (Duration::ZERO, relay_text(created.clone())),
-                (Duration::ZERO, relay_text(delta.clone())),
-                (Duration::ZERO, relay_text(terminal.clone())),
-            ]);
-            let runtime = TestRuntime::new(Box::new(official), false);
-            runtime.hide_turn_state.store(enabled, Ordering::Relaxed);
-            let (client, client_sent) = ScriptedPeer::new([
-                (Duration::ZERO, relay_text(request())),
-                (Duration::from_millis(100), RelayFrame::Close),
-            ]);
-            run_codex_ws_session(Box::new(client), &runtime).await;
-            let frames: Vec<_> = client_sent
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(|frame| match frame {
-                    RelayFrame::Text(text) => {
-                        Some(serde_json::from_slice::<serde_json::Value>(text).unwrap())
-                    }
-                    _ => None,
-                })
-                .collect();
-            let created = frames
-                .iter()
-                .find(|v| v["type"] == "response.created")
-                .unwrap();
-            assert_eq!(
-                created["headers"].get("x-codex-turn-state").is_none(),
-                enabled
-            );
-            assert_eq!(created["headers"]["x-request-id"], "keep");
-            let completed = frames
-                .iter()
-                .find(|v| v["type"] == "response.completed")
-                .unwrap();
-            assert_eq!(completed.get("turn_state").is_none(), enabled);
-            assert_eq!(completed["response"]["usage"]["input_tokens"], 3);
-            assert!(frames
-                .iter()
-                .any(|v| v["delta"] == "text mentioning x-codex-turn-state stays unchanged"));
-            assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 1);
+                .to_string();
+                let (official, _) = ScriptedPeer::new([
+                    (Duration::ZERO, relay_text(created.clone())),
+                    (Duration::ZERO, relay_text(delta.clone())),
+                    (Duration::ZERO, relay_text(terminal.clone())),
+                ]);
+                let runtime = TestRuntime::new(Box::new(official), false);
+                runtime
+                    .turn_state_override
+                    .store(enabled, Ordering::Relaxed);
+                runtime
+                    .standard_adapter
+                    .store(standard_adapter, Ordering::Relaxed);
+                let (client, client_sent) = ScriptedPeer::new([
+                    (Duration::ZERO, relay_text(request())),
+                    (Duration::from_millis(100), RelayFrame::Close),
+                ]);
+                run_codex_ws_session(Box::new(client), &runtime).await;
+                let frames: Vec<_> = client_sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|frame| match frame {
+                        RelayFrame::Text(text) => {
+                            Some(serde_json::from_slice::<serde_json::Value>(text).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let created = frames
+                    .iter()
+                    .find(|v| v["type"] == "response.created")
+                    .unwrap();
+                assert!(created["headers"].get("x-codex-turn-state").is_none());
+                assert_eq!(created["headers"]["x-request-id"], "keep");
+                let completed = frames
+                    .iter()
+                    .find(|v| v["type"] == "response.completed")
+                    .unwrap();
+                assert!(completed.get("turn_state").is_none());
+                assert_eq!(completed["response"]["usage"]["input_tokens"], 3);
+                assert!(frames
+                    .iter()
+                    .any(|v| v["delta"] == "text mentioning x-codex-turn-state stays unchanged"));
+                assert_eq!(runtime.report_calls.load(Ordering::Relaxed), 1);
+            }
         }
     }
 
@@ -6071,7 +6070,7 @@ mod tests {
                     "output":[{"turn_state":"user-data"}]}}
             ]}).to_string());
         let raw = classify_server_event(&input).unwrap();
-        let filtered = classify_server_event_with_ticket_policy(&input, Codex, true).unwrap();
+        let filtered = classify_public_server_event(&input, Codex).unwrap();
         assert_eq!(filtered.turn_state, raw.turn_state);
         assert_eq!(filtered.terminal_event, raw.terminal_event);
         let CodexRelayDirective::ForwardEvents(frames) = filtered.codex_relay else {
@@ -6088,17 +6087,34 @@ mod tests {
         let simple = Bytes::from_static(
             br#"{"type":"response.metadata","headers":{"x-codex-turn-state":"ticket"}}"#,
         );
-        assert_eq!(
-            classify_server_event_with_ticket_policy(&simple, Codex, false)
+        for adapter in [Codex, Standard] {
+            let CodexRelayDirective::ForwardEvents(frames) =
+                classify_public_server_event(&simple, adapter)
+                    .unwrap()
+                    .codex_relay
+            else {
+                panic!("filtered public metadata frame");
+            };
+            let frame: serde_json::Value = serde_json::from_slice(&frames[0]).unwrap();
+            assert!(frame["headers"].get("x-codex-turn-state").is_none());
+            assert_eq!(frame["type"], "response.metadata");
+        }
+        // Standard envelopes are not expanded/suppressed as Codex batches.
+        let CodexRelayDirective::ForwardEvents(frames) =
+            classify_public_server_event(&input, Standard)
                 .unwrap()
-                .codex_relay,
-            CodexRelayDirective::ForwardOriginal
-        );
+                .codex_relay
+        else {
+            panic!("filtered standard envelope");
+        };
+        assert_eq!(frames.len(), 1);
+        let frame: serde_json::Value = serde_json::from_slice(&frames[0]).unwrap();
+        assert_eq!(frame["type"], "codex.response.metadata");
+        assert!(frame["headers"].get("x-codex-turn-state").is_none());
+        assert!(frame["chunks"][0].get("X-Codex-Turn-State").is_none());
         assert_eq!(
-            classify_server_event_with_ticket_policy(&simple, Standard, true)
-                .unwrap()
-                .codex_relay,
-            CodexRelayDirective::ForwardOriginal
+            frame["chunks"][1]["response"]["output"][0]["turn_state"],
+            "user-data"
         );
     }
 }

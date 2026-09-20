@@ -2855,9 +2855,7 @@ async fn execute_stream_from_frame_stream(
                     .await?;
             // Error conversion can rebuild headers from the raw provider
             // payload retained for auditing, rather than client_headers.
-            if crate::turn_state::hide_response_ticket(&plan.headers) {
-                response.headers_mut().remove(crate::turn_state::HEADER);
-            }
+            response.headers_mut().remove(crate::turn_state::HEADER);
             return Ok(Some(attach_control_metadata_headers(
                 response,
                 Some(request_id),

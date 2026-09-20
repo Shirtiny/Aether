@@ -412,8 +412,10 @@ async fn admin_codex_key_tests_apply_turn_state_override_for_both_direct_and_poo
         (Some("source"), "codex", false, true),
         (Some("source"), "codex", true, true),
         (None, "codex", false, false),
+        (None, "codex", true, false),
         (Some("missing-source"), "codex", false, false),
         (Some("source"), "custom", false, false),
+        (None, "custom", false, false),
     ] {
         for api_format in ["openai:responses", "openai:responses:compact"] {
             let gateway = ModelTestGateway::with_turn_state(
@@ -429,16 +431,12 @@ async fn admin_codex_key_tests_apply_turn_state_override_for_both_direct_and_poo
                     let (plan, payload) = gateway
                         .request(mode, key, json!({}), json!({"input":"hello"}))
                         .await;
-                    let hides_ticket = provider_type == "codex" && source.is_some();
                     let response_headers = payload["attempts"][0]["response_headers"]
                         .as_object()
                         .unwrap();
-                    assert_eq!(
-                        response_headers
-                            .keys()
-                            .any(|k| k.eq_ignore_ascii_case(crate::turn_state::HEADER)),
-                        !hides_ticket
-                    );
+                    assert!(!response_headers
+                        .keys()
+                        .any(|k| k.eq_ignore_ascii_case(crate::turn_state::HEADER)));
                     assert!(payload["attempts"][0]["request_headers"]
                         .get(crate::turn_state::HIDE_RESPONSE_HEADER)
                         .is_none());

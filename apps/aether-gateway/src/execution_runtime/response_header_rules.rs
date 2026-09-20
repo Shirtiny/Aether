@@ -55,7 +55,7 @@ pub(crate) async fn apply_endpoint_response_header_rules(
     apply_configured_response_header_rules(state, plan, headers, response_body).await?;
     // Last, even when endpoint rules are absent/invalid, so rules cannot
     // reintroduce a ticket. Raw provider headers remain in the upstream audit.
-    crate::turn_state::filter_response_headers(&plan.headers, headers);
+    crate::turn_state::filter_response_headers(headers);
     Ok(())
 }
 
@@ -146,7 +146,7 @@ mod tests {
             let state = AppState::new().unwrap().with_data_state_for_tests(
                 crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(repo),
             );
-            for enabled in [false, true] {
+            for legacy_policy in [None, Some("false"), Some("true")] {
                 let mut plan: ExecutionPlan = serde_json::from_value(json!({
                     "request_id":"test", "provider_id":"provider", "endpoint_id":"endpoint",
                     "key_id":"key", "method":"POST", "url":"https://example.invalid/responses",
@@ -154,9 +154,13 @@ mod tests {
                     "client_api_format":"openai:responses", "provider_api_format":"openai:responses"
                 }))
                 .unwrap();
-                crate::turn_state::set_response_ticket_policy(&mut plan.headers, enabled);
+                if let Some(value) = legacy_policy {
+                    plan.headers
+                        .insert(crate::turn_state::HIDE_RESPONSE_HEADER.into(), value.into());
+                }
                 let upstream = BTreeMap::from([
                     ("x-codex-turn-state".into(), "upstream-ticket".into()),
+                    ("X-Codex-Turn-State".into(), "mixed-case-ticket".into()),
                     ("content-type".into(), "text/event-stream".into()),
                     ("x-request-id".into(), "upstream-request".into()),
                 ]);
@@ -166,12 +170,9 @@ mod tests {
                 apply_endpoint_response_header_rules(&state, &plan, &mut client, None)
                     .await
                     .unwrap();
-                assert_eq!(
-                    client
-                        .keys()
-                        .any(|k| k.eq_ignore_ascii_case(crate::turn_state::HEADER)),
-                    !enabled
-                );
+                assert!(!client
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case(crate::turn_state::HEADER)));
                 assert_eq!(client["x-request-id"], "upstream-request");
                 assert_eq!(client["content-type"], "text/event-stream");
                 assert_eq!(
@@ -194,7 +195,10 @@ mod tests {
             Json, Router,
         };
         let upstream = Router::new().route("/responses", post(|headers: HeaderMap, Json(body): Json<Value>| async move {
-            assert_eq!(headers.get(crate::turn_state::HEADER).unwrap(), "collected-ticket");
+            assert_eq!(
+                headers.get(crate::turn_state::HEADER).map(|value| value.to_str().unwrap()),
+                (body["test_override"] == true).then_some("collected-ticket")
+            );
             assert!(!headers.contains_key(crate::turn_state::HIDE_RESPONSE_HEADER));
             let stream = body["stream"] == true;
             let error = body["test_error"] == true;
@@ -226,10 +230,12 @@ mod tests {
                         "request_id":format!("test-{enabled}-{stream}-{error}"), "provider_id":"provider", "endpoint_id":"endpoint",
                         "key_id":"key", "method":"POST", "url":format!("http://{addr}/responses"),
                         "headers":{"content-type":"application/json", "x-codex-turn-state":"collected-ticket"},
-                        "body":{"json_body":{"model":"test", "stream":stream, "test_error":error}},
+                        "body":{"json_body":{"model":"test", "stream":stream, "test_error":error, "test_override":enabled}},
                         "stream":stream, "client_api_format":"openai:responses", "provider_api_format":"openai:responses"
                     })).unwrap();
-                    crate::turn_state::set_response_ticket_policy(&mut plan.headers, enabled);
+                    if !enabled {
+                        plan.headers.remove(crate::turn_state::HEADER);
+                    }
                     let decision = GatewayControlDecision::synthetic(
                         "/v1/responses",
                         Some("ai_public".into()),
@@ -272,9 +278,8 @@ mod tests {
                             StatusCode::OK
                         }
                     );
-                    assert_eq!(
-                        response.headers().contains_key(crate::turn_state::HEADER),
-                        !enabled,
+                    assert!(
+                        !response.headers().contains_key(crate::turn_state::HEADER),
                         "enabled={enabled}, stream={stream}, error={error}"
                     );
                     assert!(!response

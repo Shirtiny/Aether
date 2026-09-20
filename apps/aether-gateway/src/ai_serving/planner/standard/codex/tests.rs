@@ -1967,7 +1967,7 @@ async fn turn_state_override_runs_after_turn_sanitation_and_header_rules() {
             .await;
             assert_eq!(headers[crate::turn_state::HEADER], ticket);
             assert_eq!(body["client_metadata"][crate::turn_state::HEADER], ticket);
-            assert!(crate::turn_state::hide_response_ticket(&headers));
+            assert!(!headers.contains_key(crate::turn_state::HIDE_RESPONSE_HEADER));
         }
     }
     for (provider_type, config) in [
@@ -2000,7 +2000,7 @@ async fn turn_state_override_runs_after_turn_sanitation_and_header_rules() {
         )
         .await;
         assert_eq!(headers["x-codex-turn-state"], "original");
-        assert!(!crate::turn_state::hide_response_ticket(&headers));
+        assert!(!headers.contains_key(crate::turn_state::HIDE_RESPONSE_HEADER));
     }
 }
 
@@ -2099,10 +2099,7 @@ async fn turn_state_source_switch_and_missing_source_never_use_another_channels_
             body["client_metadata"][crate::turn_state::HEADER].as_str(),
             (source_id == json!("source")).then_some(expected)
         );
-        assert_eq!(
-            crate::turn_state::hide_response_ticket(&headers),
-            !source_id.is_null()
-        );
+        assert!(!headers.contains_key(crate::turn_state::HIDE_RESPONSE_HEADER));
     }
 }
 
