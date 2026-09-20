@@ -415,39 +415,48 @@ async fn admin_codex_key_tests_apply_turn_state_override_for_both_direct_and_poo
         (Some("missing-source"), "codex", false, false),
         (Some("source"), "custom", false, false),
     ] {
-        let gateway = ModelTestGateway::with_turn_state(
-            "openai:responses",
-            provider_type,
-            true,
-            identity,
-            source,
-        )
-        .await;
-        for mode in ["direct", "pool"] {
-            for key in ["key-one", "key-two"] {
-                let (plan, payload) = gateway
-                    .request(mode, key, json!({}), json!({"input":"hello"}))
-                    .await;
-                let hides_ticket = provider_type == "codex" && source.is_some();
-                let response_headers = payload["attempts"][0]["response_headers"]
-                    .as_object()
-                    .unwrap();
-                assert_eq!(
-                    response_headers
-                        .keys()
-                        .any(|k| k.eq_ignore_ascii_case(crate::turn_state::HEADER)),
-                    !hides_ticket
-                );
-                assert!(payload["attempts"][0]["request_headers"]
-                    .get(crate::turn_state::HIDE_RESPONSE_HEADER)
-                    .is_none());
-                assert_eq!(
-                    plan.headers
-                        .get(crate::turn_state::HEADER)
-                        .map(String::as_str),
-                    expected.then_some("test-collected-ticket"),
-                    "source={source:?}, provider={provider_type}, mode={mode}, key={key}"
-                );
+        for api_format in ["openai:responses", "openai:responses:compact"] {
+            let gateway = ModelTestGateway::with_turn_state(
+                api_format,
+                provider_type,
+                true,
+                identity,
+                source,
+            )
+            .await;
+            for mode in ["direct", "pool"] {
+                for key in ["key-one", "key-two"] {
+                    let (plan, payload) = gateway
+                        .request(mode, key, json!({}), json!({"input":"hello"}))
+                        .await;
+                    let hides_ticket = provider_type == "codex" && source.is_some();
+                    let response_headers = payload["attempts"][0]["response_headers"]
+                        .as_object()
+                        .unwrap();
+                    assert_eq!(
+                        response_headers
+                            .keys()
+                            .any(|k| k.eq_ignore_ascii_case(crate::turn_state::HEADER)),
+                        !hides_ticket
+                    );
+                    assert!(payload["attempts"][0]["request_headers"]
+                        .get(crate::turn_state::HIDE_RESPONSE_HEADER)
+                        .is_none());
+                    assert_eq!(
+                        plan.headers
+                            .get(crate::turn_state::HEADER)
+                            .map(String::as_str),
+                        expected.then_some("test-collected-ticket"),
+                        "source={source:?}, provider={provider_type}, mode={mode}, key={key}"
+                    );
+                    assert_eq!(
+                        plan.body.json_body.as_ref().unwrap()["client_metadata"]
+                            [crate::turn_state::HEADER]
+                            .as_str(),
+                        expected.then_some("test-collected-ticket"),
+                        "body source={source:?}, provider={provider_type}, mode={mode}, key={key}"
+                    );
+                }
             }
         }
     }

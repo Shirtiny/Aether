@@ -1937,7 +1937,10 @@ async fn turn_state_override_runs_after_turn_sanitation_and_header_rules() {
         let mut transport = sample_transport(
             "codex",
             Some(json!({"pool_advanced": {
-                "codex_runtime_identity": {"enabled": identity_enabled},
+                "codex_runtime_identity": {
+                    "enabled": identity_enabled,
+                    "expected_threads_per_day": 32, "expected_turns_per_day": 512
+                },
                 "turn_state_source_provider_id": "source"
             }})),
         );
@@ -1963,6 +1966,7 @@ async fn turn_state_override_runs_after_turn_sanitation_and_header_rules() {
             )
             .await;
             assert_eq!(headers[crate::turn_state::HEADER], ticket);
+            assert_eq!(body["client_metadata"][crate::turn_state::HEADER], ticket);
             assert!(crate::turn_state::hide_response_ticket(&headers));
         }
     }
@@ -2001,6 +2005,69 @@ async fn turn_state_override_runs_after_turn_sanitation_and_header_rules() {
 }
 
 #[tokio::test]
+async fn turn_state_override_restores_http_body_after_minted_identity_clears_client_ticket() {
+    use crate::codex_runtime_identity::CodexRuntimeIdentitySurface;
+    for surface in [
+        CodexRuntimeIdentitySurface::HttpResponses,
+        CodexRuntimeIdentitySurface::HttpCompact,
+    ] {
+        let runtime = aether_runtime_state::RuntimeState::memory(
+            aether_runtime_state::MemoryRuntimeStateConfig::default(),
+        );
+        crate::turn_state::tests::seed_ticket(&runtime, "collected-ticket", 0).await;
+        let transport = sample_transport(
+            "codex",
+            Some(json!({"pool_advanced": {
+                "codex_runtime_identity": {
+                    "enabled": true,
+                    "expected_threads_per_day": 32, "expected_turns_per_day": 512
+                },
+                "turn_state_source_provider_id": "source"
+            }})),
+        );
+        let original = json!({
+            "model": "test-model", "input": [{"role": "user", "content": "Hi"}],
+            "client_metadata": {
+                "session_id": "client-thread", "thread_id": "client-thread",
+                "turn_id": "client-turn", "x-codex-turn-state": "stale-client-ticket"
+            }
+        });
+        let mut body = original.clone();
+        let mut headers = BTreeMap::from([(
+            crate::turn_state::HEADER.into(),
+            "stale-client-ticket".into(),
+        )]);
+        let identity = super::apply_codex_pool_runtime_identity(
+            &runtime,
+            &transport,
+            &mut headers,
+            Some(&mut body),
+            &HeaderMap::new(),
+            Some(&original),
+            surface,
+        )
+        .await
+        .expect("fresh client identity must be rewritten");
+        assert!(
+            !identity.forwards_turn_state(),
+            "the old client ticket must be sanitized"
+        );
+        assert_eq!(headers[crate::turn_state::HEADER], "collected-ticket");
+        assert_eq!(
+            body["client_metadata"][crate::turn_state::HEADER],
+            "collected-ticket"
+        );
+        assert_ne!(body["client_metadata"]["thread_id"], "client-thread");
+        let encoded: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+        assert_eq!(
+            encoded["client_metadata"][crate::turn_state::HEADER],
+            headers[crate::turn_state::HEADER]
+        );
+    }
+}
+
+#[tokio::test]
 async fn turn_state_source_switch_and_missing_source_never_use_another_channels_ticket() {
     let runtime = aether_runtime_state::RuntimeState::memory(
         aether_runtime_state::MemoryRuntimeStateConfig::default(),
@@ -2028,6 +2095,10 @@ async fn turn_state_source_switch_and_missing_source_never_use_another_channels_
         )
         .await;
         assert_eq!(headers["x-codex-turn-state"], expected);
+        assert_eq!(
+            body["client_metadata"][crate::turn_state::HEADER].as_str(),
+            (source_id == json!("source")).then_some(expected)
+        );
         assert_eq!(
             crate::turn_state::hide_response_ticket(&headers),
             !source_id.is_null()
@@ -2068,5 +2139,9 @@ async fn turn_state_account_source_overrides_and_never_falls_back_to_provider_ca
         )
         .await;
         assert_eq!(headers[crate::turn_state::HEADER], expected);
+        assert_eq!(
+            body["client_metadata"][crate::turn_state::HEADER].as_str(),
+            (account == "account-a").then_some(expected)
+        );
     }
 }

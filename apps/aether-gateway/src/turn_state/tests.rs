@@ -149,7 +149,7 @@ fn override_inserts_missing_headers_and_replaces_case_insensitive_projections() 
         (HEADER.into(), "other".into()),
     ]);
     let mut body = json!({"client_metadata": {"X-Codex-Turn-State": "old", "keep": "yes"}});
-    apply_ticket(&mut headers, Some(&mut body), &ticket, false);
+    apply_ticket(&mut headers, Some(&mut body), &ticket);
     assert_eq!(headers.len(), 1);
     assert_eq!(headers[HEADER], ticket);
     assert_eq!(body["client_metadata"][HEADER], ticket);
@@ -157,14 +157,42 @@ fn override_inserts_missing_headers_and_replaces_case_insensitive_projections() 
     assert_eq!(body["client_metadata"]["keep"], "yes");
     headers.clear();
     let mut body = json!({"input": []});
-    apply_ticket(&mut headers, Some(&mut body), &ticket, false);
+    apply_ticket(&mut headers, Some(&mut body), &ticket);
     assert_eq!(headers[HEADER], ticket);
-    assert!(body.get("client_metadata").is_none());
-    // WS must supply the field on every step, including the first/new turn.
-    for old_metadata in [Value::Null, json!({}), json!({HEADER: "old"})] {
-        let mut body = json!({"client_metadata": old_metadata});
-        apply_ticket(&mut BTreeMap::new(), Some(&mut body), &ticket, true);
-        assert_eq!(body["client_metadata"][HEADER], ticket);
+    assert_eq!(body["client_metadata"][HEADER], ticket);
+    // Both transports must restore a projection removed by identity sanitation,
+    // including missing/malformed metadata and tickets of different lengths.
+    for ticket in ["a".repeat(292), "b".repeat(384)] {
+        for old_metadata in [
+            Value::Null,
+            json!({}),
+            json!("invalid"),
+            json!({HEADER: "old"}),
+        ] {
+            let mut body = json!({"client_metadata": old_metadata, "input": []});
+            apply_ticket(&mut headers, Some(&mut body), &ticket);
+            assert_eq!(headers[HEADER], ticket);
+            assert_eq!(body["client_metadata"][HEADER], ticket);
+            assert_eq!(body["input"], json!([]));
+        }
+    }
+}
+
+#[test]
+fn invalid_turn_state_never_changes_headers_or_body() {
+    for ticket in [
+        String::new(),
+        "bad\nvalue".into(),
+        "非ASCII".into(),
+        "a".repeat(4097),
+    ] {
+        let mut headers = BTreeMap::from([(HEADER.into(), "original".into())]);
+        let mut body = json!({"client_metadata": {HEADER: "original", "keep": "yes"}});
+        let original_headers = headers.clone();
+        let original_body = body.clone();
+        apply_ticket(&mut headers, Some(&mut body), &ticket);
+        assert_eq!(headers, original_headers);
+        assert_eq!(body, original_body);
     }
 }
 

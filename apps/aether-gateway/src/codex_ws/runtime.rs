@@ -3353,7 +3353,7 @@ fn materialize_codex_ws_step_body(
         env_context_state = state;
     }
     if let Some(ticket) = turn_state_tickets.and_then(|tickets| tickets.for_body(&body)) {
-        crate::turn_state::apply_ticket(&mut BTreeMap::new(), Some(&mut body), ticket, true);
+        crate::turn_state::apply_ticket(&mut BTreeMap::new(), Some(&mut body), ticket);
     }
     let body_text = serde_json::to_string(&body)
         .map_err(|_| StepPreparationError::retain("account_profile_materialization_failed"))?;

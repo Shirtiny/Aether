@@ -671,7 +671,6 @@ pub(crate) async fn apply_codex_pool_runtime_identity(
                 provider_request_headers,
                 provider_request_body.as_deref_mut(),
                 ticket,
-                false,
             );
         }
     }

@@ -219,12 +219,12 @@ pub(crate) async fn load_tickets(
 }
 
 /// Must run AFTER runtime identity sanitation and endpoint rules. No inbound
-/// header or matching turn is required for an explicitly enabled override.
+/// header, body projection or matching turn is required for an explicitly
+/// enabled override. Restore both projections even if sanitation removed them.
 pub(crate) fn apply_ticket(
     headers: &mut BTreeMap<String, String>,
     body: Option<&mut Value>,
     ticket: &str,
-    websocket: bool,
 ) {
     if !valid_ticket(ticket) {
         return;
@@ -232,22 +232,15 @@ pub(crate) fn apply_ticket(
     headers.retain(|name, _| !name.eq_ignore_ascii_case(HEADER));
     headers.insert(HEADER.into(), ticket.into());
     if let Some(object) = body.and_then(Value::as_object_mut) {
-        // WS response.create carries the per-step header in client_metadata.
-        // For HTTP only replace a body projection if the client supplied one.
-        if websocket {
-            let meta = object.entry("client_metadata").or_insert_with(|| json!({}));
-            if !meta.is_object() {
-                *meta = json!({});
-            }
+        // HTTP and WS use the same explicit override. Do not mistake a missing
+        // projection (including one just sanitized) for a disabled override.
+        let meta = object.entry("client_metadata").or_insert_with(|| json!({}));
+        if !meta.is_object() {
+            *meta = json!({});
         }
-        if let Some(meta) = object
-            .get_mut("client_metadata")
-            .and_then(Value::as_object_mut)
-        {
-            if websocket || meta.keys().any(|name| name.eq_ignore_ascii_case(HEADER)) {
-                meta.retain(|name, _| !name.eq_ignore_ascii_case(HEADER));
-                meta.insert(HEADER.into(), Value::String(ticket.into()));
-            }
+        if let Some(meta) = meta.as_object_mut() {
+            meta.retain(|name, _| !name.eq_ignore_ascii_case(HEADER));
+            meta.insert(HEADER.into(), Value::String(ticket.into()));
         }
     }
 }
