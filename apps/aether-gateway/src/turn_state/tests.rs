@@ -506,6 +506,14 @@ async fn fetch_plan_reuses_channel_credentials_and_responses_path_without_networ
     assert_eq!(body["model"], "model-a");
     assert_eq!(body["store"], false);
     assert_eq!(body["stream"], true);
+    assert_eq!(
+        body["instructions"],
+        "Answer the user's question concisely."
+    );
+    assert_eq!(
+        body["input"][0]["content"][0]["text"],
+        "hello 今天的日期是什么 现在的时间是什么"
+    );
     transport.endpoint.base_url = "https://unrelated.example".into();
     assert!(build_fetch_plan(&state, &transport, "model-a")
         .await

@@ -308,8 +308,8 @@ async fn build_fetch_plan(
     }
     let body = json!({
         "model": model.trim(), "stream": true, "store": false,
-        "instructions": "Reply with OK only.",
-        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hi"}]}]
+        "instructions": "Answer the user's question concisely.",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello 今天的日期是什么 现在的时间是什么"}]}]
     });
     plan.url = crate::provider_transport::build_transport_request_url(
         transport,
