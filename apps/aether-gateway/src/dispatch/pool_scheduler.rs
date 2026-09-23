@@ -5301,9 +5301,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn sticky_concurrency_wait_respects_shorter_planning_budget() {
-        let (mut app, group, _) = sticky_concurrency_fixture(Some(true), 120).await;
-        app.frontdoor_runtime_guards
-            .local_execution_planning_timeout = Duration::from_secs(2);
+        let (app, group, _) = sticky_concurrency_fixture(Some(true), 120).await;
+        let app = app.with_frontdoor_runtime_guard_config_for_tests(
+            FrontdoorRuntimeGuardConfig::for_tests(
+                Duration::from_secs(120),
+                Duration::from_secs(2),
+            ),
+        );
         let mut cursor = PoolKeyCursor::new(
             PlannerAppState::new(&app),
             group,
