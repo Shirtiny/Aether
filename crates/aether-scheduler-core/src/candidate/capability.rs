@@ -16,6 +16,9 @@ pub fn candidate_supports_required_capability(
     if required_capability.is_empty() {
         return true;
     }
+    if required_capability.eq_ignore_ascii_case(CODEX_OFFICIAL_WS_REQUIRED_CAPABILITY) {
+        return candidate_supports_codex_official_ws_capability(candidate);
+    }
     let Some(capabilities) = candidate.key_capabilities.as_ref() else {
         return false;
     };
@@ -69,9 +72,9 @@ pub fn hard_filter_candidates_by_flat_required_capabilities(
     });
 }
 
-/// Applies the account-capability hard gate required by a native Codex WebSocket selection.
+/// Selects Codex OAuth accounts for native WebSocket requests without an account switch.
 /// Call this immediately after enumeration and before runtime-state reads or ranking. Endpoint and
-/// immutable transport-profile eligibility must still be checked from the selected provider
+/// built-in transport-profile eligibility must still be checked from the selected provider
 /// transport snapshot before dialing upstream.
 pub fn hard_filter_candidates_for_codex_official_ws(
     candidates: &mut Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -84,13 +87,6 @@ pub fn candidate_supports_codex_official_ws_capability(
 ) -> bool {
     candidate.provider_type.trim().eq_ignore_ascii_case("codex")
         && candidate.key_auth_type.trim().eq_ignore_ascii_case("oauth")
-        && candidate
-            .key_capabilities
-            .as_ref()
-            .and_then(serde_json::Value::as_object)
-            .and_then(|capabilities| capabilities.get(CODEX_OFFICIAL_WS_REQUIRED_CAPABILITY))
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
 }
 
 pub fn requested_capability_priority_for_candidate(

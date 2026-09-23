@@ -186,7 +186,6 @@ impl AppState {
     async fn key_is_codex_ws_relevant(
         &self,
         key: &provider_catalog::StoredProviderCatalogKey,
-        explicit_ws_mutation: bool,
     ) -> Result<bool, GatewayError> {
         if !responses_ws_key_supports_responses(key) {
             return Ok(false);
@@ -195,7 +194,7 @@ impl AppState {
             match self.provider_responses_ws_adapter(&key.provider_id).await? {
                 Some(crate::orchestration::ResponsesWebSocketAdapter::Standard) => true,
                 Some(crate::orchestration::ResponsesWebSocketAdapter::Codex) => {
-                    codex_ws_key_shape_matches(key, explicit_ws_mutation)
+                    codex_ws_key_shape_matches(key)
                 }
                 None => false,
             },
@@ -719,7 +718,7 @@ impl AppState {
         key: &provider_catalog::StoredProviderCatalogKey,
     ) -> Result<Option<provider_catalog::StoredProviderCatalogKey>, GatewayError> {
         let hot_mutation = self
-            .key_is_codex_ws_relevant(key, false)
+            .key_is_codex_ws_relevant(key)
             .await?
             .then(|| crate::codex_ws::hot_state::begin_key_hot_mutation(self, &key.id));
         let hot_mutation = match hot_mutation {
@@ -1423,9 +1422,9 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))?
             .into_iter()
             .next();
-        let relevant = self.key_is_codex_ws_relevant(key, false).await?
+        let relevant = self.key_is_codex_ws_relevant(key).await?
             || match existing.as_ref() {
-                Some(existing) => self.key_is_codex_ws_relevant(existing, false).await?,
+                Some(existing) => self.key_is_codex_ws_relevant(existing).await?,
                 None => false,
             };
         let hot_mutation = if relevant {
@@ -1445,49 +1444,6 @@ impl AppState {
         Ok(updated)
     }
 
-    pub(crate) async fn update_provider_catalog_key_codex_ws_metadata(
-        &self,
-        key_id: &str,
-        enabled: bool,
-        websocket_transport_profile: Option<&serde_json::Value>,
-        updated_at_unix_secs: u64,
-    ) -> Result<bool, GatewayError> {
-        let existing = self
-            .data
-            .list_provider_catalog_keys_by_ids(&[key_id.to_string()])
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?
-            .into_iter()
-            .next();
-        let relevant = match existing.as_ref() {
-            Some(existing) => self.key_is_codex_ws_relevant(existing, true).await?,
-            None => false,
-        };
-        let hot_mutation = if relevant {
-            Some(crate::codex_ws::hot_state::begin_key_hot_mutation(self, key_id).await?)
-        } else {
-            None
-        };
-        let updated = self
-            .data
-            .update_provider_catalog_key_codex_ws_metadata(
-                key_id,
-                enabled,
-                websocket_transport_profile,
-                updated_at_unix_secs,
-            )
-            .await;
-        if let Some(mutation) = hot_mutation {
-            self.finish_codex_ws_key_hot_after_authoritative_read(mutation, key_id)
-                .await?;
-        }
-        let updated = updated.map_err(|err| GatewayError::Internal(err.to_string()))?;
-        if updated {
-            self.invalidate_provider_routing_caches();
-        }
-        Ok(updated)
-    }
-
     pub(crate) async fn update_provider_catalog_key_runtime_state(
         &self,
         key: &provider_catalog::StoredProviderCatalogKey,
@@ -1497,7 +1453,7 @@ impl AppState {
         // but preserve the global scheduler-affinity epoch so unrelated
         // long-lived bindings are not treated as stale catalog snapshots.
         let restrictive = !crate::codex_ws::hot_state::key_runtime_eligibility(key).0;
-        let relevant = restrictive && self.key_is_codex_ws_relevant(key, true).await?;
+        let relevant = restrictive && self.key_is_codex_ws_relevant(key).await?;
         // Restrictive runtime writes are rare and safety-sensitive. Use the
         // same distributed transition lock as admin mutations so a failed
         // one-shot CAS can never leave an eligible generation visible after
@@ -1555,7 +1511,7 @@ impl AppState {
             .into_iter()
             .next();
         let relevant = match existing_key.as_ref() {
-            Some(key) => self.key_is_codex_ws_relevant(key, false).await?,
+            Some(key) => self.key_is_codex_ws_relevant(key).await?,
             None => false,
         };
         let hot_mutation = if relevant {
@@ -1721,7 +1677,7 @@ impl AppState {
                 .await
                 .map_err(|err| GatewayError::Internal(err.to_string()))?;
             match keys.first() {
-                Some(key) => self.key_is_codex_ws_relevant(key, false).await?,
+                Some(key) => self.key_is_codex_ws_relevant(key).await?,
                 None => false,
             }
         };
@@ -1768,29 +1724,15 @@ fn codex_ws_provider_resource_eligibility(
     (true, "eligible")
 }
 
-fn codex_ws_key_shape_matches(
-    key: &provider_catalog::StoredProviderCatalogKey,
-    explicit_ws_mutation: bool,
-) -> bool {
-    let oauth_for_responses = key.auth_type.trim().eq_ignore_ascii_case("oauth")
+fn codex_ws_key_shape_matches(key: &provider_catalog::StoredProviderCatalogKey) -> bool {
+    key.auth_type.trim().eq_ignore_ascii_case("oauth")
         || key
             .auth_type_by_format
             .as_ref()
             .and_then(serde_json::Value::as_object)
             .and_then(|formats| formats.get("openai:responses"))
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|auth_type| auth_type.trim().eq_ignore_ascii_case("oauth"));
-    if !oauth_for_responses {
-        return false;
-    }
-    explicit_ws_mutation
-        || key
-            .capabilities
-            .as_ref()
-            .and_then(serde_json::Value::as_object)
-            .is_some_and(|capabilities| {
-                capabilities.contains_key(aether_provider_transport::CODEX_OFFICIAL_WS_CAPABILITY)
-            })
+            .is_some_and(|auth_type| auth_type.trim().eq_ignore_ascii_case("oauth"))
 }
 
 fn responses_ws_key_supports_responses(key: &provider_catalog::StoredProviderCatalogKey) -> bool {
@@ -1910,27 +1852,11 @@ mod tests {
             "provider-1".to_string(),
             "Codex OAuth".to_string(),
             "oauth".to_string(),
-            Some(json!({
-                (aether_provider_transport::CODEX_OFFICIAL_WS_CAPABILITY): true
-            })),
+            None,
             true,
         )
         .expect("Codex key should build");
         key.api_formats = Some(json!(["openai:responses"]));
-        key.fingerprint = Some(json!({
-            (aether_provider_transport::CODEX_OFFICIAL_WS_PROFILE_FINGERPRINT_KEY): {
-                "schema_version": aether_provider_transport::CODEX_OFFICIAL_WS_PROFILE_SCHEMA_VERSION,
-                "profile_id": aether_provider_transport::CODEX_OFFICIAL_WS_PROFILE_ID,
-                "codex_commit": aether_provider_transport::CODEX_OFFICIAL_WS_CODEX_COMMIT,
-                "tokio_tungstenite_rev": aether_provider_transport::CODEX_OFFICIAL_WS_TOKIO_TUNGSTENITE_REV,
-                "tungstenite_rev": aether_provider_transport::CODEX_OFFICIAL_WS_TUNGSTENITE_REV,
-                "tungstenite_patch_id": aether_provider_transport::CODEX_OFFICIAL_WS_TUNGSTENITE_PATCH_ID,
-                "write_buffer_size_bytes": aether_provider_transport::CODEX_OFFICIAL_WS_WRITE_BUFFER_SIZE_BYTES,
-                "max_write_buffer_size_bytes": aether_provider_transport::CODEX_OFFICIAL_WS_MAX_WRITE_BUFFER_SIZE_BYTES,
-                "max_retained_write_buffer_capacity_bytes": aether_provider_transport::CODEX_OFFICIAL_WS_MAX_RETAINED_WRITE_BUFFER_CAPACITY_BYTES,
-                "crypto_provider": aether_provider_transport::CODEX_OFFICIAL_WS_CRYPTO_PROVIDER,
-            }
-        }));
         key
     }
 

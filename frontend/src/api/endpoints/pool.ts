@@ -337,8 +337,6 @@ export interface PoolBatchAction {
   action:
     | 'enable'
     | 'disable'
-    | 'enable_codex_ws'
-    | 'disable_codex_ws'
     | 'refresh_codex_client_profiles'
     | 'delete'
     | 'clear_proxy'

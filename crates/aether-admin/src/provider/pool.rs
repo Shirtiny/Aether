@@ -34,8 +34,6 @@ pub enum AdminPoolBatchActionKind {
     SetProxy,
     RegenerateFingerprint,
     RefreshCodexClientProfiles,
-    EnableCodexWs,
-    DisableCodexWs,
     Delete,
 }
 
@@ -415,21 +413,13 @@ pub fn build_admin_pool_batch_action_plan(
             AdminPoolBatchActionKind::RefreshCodexClientProfiles,
             "Codex client profiles refreshed",
         ),
-        "enable_codex_ws" => (AdminPoolBatchActionKind::EnableCodexWs, "Codex WS enabled"),
-        "disable_codex_ws" => (
-            AdminPoolBatchActionKind::DisableCodexWs,
-            "Codex WS disabled",
-        ),
-        "drain_codex_ws" => {
-            return Err(
-                "drain_codex_ws is not supported yet; disable_codex_ws applies the configured soft-drain policy"
-                    .to_string(),
-            );
+        "enable_codex_ws" | "disable_codex_ws" | "drain_codex_ws" => {
+            return Err("Account-level Codex WS actions are not supported; Codex OAuth accounts support WebSocket by default".to_string());
         }
         "delete" => (AdminPoolBatchActionKind::Delete, "deleted"),
         _ => {
             return Err(format!(
-                "Invalid action: {action}. Supported locally: enable, disable, clear_proxy, set_proxy, regenerate_fingerprint, refresh_codex_client_profiles, enable_codex_ws, disable_codex_ws, delete"
+                "Invalid action: {action}. Supported locally: enable, disable, clear_proxy, set_proxy, regenerate_fingerprint, refresh_codex_client_profiles, delete"
             ));
         }
     };
@@ -573,31 +563,29 @@ mod tests {
 
     #[test]
     fn parses_dedicated_codex_batch_actions() {
-        for (action, expected) in [
-            (
-                "refresh_codex_client_profiles",
-                AdminPoolBatchActionKind::RefreshCodexClientProfiles,
-            ),
-            ("enable_codex_ws", AdminPoolBatchActionKind::EnableCodexWs),
-            ("disable_codex_ws", AdminPoolBatchActionKind::DisableCodexWs),
-        ] {
+        for (action, expected) in [(
+            "refresh_codex_client_profiles",
+            AdminPoolBatchActionKind::RefreshCodexClientProfiles,
+        )] {
             let plan = build_admin_pool_batch_action_plan(AdminPoolBatchActionRequest {
                 key_ids: vec![" key-1 ".to_string(), "key-1".to_string()],
                 action: action.to_string(),
                 payload: None,
             })
-            .expect("Codex WS action should parse");
+            .expect("Codex client profile action should parse");
             assert_eq!(plan.action, expected);
             assert_eq!(plan.key_ids, vec!["key-1"]);
         }
 
-        let drain_error = build_admin_pool_batch_action_plan(AdminPoolBatchActionRequest {
-            key_ids: vec!["key-1".to_string()],
-            action: "drain_codex_ws".to_string(),
-            payload: None,
-        })
-        .expect_err("drain must not be silently emulated");
-        assert!(drain_error.contains("not supported"));
+        for action in ["enable_codex_ws", "disable_codex_ws", "drain_codex_ws"] {
+            let error = build_admin_pool_batch_action_plan(AdminPoolBatchActionRequest {
+                key_ids: vec!["key-1".to_string()],
+                action: action.to_string(),
+                payload: None,
+            })
+            .expect_err("removed account WS actions must not mutate metadata");
+            assert!(error.contains("not supported"));
+        }
     }
 
     #[test]

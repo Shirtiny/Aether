@@ -192,18 +192,15 @@ mod tests {
             sample_candidate(
                 "enabled",
                 Some(serde_json::json!({
-                    "codex_official_ws": true,
+                    "vision": true,
                     "unrelated": true
                 })),
             ),
-            sample_candidate(
-                "disabled",
-                Some(serde_json::json!({"codex_official_ws": false})),
-            ),
+            sample_candidate("disabled", Some(serde_json::json!({"vision": false}))),
             sample_candidate("missing", Some(serde_json::json!({}))),
         ];
         let required = serde_json::json!({
-            "codex_official_ws": true,
+            "vision": true,
             "not_required": false
         });
 
@@ -218,21 +215,18 @@ mod tests {
 
     #[test]
     fn hard_capability_filter_is_opt_in_and_fails_closed_for_malformed_requirements() {
-        let disabled = sample_candidate(
-            "disabled",
-            Some(serde_json::json!({"codex_official_ws": false})),
-        );
+        let disabled = sample_candidate("disabled", Some(serde_json::json!({"vision": false})));
         assert!(super::candidate_supports_flat_required_capabilities(
             &disabled, None
         ));
         assert!(!super::candidate_supports_flat_required_capabilities(
             &disabled,
-            Some(&serde_json::json!(["codex_official_ws"]))
+            Some(&serde_json::json!(["vision"]))
         ));
     }
 
     #[test]
-    fn native_codex_ws_account_gate_rejects_missing_disabled_and_malformed_capabilities() {
+    fn native_codex_ws_defaults_to_all_codex_oauth_accounts() {
         let mut enabled = sample_candidate(
             "enabled",
             Some(serde_json::json!({"codex_official_ws": true})),
@@ -273,9 +267,20 @@ mod tests {
             sample_candidate("no-capabilities", None),
         ];
 
+        for candidate in &mut candidates {
+            if candidate.key_id != "key-wrong-provider" && candidate.key_id != "key-wrong-auth" {
+                candidate.provider_type = "codex".to_string();
+                candidate.key_auth_type = "oauth".to_string();
+                assert!(super::candidate_supports_flat_required_capabilities(
+                    candidate,
+                    Some(&serde_json::json!({"codex_official_ws": true})),
+                ));
+            }
+        }
+
         super::hard_filter_candidates_for_codex_official_ws(&mut candidates);
 
-        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates.len(), 8);
         assert_eq!(candidates[0].key_id, "key-enabled");
     }
 

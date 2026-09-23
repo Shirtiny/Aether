@@ -5,7 +5,6 @@ use aether_contracts::{
 };
 use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
-use serde_json::Value;
 
 use super::snapshot::GatewayProviderTransportSnapshot;
 
@@ -101,58 +100,28 @@ pub enum CodexOfficialWsIneligibilityReason {
     ProviderInactive = 3,
     KeyAuthTypeUnsupported = 4,
     KeyInactive = 5,
-    AccountCapabilityMissing = 6,
-    AccountCapabilityDisabled = 7,
-    AccountCapabilityInvalid = 8,
-    WebsocketTransportProfileMissing = 9,
-    WebsocketTransportProfileInvalid = 10,
-    WebsocketTransportProfileSchemaUnsupported = 11,
-    WebsocketTransportProfileIdUnsupported = 12,
     EndpointInactive = 13,
     OfficialEndpointInvalid = 14,
     OfficialEndpointSchemeUnsupported = 15,
     OfficialEndpointHostUnsupported = 16,
     OfficialEndpointPortUnsupported = 17,
     OfficialEndpointPathUnsupported = 18,
-    WebsocketTransportProfileCodexCommitUnsupported = 19,
-    WebsocketTransportProfileTokioTungsteniteRevUnsupported = 20,
-    WebsocketTransportProfileTungsteniteRevUnsupported = 21,
-    WebsocketTransportProfileCryptoProviderUnsupported = 22,
-    WebsocketTransportProfileTungstenitePatchUnsupported = 23,
-    WebsocketTransportProfileWriteBufferSizeUnsupported = 24,
-    WebsocketTransportProfileMaxWriteBufferSizeUnsupported = 25,
-    WebsocketTransportProfileMaxRetainedWriteBufferCapacityUnsupported = 26,
     EndpointApiFormatUnsupported = 27,
 }
 
-const ALL_INELIGIBILITY_REASONS: [CodexOfficialWsIneligibilityReason; 28] = [
+const ALL_INELIGIBILITY_REASONS: [CodexOfficialWsIneligibilityReason; 13] = [
     CodexOfficialWsIneligibilityReason::GlobalDisabled,
     CodexOfficialWsIneligibilityReason::NativeCodexWsDisabled,
     CodexOfficialWsIneligibilityReason::ProviderTypeUnsupported,
     CodexOfficialWsIneligibilityReason::ProviderInactive,
     CodexOfficialWsIneligibilityReason::KeyAuthTypeUnsupported,
     CodexOfficialWsIneligibilityReason::KeyInactive,
-    CodexOfficialWsIneligibilityReason::AccountCapabilityMissing,
-    CodexOfficialWsIneligibilityReason::AccountCapabilityDisabled,
-    CodexOfficialWsIneligibilityReason::AccountCapabilityInvalid,
-    CodexOfficialWsIneligibilityReason::WebsocketTransportProfileMissing,
-    CodexOfficialWsIneligibilityReason::WebsocketTransportProfileInvalid,
-    CodexOfficialWsIneligibilityReason::WebsocketTransportProfileSchemaUnsupported,
-    CodexOfficialWsIneligibilityReason::WebsocketTransportProfileIdUnsupported,
     CodexOfficialWsIneligibilityReason::EndpointInactive,
     CodexOfficialWsIneligibilityReason::OfficialEndpointInvalid,
     CodexOfficialWsIneligibilityReason::OfficialEndpointSchemeUnsupported,
     CodexOfficialWsIneligibilityReason::OfficialEndpointHostUnsupported,
     CodexOfficialWsIneligibilityReason::OfficialEndpointPortUnsupported,
     CodexOfficialWsIneligibilityReason::OfficialEndpointPathUnsupported,
-    CodexOfficialWsIneligibilityReason::WebsocketTransportProfileCodexCommitUnsupported,
-    CodexOfficialWsIneligibilityReason::WebsocketTransportProfileTokioTungsteniteRevUnsupported,
-    CodexOfficialWsIneligibilityReason::WebsocketTransportProfileTungsteniteRevUnsupported,
-    CodexOfficialWsIneligibilityReason::WebsocketTransportProfileCryptoProviderUnsupported,
-    CodexOfficialWsIneligibilityReason::WebsocketTransportProfileTungstenitePatchUnsupported,
-    CodexOfficialWsIneligibilityReason::WebsocketTransportProfileWriteBufferSizeUnsupported,
-    CodexOfficialWsIneligibilityReason::WebsocketTransportProfileMaxWriteBufferSizeUnsupported,
-    CodexOfficialWsIneligibilityReason::WebsocketTransportProfileMaxRetainedWriteBufferCapacityUnsupported,
     CodexOfficialWsIneligibilityReason::EndpointApiFormatUnsupported,
 ];
 
@@ -312,9 +281,15 @@ pub fn resolve_codex_official_ws(
         reasons.insert(CodexOfficialWsIneligibilityReason::KeyInactive);
     }
 
-    let configured = resolve_account_capability(transport.key.capabilities.as_ref(), &mut reasons);
-    let profile_id =
-        resolve_websocket_transport_profile(transport.key.fingerprint.as_ref(), &mut reasons);
+    // Native Codex OAuth accounts always use the connector's built-in, pinned
+    // WS profile. Legacy account capability/profile metadata is not a gate.
+    let configured = transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("codex")
+        && transport.key.auth_type.trim().eq_ignore_ascii_case("oauth");
+    let profile_id = configured.then_some(CODEX_OFFICIAL_WS_PROFILE_ID);
 
     let profile_effective = reasons.is_empty();
     CodexOfficialWsResolution {
@@ -374,153 +349,6 @@ fn resolve_official_endpoint(
     {
         reasons.insert(CodexOfficialWsIneligibilityReason::OfficialEndpointPathUnsupported);
     }
-}
-
-fn resolve_account_capability(
-    capabilities: Option<&Value>,
-    reasons: &mut CodexOfficialWsIneligibilityReasons,
-) -> bool {
-    let Some(capabilities) = capabilities else {
-        reasons.insert(CodexOfficialWsIneligibilityReason::AccountCapabilityMissing);
-        return false;
-    };
-    let Some(capabilities) = capabilities.as_object() else {
-        reasons.insert(CodexOfficialWsIneligibilityReason::AccountCapabilityInvalid);
-        return false;
-    };
-    let Some(capability) = capabilities.get(CODEX_OFFICIAL_WS_CAPABILITY) else {
-        reasons.insert(CodexOfficialWsIneligibilityReason::AccountCapabilityMissing);
-        return false;
-    };
-    match capability.as_bool() {
-        Some(true) => true,
-        Some(false) => {
-            reasons.insert(CodexOfficialWsIneligibilityReason::AccountCapabilityDisabled);
-            false
-        }
-        None => {
-            reasons.insert(CodexOfficialWsIneligibilityReason::AccountCapabilityInvalid);
-            false
-        }
-    }
-}
-
-fn resolve_websocket_transport_profile(
-    fingerprint: Option<&Value>,
-    reasons: &mut CodexOfficialWsIneligibilityReasons,
-) -> Option<&'static str> {
-    let Some(fingerprint) = fingerprint else {
-        reasons.insert(CodexOfficialWsIneligibilityReason::WebsocketTransportProfileMissing);
-        return None;
-    };
-    let Some(fingerprint) = fingerprint.as_object() else {
-        reasons.insert(CodexOfficialWsIneligibilityReason::WebsocketTransportProfileInvalid);
-        return None;
-    };
-    let Some(profile) = fingerprint.get(CODEX_OFFICIAL_WS_PROFILE_FINGERPRINT_KEY) else {
-        reasons.insert(CodexOfficialWsIneligibilityReason::WebsocketTransportProfileMissing);
-        return None;
-    };
-    let Some(profile) = profile.as_object() else {
-        reasons.insert(CodexOfficialWsIneligibilityReason::WebsocketTransportProfileInvalid);
-        return None;
-    };
-
-    let schema_matches = profile.get("schema_version").and_then(Value::as_u64)
-        == Some(CODEX_OFFICIAL_WS_PROFILE_SCHEMA_VERSION);
-    if !schema_matches {
-        reasons
-            .insert(CodexOfficialWsIneligibilityReason::WebsocketTransportProfileSchemaUnsupported);
-    }
-
-    let profile_matches =
-        profile.get("profile_id").and_then(Value::as_str) == Some(CODEX_OFFICIAL_WS_PROFILE_ID);
-    if !profile_matches {
-        reasons.insert(CodexOfficialWsIneligibilityReason::WebsocketTransportProfileIdUnsupported);
-    }
-
-    let codex_commit_matches =
-        profile.get("codex_commit").and_then(Value::as_str) == Some(CODEX_OFFICIAL_WS_CODEX_COMMIT);
-    if !codex_commit_matches {
-        reasons.insert(
-            CodexOfficialWsIneligibilityReason::WebsocketTransportProfileCodexCommitUnsupported,
-        );
-    }
-
-    let tokio_tungstenite_rev_matches =
-        profile.get("tokio_tungstenite_rev").and_then(Value::as_str)
-            == Some(CODEX_OFFICIAL_WS_TOKIO_TUNGSTENITE_REV);
-    if !tokio_tungstenite_rev_matches {
-        reasons.insert(
-            CodexOfficialWsIneligibilityReason::WebsocketTransportProfileTokioTungsteniteRevUnsupported,
-        );
-    }
-
-    let tungstenite_rev_matches = profile.get("tungstenite_rev").and_then(Value::as_str)
-        == Some(CODEX_OFFICIAL_WS_TUNGSTENITE_REV);
-    if !tungstenite_rev_matches {
-        reasons.insert(
-            CodexOfficialWsIneligibilityReason::WebsocketTransportProfileTungsteniteRevUnsupported,
-        );
-    }
-
-    let crypto_provider_matches = profile.get("crypto_provider").and_then(Value::as_str)
-        == Some(CODEX_OFFICIAL_WS_CRYPTO_PROVIDER);
-    if !crypto_provider_matches {
-        reasons.insert(
-            CodexOfficialWsIneligibilityReason::WebsocketTransportProfileCryptoProviderUnsupported,
-        );
-    }
-
-    let tungstenite_patch_matches = profile.get("tungstenite_patch_id").and_then(Value::as_str)
-        == Some(CODEX_OFFICIAL_WS_TUNGSTENITE_PATCH_ID);
-    if !tungstenite_patch_matches {
-        reasons.insert(
-            CodexOfficialWsIneligibilityReason::WebsocketTransportProfileTungstenitePatchUnsupported,
-        );
-    }
-
-    let write_buffer_size_matches = profile
-        .get("write_buffer_size_bytes")
-        .and_then(Value::as_u64)
-        == Some(CODEX_OFFICIAL_WS_WRITE_BUFFER_SIZE_BYTES as u64);
-    if !write_buffer_size_matches {
-        reasons.insert(
-            CodexOfficialWsIneligibilityReason::WebsocketTransportProfileWriteBufferSizeUnsupported,
-        );
-    }
-
-    let max_write_buffer_size_matches = profile
-        .get("max_write_buffer_size_bytes")
-        .and_then(Value::as_u64)
-        == Some(CODEX_OFFICIAL_WS_MAX_WRITE_BUFFER_SIZE_BYTES as u64);
-    if !max_write_buffer_size_matches {
-        reasons.insert(
-            CodexOfficialWsIneligibilityReason::WebsocketTransportProfileMaxWriteBufferSizeUnsupported,
-        );
-    }
-
-    let max_retained_write_buffer_capacity_matches = profile
-        .get("max_retained_write_buffer_capacity_bytes")
-        .and_then(Value::as_u64)
-        == Some(CODEX_OFFICIAL_WS_MAX_RETAINED_WRITE_BUFFER_CAPACITY_BYTES as u64);
-    if !max_retained_write_buffer_capacity_matches {
-        reasons.insert(
-            CodexOfficialWsIneligibilityReason::WebsocketTransportProfileMaxRetainedWriteBufferCapacityUnsupported,
-        );
-    }
-
-    (schema_matches
-        && profile_matches
-        && codex_commit_matches
-        && tokio_tungstenite_rev_matches
-        && tungstenite_rev_matches
-        && crypto_provider_matches
-        && tungstenite_patch_matches
-        && write_buffer_size_matches
-        && max_write_buffer_size_matches
-        && max_retained_write_buffer_capacity_matches)
-        .then_some(CODEX_OFFICIAL_WS_PROFILE_ID)
 }
 
 #[cfg(test)]
@@ -786,7 +614,7 @@ mod tests {
 
     #[test]
     fn rejects_every_invalid_cartesian_configuration() {
-        const DIMENSIONS: usize = 14;
+        const DIMENSIONS: usize = 7;
         for mask in 0usize..(1usize << DIMENSIONS) {
             let mut transport = valid_transport();
             let flags = CodexOfficialWsGlobalFlags {
@@ -802,47 +630,6 @@ mod tests {
             if mask & (1 << 6) == 0 {
                 transport.key.auth_type = "api_key".to_string();
             }
-            transport.key.capabilities = Some(json!({
-                "codex_official_ws": mask & (1 << 7) != 0
-            }));
-            transport.key.fingerprint = Some(json!({
-                "websocket_transport_profile": {
-                    "schema_version": if mask & (1 << 8) != 0 {
-                        CODEX_OFFICIAL_WS_PROFILE_SCHEMA_VERSION
-                    } else {
-                        CODEX_OFFICIAL_WS_PROFILE_SCHEMA_VERSION + 1
-                    },
-                    "profile_id": if mask & (1 << 9) != 0 {
-                        CODEX_OFFICIAL_WS_PROFILE_ID
-                    } else {
-                        "unsupported-profile"
-                    },
-                    "codex_commit": if mask & (1 << 10) != 0 {
-                        CODEX_OFFICIAL_WS_CODEX_COMMIT
-                    } else {
-                        "unsupported-codex-commit"
-                    },
-                    "tokio_tungstenite_rev": if mask & (1 << 11) != 0 {
-                        CODEX_OFFICIAL_WS_TOKIO_TUNGSTENITE_REV
-                    } else {
-                        "unsupported-tokio-tungstenite-rev"
-                    },
-                    "tungstenite_rev": if mask & (1 << 12) != 0 {
-                        CODEX_OFFICIAL_WS_TUNGSTENITE_REV
-                    } else {
-                        "unsupported-tungstenite-rev"
-                    },
-                    "tungstenite_patch_id": CODEX_OFFICIAL_WS_TUNGSTENITE_PATCH_ID,
-                    "write_buffer_size_bytes": CODEX_OFFICIAL_WS_WRITE_BUFFER_SIZE_BYTES,
-                    "max_write_buffer_size_bytes": CODEX_OFFICIAL_WS_MAX_WRITE_BUFFER_SIZE_BYTES,
-                    "max_retained_write_buffer_capacity_bytes": CODEX_OFFICIAL_WS_MAX_RETAINED_WRITE_BUFFER_CAPACITY_BYTES,
-                    "crypto_provider": if mask & (1 << 13) != 0 {
-                        CODEX_OFFICIAL_WS_CRYPTO_PROVIDER
-                    } else {
-                        "unsupported-crypto-provider"
-                    },
-                }
-            }));
 
             let result = resolve_codex_official_ws(&transport, flags);
             let all_dimensions_valid = mask == (1usize << DIMENSIONS) - 1;
@@ -929,98 +716,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_each_missing_immutable_profile_manifest_field() {
-        let cases = [
-            (
-                "codex_commit",
-                CodexOfficialWsIneligibilityReason::WebsocketTransportProfileCodexCommitUnsupported,
-            ),
-            (
-                "tokio_tungstenite_rev",
-                CodexOfficialWsIneligibilityReason::WebsocketTransportProfileTokioTungsteniteRevUnsupported,
-            ),
-            (
-                "tungstenite_rev",
-                CodexOfficialWsIneligibilityReason::WebsocketTransportProfileTungsteniteRevUnsupported,
-            ),
-            (
-                "crypto_provider",
-                CodexOfficialWsIneligibilityReason::WebsocketTransportProfileCryptoProviderUnsupported,
-            ),
-            (
-                "tungstenite_patch_id",
-                CodexOfficialWsIneligibilityReason::WebsocketTransportProfileTungstenitePatchUnsupported,
-            ),
-            (
-                "write_buffer_size_bytes",
-                CodexOfficialWsIneligibilityReason::WebsocketTransportProfileWriteBufferSizeUnsupported,
-            ),
-            (
-                "max_write_buffer_size_bytes",
-                CodexOfficialWsIneligibilityReason::WebsocketTransportProfileMaxWriteBufferSizeUnsupported,
-            ),
-            (
-                "max_retained_write_buffer_capacity_bytes",
-                CodexOfficialWsIneligibilityReason::WebsocketTransportProfileMaxRetainedWriteBufferCapacityUnsupported,
-            ),
-        ];
-
-        for (field, reason) in cases {
-            let mut transport = valid_transport();
-            transport
-                .key
-                .fingerprint
-                .as_mut()
-                .and_then(Value::as_object_mut)
-                .and_then(|fingerprint| fingerprint.get_mut("websocket_transport_profile"))
-                .and_then(Value::as_object_mut)
-                .expect("valid profile should exist")
-                .remove(field);
-
-            let result = resolve_codex_official_ws(&transport, enabled_flags());
-            assert!(
-                !result.profile_effective,
-                "profile unexpectedly eligible without {field}"
-            );
-            assert!(result.reasons.contains(reason));
-            assert_eq!(result.profile_id, None);
+    fn all_codex_oauth_accounts_use_the_builtin_ws_profile() {
+        for capabilities in [
+            None,
+            Some(json!({})),
+            Some(json!({"codex_official_ws": false})),
+            Some(json!({"codex_official_ws": "invalid"})),
+            Some(json!({"codex_official_ws": true})),
+        ] {
+            for fingerprint in [
+                None,
+                Some(json!({})),
+                Some(json!({"websocket_transport_profile": "invalid"})),
+                Some(json!({"websocket_transport_profile": {"profile_id": "outdated"}})),
+                valid_transport().key.fingerprint,
+            ] {
+                let mut transport = valid_transport();
+                transport.key.capabilities = capabilities.clone();
+                transport.key.fingerprint = fingerprint;
+                let result = resolve_codex_official_ws(&transport, enabled_flags());
+                assert!(result.configured);
+                assert!(result.profile_effective);
+                assert!(result.reasons.is_empty());
+                assert_eq!(result.profile_id, Some(CODEX_OFFICIAL_WS_PROFILE_ID));
+            }
         }
-    }
-
-    #[test]
-    fn reports_missing_invalid_and_disabled_account_configuration_separately() {
-        let mut transport = valid_transport();
-        transport.key.capabilities = None;
-        transport.key.fingerprint = None;
-        let missing = resolve_codex_official_ws(&transport, enabled_flags());
-        assert!(!missing.configured);
-        assert!(missing
-            .reasons
-            .contains(CodexOfficialWsIneligibilityReason::AccountCapabilityMissing));
-        assert!(missing
-            .reasons
-            .contains(CodexOfficialWsIneligibilityReason::WebsocketTransportProfileMissing));
-
-        transport.key.capabilities = Some(json!({"codex_official_ws": "true"}));
-        transport.key.fingerprint = Some(json!({
-            "websocket_transport_profile": CODEX_OFFICIAL_WS_PROFILE_ID
-        }));
-        let invalid = resolve_codex_official_ws(&transport, enabled_flags());
-        assert!(!invalid.configured);
-        assert!(invalid
-            .reasons
-            .contains(CodexOfficialWsIneligibilityReason::AccountCapabilityInvalid));
-        assert!(invalid
-            .reasons
-            .contains(CodexOfficialWsIneligibilityReason::WebsocketTransportProfileInvalid));
-
-        transport.key.capabilities = Some(json!({"codex_official_ws": false}));
-        transport.key.fingerprint = valid_transport().key.fingerprint;
-        let disabled = resolve_codex_official_ws(&transport, enabled_flags());
-        assert!(!disabled.configured);
-        assert!(disabled
-            .reasons
-            .contains(CodexOfficialWsIneligibilityReason::AccountCapabilityDisabled));
     }
 
     #[test]
@@ -1128,12 +848,12 @@ mod tests {
     }
 
     #[test]
-    fn websocket_account_switch_does_not_change_http_transport_eligibility() {
+    fn legacy_ws_switch_does_not_disable_ws_or_http_transport() {
         let mut transport = valid_transport();
         transport.key.capabilities = Some(json!({"codex_official_ws": false}));
 
         let ws = resolve_codex_official_ws(&transport, enabled_flags());
-        assert!(!ws.profile_effective);
+        assert!(ws.profile_effective);
         assert!(
             crate::policy::supports_local_standard_transport_with_network(
                 &transport,

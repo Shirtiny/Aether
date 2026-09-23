@@ -192,7 +192,7 @@ async fn codex_ws_hard_filter_runs_before_runtime_catalog_and_quota_reads() {
     rejected.endpoint_api_format = "openai:responses".to_string();
     rejected.endpoint_kind = Some("responses".to_string());
     rejected.key_id = "key-rejected".to_string();
-    rejected.key_auth_type = "oauth".to_string();
+    rejected.key_auth_type = "api_key".to_string();
     rejected.key_api_formats = Some(vec!["openai:responses".to_string()]);
     rejected.key_capabilities = Some(serde_json::json!({"codex_official_ws": "true"}));
 
@@ -201,7 +201,8 @@ async fn codex_ws_hard_filter_runs_before_runtime_catalog_and_quota_reads() {
     accepted.provider_name = "provider-accepted".to_string();
     accepted.endpoint_id = "endpoint-accepted".to_string();
     accepted.key_id = "key-accepted".to_string();
-    accepted.key_capabilities = Some(serde_json::json!({"codex_official_ws": true}));
+    accepted.key_auth_type = "oauth".to_string();
+    accepted.key_capabilities = None;
 
     let rows = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
         rejected, accepted,

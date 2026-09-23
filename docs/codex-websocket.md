@@ -181,80 +181,31 @@ API 的 `responses_websocket_enabled` 布尔字段设置。关闭后只退出 WS
 
 1. Provider 类型精确为 `codex`，Provider 启用且 Provider 级 WS 开关开启；
 2. Key 的 `auth_type` 为 `oauth`，且 Key 启用；
-3. `capabilities.codex_official_ws=true`；
-4. Key 携带完整且精确匹配的 schema-3 transport profile；
-5. Endpoint 启用且 API 格式为 `openai:responses`；
-6. Endpoint 为 HTTPS、`chatgpt.com:443`；
-7. base path 为 `/backend-api/codex`，允许一个结尾 `/`；
-8. Endpoint 没有 query、fragment 或自定义 path 覆盖；
-9. 正常的模型、配额、熔断、代理和并发检查通过。
+3. Endpoint 启用且 API 格式为 `openai:responses`；
+4. Endpoint 为 HTTPS、`chatgpt.com:443`；
+5. base path 为 `/backend-api/codex`，允许一个结尾 `/`；
+6. Endpoint 没有 query、fragment 或自定义 path 覆盖；
+7. 正常的模型、配额、熔断、代理和并发检查通过。
+
+所有 Codex OAuth 账号默认支持 WS，统一使用连接器内置的固定 transport profile。
+新导入账号、没有 WS 元数据的旧账号及曾关闭 WS 的账号均无需手动开启；历史
+`capabilities.codex_official_ws` 和 `fingerprint.websocket_transport_profile` 不再参与
+资格判断，也无需数据库回填。全局与 Provider 级 WS 开关仍然有效。
 
 `profile_effective=true` 只说明静态条件成立，不代表某次真实请求必然可调度。
 
 ### 4.3 Codex 管理界面
 
-进入 **Admin -> Pool Management**，找到 Codex OAuth 账号：
+**Admin -> Pool Management** 不再提供单账号或批量 WS 开关。
+Codex OAuth 账号显示“WS 默认支持”；账号停用时显示“WS 不可调度”。
+此标签不是对请求模型、代理、额度等运行时资格的保证。
 
-- 单个账号使用“启用账号级 Codex WS”；
-- 批量操作使用“启用 Codex WS”；
-- “关闭账号级 Codex WS”只软排空 WS，不改变 HTTP 调度状态。
+### 4.4 旧账号级 API
 
-管理界面会自动写入固定 profile，操作员不应手工拼装 fingerprint。
-
-### 4.4 Codex 单账号 API
-
-启用：
-
-```http
-PUT /api/admin/endpoints/keys/{key_id}/codex-ws
-Content-Type: application/json
-
-{
-  "enabled": true,
-  "profile_id": "codex-ws-0.144.1-linux-x64-rustls023-aws-lc-caenv1-wbufret256k1"
-}
-```
-
-关闭：
-
-```json
-{
-  "enabled": false
-}
-```
-
-启用操作原子合并现有 Key JSON，并写入：
-
-- `capabilities.codex_official_ws=true`；
-- `fingerprint.websocket_transport_profile` 的完整固定 manifest。
-
-关闭时写入 `capabilities.codex_official_ws=false`，保留固定 manifest 和其他无关字段。
-响应中的关键字段：
-
-| 字段 | 含义 |
-|---|---|
-| `configured` | 账号级 capability 是否开启 |
-| `profile_effective` | 静态 profile 与 Endpoint 是否匹配 |
-| `runtime_eligible` | 当前是否已知可运行；缺少具体请求上下文时为 `null` |
-| `profile_id` | 当前固定 profile ID |
-| `runtime_state` | `request_scoped`、`profile_blocked`、`soft_draining` 或 `hard_revoked` |
-| `profile_reasons` | 静态不满足原因 |
-| `runtime_reasons` | 配额、代理、模型、熔断、并发等运行期原因 |
-
-### 4.5 Codex 批量 API
-
-```http
-POST /api/admin/pool/{provider_id}/keys/batch-action
-Content-Type: application/json
-
-{
-  "key_ids": ["key-1", "key-2"],
-  "action": "enable_codex_ws"
-}
-```
-
-关闭时使用 `disable_codex_ws`。批量操作只处理 Codex OAuth Key；不匹配的账号会跳过
-或返回明确错误，不会被转换成其他认证类型。
+`PUT /api/admin/endpoints/keys/{key_id}/codex-ws` 已退役，返回 `410 Gone`，不再写入元数据。
+批量操作 `enable_codex_ws`、`disable_codex_ws`、`drain_codex_ws` 均返回明确错误。
+需要停止某个账号的所有调度时使用账号停用；只停止 WS 而保留 HTTP 时使用 Provider 级
+Responses WebSocket 开关或全局 WS 熔断。
 
 ## 5. 官方 TLS 和 WebSocket profile
 
@@ -496,15 +447,13 @@ codex_ws_usage_event_build_failed
 terminal 类型、Provider write 状态、queue depth、TTFT 和总耗时。禁止记录 prompt、
 OAuth token、Aether API Key、代理凭据、完整 Provider body 或官方账号原始 ID。
 
-管理 API 返回的常见静态原因包括：
+传输资格判定的常见静态原因包括：
 
 ```text
 global_disabled
 native_codex_ws_disabled
 provider_type_unsupported
 key_auth_type_unsupported
-account_capability_disabled
-websocket_transport_profile_invalid
 official_endpoint_host_unsupported
 official_endpoint_path_unsupported
 endpoint_api_format_unsupported
@@ -513,9 +462,9 @@ endpoint_api_format_unsupported
 ## 10. 与 sub2api 的对应配置
 
 Aether 隐藏全局熔断缺省开启。sub2api 的基础 router v2、Responses WS v2、API Key WS
-和 Aether route-v1 也缺省开启，管理员日常只需启用两端账号开关：
+和 Aether route-v1 也缺省开启，管理员需确认：
 
-- Aether Codex OAuth Key 的“启用账号级 Codex WS”；
+- Aether Provider 级 Responses WebSocket 开关已开启，Codex OAuth 账号默认支持 WS；
 - 对应 sub2api Aether API Key 账号的“作为 Aether WS 账号”。
 
 `gateway.openai_ws.mode_router_v2_enabled`、`responses_websockets_v2`、
@@ -542,14 +491,13 @@ http://aether:8080/v1
 2. 将同一版本部署到所有 gateway，确认集群中不再有旧 writer；
 3. 验证所有实例都在目录写入时发布 `codex-ws:catalog-fence:v2:*`，并使用共享目录写锁；
 4. 验证数据库没有意外 pending migration，并确认 `codex_ws` 没有损坏值；
-5. 将两个全局 gate 恢复为 `true`，对一个 Codex OAuth Key 启用账号级 WS；
-6. 确认 `configured=true`、`profile_effective=true`、
-   `runtime_eligible=null`、`runtime_state=request_scoped`；
+5. 将两个全局 gate 恢复为 `true`，确认 Codex Provider 的 Responses WebSocket 开关已开启；
+6. 确认普通 Codex OAuth 账号无需 WS 元数据即可连接，停用账号仍被阻断；
 7. 打开一个 sub2api Aether 账号；
 8. 保持基础 route-v1 缺省开启，不打开 reconnect migration；
 9. 运行单 turn、多 turn、软排空、硬阻断、无关 Provider 更新和配额耗尽测试；
 10. 真实 reconnect fixture 通过后再打开 migration；
-11. 逐步扩大账号，同时观察连接延迟、503 reason、排空次数、结算延迟和 RSS。
+11. 验证完成后观察连接延迟、503 reason、排空次数、结算延迟和 RSS。
 
 如果必须保证链路始终经过 Aether，sub2api 客户端所属组必须是 Aether-only。混合组允许
 调度器在故障时切换到非 Aether 官方账号，这是设计行为。
@@ -559,7 +507,8 @@ http://aether:8080/v1
 最小影响顺序：
 
 1. 在 sub2api 关闭单个 Aether 账号，或显式关闭 `aether_route_control_enabled`；
-2. 在 Aether 关闭受影响 Codex Key 的账号级 WS；
+2. 在 Aether 关闭受影响 Provider 的 Responses WebSocket 开关（保留 HTTP）；
+   若要停用单账号，使用账号停用（同时停止 HTTP 和 WS）；
 3. 向 Aether `codex_ws` 显式写入两个功能 gate 为 `false`，执行全局熔断；
 4. 若必须回退二进制版本，保持全局熔断，直到所有 gateway 都处于同一版本；
 5. 继续使用现有 HTTP/SSE 路由。

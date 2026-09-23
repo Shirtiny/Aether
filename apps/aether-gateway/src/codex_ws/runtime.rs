@@ -1290,7 +1290,7 @@ impl CodexWsRuntimePort for GatewayCodexWsRuntime {
         let parts = self
             .request_parts()
             .map_err(|_| StepPreparationError::retain("candidate_request_context_invalid"))?;
-        // Adapter eligibility is provider-scoped. Codex capability/profile
+        // Adapter eligibility is provider-scoped. Codex OAuth/endpoint
         // requirements are checked in preflight, while Standard providers use
         // their ordinary key contract.
         let required_capabilities = json!({});
