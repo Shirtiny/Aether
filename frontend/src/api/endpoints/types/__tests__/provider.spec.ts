@@ -13,6 +13,9 @@ describe('normalizePoolAdvancedConfig', () => {
     expect(normalizePoolAdvancedConfig({ sticky_collateral_avoidance_enabled: true })).toEqual({
       sticky_collateral_avoidance_enabled: true,
     })
+    expect(normalizePoolAdvancedConfig({ sticky_concurrency_wait_enabled: true })).toEqual({
+      sticky_concurrency_wait_enabled: true,
+    })
     expect(normalizePoolAdvancedConfig({ avoid_anonymous: true })).toEqual({
       avoid_anonymous: true,
     })

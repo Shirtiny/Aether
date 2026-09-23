@@ -83,6 +83,7 @@ const PROVIDER_DRAIN_POOL_ADVANCED_KEYS: &[&str] = &[
     "skip_exhausted_accounts",
     "sticky_account_collateral_avoidance_enabled",
     "sticky_collateral_avoidance_enabled",
+    "sticky_concurrency_wait_enabled",
     "sticky_session_ttl_seconds",
     "stream_timeout_cooldown_seconds",
     "stream_timeout_threshold",
@@ -363,6 +364,18 @@ mod tests {
             "risk_control_session_avoidance": {"mode": "block"}
         }));
 
+        assert_eq!(
+            classify_provider_update(&before, &after),
+            Some(CatalogMutationImpact::Drain)
+        );
+    }
+
+    #[test]
+    fn sticky_concurrency_wait_change_drains_instead_of_hard_fencing() {
+        let before = provider(json!({"pool_advanced": {}}));
+        let after = provider(json!({
+            "pool_advanced": {"sticky_concurrency_wait_enabled": true}
+        }));
         assert_eq!(
             classify_provider_update(&before, &after),
             Some(CatalogMutationImpact::Drain)

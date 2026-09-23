@@ -488,6 +488,7 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             avoid_anonymous: false,
             codex_quota_exhaustion_basis: "weekly".to_string(),
             sticky_session_ttl_seconds: 0,
+            sticky_concurrency_wait_enabled: false,
             latency_window_seconds: 3600,
             latency_sample_limit: 50,
             cost_window_seconds: 18_000,
@@ -533,6 +534,10 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
             .get("sticky_session_ttl_seconds")
             .and_then(json_u64)
             .unwrap_or(0),
+        sticky_concurrency_wait_enabled: pool_advanced
+            .get("sticky_concurrency_wait_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         latency_window_seconds: pool_advanced
             .get("latency_window_seconds")
             .and_then(json_u64)
@@ -688,6 +693,29 @@ mod tests {
         let config = admin_provider_pool_config(&provider).expect("pool config should exist");
 
         assert_eq!(config.sticky_session_ttl_seconds, 0);
+    }
+
+    #[test]
+    fn sticky_concurrency_wait_is_explicitly_opt_in() {
+        for pool_advanced in [
+            json!(true),
+            json!({}),
+            json!({"sticky_concurrency_wait_enabled": null}),
+            json!({"sticky_concurrency_wait_enabled": false}),
+            json!({"sticky_concurrency_wait_enabled": "true"}),
+        ] {
+            let provider = sample_provider(json!({"pool_advanced": pool_advanced}));
+            let config = admin_provider_pool_config(&provider).expect("pool config");
+            assert!(!config.sticky_concurrency_wait_enabled);
+        }
+        let provider = sample_provider(json!({
+            "pool_advanced": {"sticky_concurrency_wait_enabled": true}
+        }));
+        assert!(
+            admin_provider_pool_config(&provider)
+                .unwrap()
+                .sticky_concurrency_wait_enabled
+        );
     }
 
     #[test]

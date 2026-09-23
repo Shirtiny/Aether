@@ -772,6 +772,8 @@ export interface PoolCodexRuntimeIdentityConfig {
 export interface PoolAdvancedConfig {
   global_priority?: number | null
   sticky_session_ttl_seconds?: number | null
+  /** 粘性账号并发满时最多等待 15 秒，超时后恢复正常选号。默认关闭。 */
+  sticky_concurrency_wait_enabled?: boolean | null
   load_threshold_percent?: number | null
   skip_exhausted_accounts?: boolean | null
   sticky_collateral_avoidance_enabled?: boolean | null

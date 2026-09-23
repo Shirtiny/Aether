@@ -1052,6 +1052,7 @@ mod tests {
             avoid_anonymous: false,
             codex_quota_exhaustion_basis: "weekly".to_string(),
             sticky_session_ttl_seconds: 120,
+            sticky_concurrency_wait_enabled: false,
             latency_window_seconds: 600,
             latency_sample_limit: 10,
             cost_window_seconds: 600,

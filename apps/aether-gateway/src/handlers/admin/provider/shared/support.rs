@@ -40,6 +40,7 @@ pub(crate) struct AdminProviderPoolConfig {
     pub(crate) avoid_anonymous: bool,
     pub(crate) codex_quota_exhaustion_basis: String,
     pub(crate) sticky_session_ttl_seconds: u64,
+    pub(crate) sticky_concurrency_wait_enabled: bool,
     pub(crate) latency_window_seconds: u64,
     pub(crate) latency_sample_limit: u64,
     pub(crate) cost_window_seconds: u64,

@@ -27,8 +27,8 @@ use aether_scheduler_core::{
     candidate_runtime_skip_reason_with_state, CandidateRuntimeSelectabilityInput,
 };
 use tokio::sync::Semaphore;
-use tokio::time::{sleep, Duration};
-use tracing::{debug, warn};
+use tokio::time::{sleep, Duration, Instant};
+use tracing::{debug, info, warn};
 
 use crate::ai_serving::{
     candidate_auth_channel_skip_reason, candidate_common_transport_skip_reason,
@@ -62,6 +62,8 @@ const POOL_SCORE_SCHEDULE_INTEREST_MAX_PER_BATCH: usize = 16;
 const POOL_SCORE_SCHEDULE_INTEREST_MIN_INTERVAL_SECS: u64 = 60;
 const POOL_STICKY_INIT_WAIT_INTERVAL_MS: u64 = 25;
 const POOL_STICKY_INIT_LOCK_TTL_SECS: u64 = 30;
+const POOL_STICKY_CONCURRENCY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const POOL_STICKY_CONCURRENCY_WAIT_INTERVAL: Duration = Duration::from_millis(500);
 
 type PoolCatalogKeyContext = PoolMemberSignals;
 
@@ -523,6 +525,7 @@ pub(crate) struct PoolKeyCursor<'a> {
     sticky_bound_key_ineligible_reason: Option<&'static str>,
     batched_transport_reads: bool,
     key_runtime_snapshot: Option<PoolKeyRuntimeSnapshot>,
+    sticky_concurrency_wait_deadline: Option<Instant>,
 }
 
 impl<'a> PoolKeyCursor<'a> {
@@ -604,6 +607,7 @@ impl<'a> PoolKeyCursor<'a> {
             sticky_bound_key_ineligible_reason: None,
             batched_transport_reads: false,
             key_runtime_snapshot: None,
+            sticky_concurrency_wait_deadline: None,
         }
     }
 
@@ -1075,6 +1079,80 @@ impl<'a> PoolKeyCursor<'a> {
     }
 
     async fn sticky_candidate(&mut self) -> StickyCandidateLookup {
+        let wait_enabled = pool_config_for_candidate(&self.group)
+            .is_some_and(|config| config.sticky_concurrency_wait_enabled);
+        // Leave at least half of the existing planning budget for fallback selection.
+        // Extending the outer guard here would change timeout behavior for other pools.
+        let wait_timeout = POOL_STICKY_CONCURRENCY_WAIT_TIMEOUT.min(
+            self.state
+                .app()
+                .frontdoor_runtime_guards
+                .local_execution_planning_timeout
+                / 2,
+        );
+        let mut waited = false;
+        loop {
+            let lookup = self.lookup_sticky_candidate().await;
+            let bound_key_id = match &lookup {
+                StickyCandidateLookup::Ineligible {
+                    bound_key_id,
+                    reason,
+                } if wait_enabled && *reason == "provider_key_concurrency_limit_reached" => {
+                    bound_key_id
+                }
+                _ => {
+                    if waited {
+                        info!(
+                            event_name = "pool_sticky_concurrency_wait_finished",
+                            provider_id = %self.group.candidate.provider_id,
+                            result = if matches!(&lookup, StickyCandidateLookup::Candidate(_)) {
+                                "available"
+                            } else {
+                                "unavailable"
+                            },
+                            "sticky account concurrency wait ended"
+                        );
+                    }
+                    return lookup;
+                }
+            };
+            // One budget for the entire cursor, including repeated sticky/init lookups.
+            // Do not invalidate or rebind the session, or hold an init lock while waiting.
+            let deadline = *self
+                .sticky_concurrency_wait_deadline
+                .get_or_insert_with(|| Instant::now() + wait_timeout);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if waited {
+                    info!(
+                        event_name = "pool_sticky_concurrency_wait_finished",
+                        provider_id = %self.group.candidate.provider_id,
+                        key_id = %bound_key_id,
+                        result = "timeout",
+                        "sticky account concurrency wait timed out; resuming pool selection"
+                    );
+                }
+                return lookup;
+            }
+            if !waited {
+                info!(
+                    event_name = "pool_sticky_concurrency_wait_started",
+                    provider_id = %self.group.candidate.provider_id,
+                    key_id = %bound_key_id,
+                    timeout_ms = wait_timeout.as_millis() as u64,
+                    "waiting for a concurrency slot on the sticky account"
+                );
+                waited = true;
+            }
+            sleep(remaining.min(POOL_STICKY_CONCURRENCY_WAIT_INTERVAL)).await;
+            // The normal cursor freezes this snapshot. Waiting must observe completed
+            // streams and re-read binding, account health, quota and cooldown each time.
+            self.key_runtime_snapshot = None;
+            self.ensure_key_runtime_snapshot().await;
+        }
+    }
+
+    async fn lookup_sticky_candidate(&mut self) -> StickyCandidateLookup {
         let Some(pool_config) = pool_config_for_candidate(&self.group) else {
             return StickyCandidateLookup::Missing;
         };
@@ -1203,6 +1281,50 @@ impl<'a> PoolKeyCursor<'a> {
                 .as_ref()
                 .expect("pool key runtime snapshot should be initialized"),
         ) {
+            if reason == "provider_key_concurrency_limit_reached"
+                && pool_config.sticky_concurrency_wait_enabled
+            {
+                // Concurrency is checked before other runtime/transport gates. Never
+                // wait for an account that this request cannot use even with a slot.
+                let mut without_concurrency = provider_key_runtime_states;
+                if let Some(key) = without_concurrency.get_mut(&sticky_key_id) {
+                    key.concurrent_limit = None;
+                }
+                if let Some(reason) = pool_candidate_key_runtime_skip_reason(
+                    self.state,
+                    &candidate,
+                    &without_concurrency,
+                    self.key_runtime_snapshot
+                        .as_ref()
+                        .expect("runtime snapshot"),
+                ) {
+                    return StickyCandidateLookup::Ineligible {
+                        bound_key_id: sticky_key_id,
+                        reason,
+                    };
+                }
+                if self
+                    .routing_overlay
+                    .as_ref()
+                    .is_some_and(|overlay| !overlay.key_allowed(sticky_key_id.as_str()))
+                {
+                    return StickyCandidateLookup::Ineligible {
+                        bound_key_id: sticky_key_id,
+                        reason: ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON,
+                    };
+                }
+                let transport = read_candidate_transport_snapshot(self.state, &candidate).await;
+                // Unlike build_eligible_candidate, this does not consume seen_key_ids.
+                if self
+                    .build_eligible_candidate_from_transport(candidate, transport)
+                    .is_none()
+                {
+                    return StickyCandidateLookup::Ineligible {
+                        bound_key_id: sticky_key_id,
+                        reason: "pool_sticky_bound_key_unavailable",
+                    };
+                }
+            }
             return StickyCandidateLookup::Ineligible {
                 bound_key_id: sticky_key_id,
                 reason,
@@ -2292,7 +2414,8 @@ mod tests {
         StoredMinimalCandidateSelectionRow, StoredPoolKeyCandidateOrder,
     };
     use aether_data_contracts::repository::candidates::{
-        RequestCandidateStatus, StoredRequestCandidate,
+        RequestCandidateStatus, RequestCandidateWriteRepository, StoredRequestCandidate,
+        UpsertRequestCandidateRecord,
     };
     use aether_data_contracts::repository::pool_scores::{
         PoolMemberHardState, PoolMemberIdentity, PoolMemberProbeStatus, StoredPoolMemberScore,
@@ -5006,6 +5129,317 @@ mod tests {
         assert!(skipped.iter().all(|candidate| {
             candidate.skip_reason == aether_pool_core::POOL_ACCOUNT_EXHAUSTED_SKIP_REASON
         }));
+    }
+
+    async fn sticky_concurrency_fixture(
+        enabled: Option<bool>,
+        ttl: u64,
+    ) -> (
+        AppState,
+        EligibleLocalExecutionCandidate,
+        (
+            Arc<InMemoryRequestCandidateRepository>,
+            UpsertRequestCandidateRecord,
+        ),
+    ) {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "sticky_session_ttl_seconds": ttl,
+                "sticky_concurrency_wait_enabled": enabled,
+                "scheduling_presets": [{"preset": "no_weight", "enabled": true}]
+            }
+        }));
+        let (provider, endpoint, mut keys, rows) = large_pool_fixture(2, provider_config.clone());
+        keys[0].concurrent_limit = Some(1);
+        keys[1].concurrent_limit = Some(1);
+        let now = crate::clock::current_unix_ms();
+        let active: UpsertRequestCandidateRecord = serde_json::from_value(json!({
+            "id": "active-candidate", "request_id": "active-request",
+            "candidate_index": 0, "retry_index": 0,
+            "provider_id": "provider-pool", "endpoint_id": "endpoint-1",
+            "key_id": "key-00000", "status": "streaming",
+            "created_at_unix_ms": now, "started_at_unix_ms": now
+        }))
+        .expect("active candidate");
+        let candidates = Arc::new(InMemoryRequestCandidateRepository::default());
+        candidates
+            .upsert(active.clone())
+            .await
+            .expect("seed active stream");
+        let data = GatewayDataState::with_candidate_selection_provider_catalog_quota_and_request_candidates_for_tests(
+            Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            Arc::new(InMemoryProviderCatalogReadRepository::seed(vec![provider], vec![endpoint], keys)),
+            Arc::new(InMemoryProviderQuotaRepository::seed(Vec::new())),
+            candidates.clone(),
+        ).with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("app")
+            .with_data_state_for_tests(data);
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config,
+        );
+        record_admin_provider_pool_success(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            "key-00000",
+            &pool_config_for_candidate(&group).unwrap(),
+            Some("session-1"),
+            None,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await;
+        (app, group, (candidates, active))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sticky_concurrency_wait_disabled_preserves_immediate_failover() {
+        for enabled in [None, Some(false)] {
+            let (app, group, _) = sticky_concurrency_fixture(enabled, 120).await;
+            let mut cursor = PoolKeyCursor::new(
+                PlannerAppState::new(&app),
+                group,
+                Some("session-1"),
+                None,
+                None,
+            );
+            let start = tokio::time::Instant::now();
+            let candidate = cursor.next_key().await.expect("fallback key");
+            assert_eq!(candidate.candidate.key_id, "key-00001");
+            assert_eq!(start.elapsed(), Duration::ZERO);
+            assert_eq!(
+                candidate
+                    .orchestration
+                    .pool_sticky_bound_key_ineligible_reason
+                    .as_deref(),
+                Some("provider_key_concurrency_limit_reached")
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sticky_concurrency_wait_reuses_account_after_stream_finishes() {
+        let (app, group, (candidates, mut active)) =
+            sticky_concurrency_fixture(Some(true), 120).await;
+        let config = pool_config_for_candidate(&group).unwrap();
+        let mut cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+        let start = tokio::time::Instant::now();
+        let release = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(
+                !admin_provider_pool_sticky_session_init_exists(
+                    app.runtime_state.as_ref(),
+                    "provider-pool",
+                    Some("session-1")
+                )
+                .await
+            );
+            let runtime = read_admin_provider_pool_runtime_state(
+                app.runtime_state.as_ref(),
+                "provider-pool",
+                &[],
+                &config,
+                Some("session-1"),
+            )
+            .await;
+            assert_eq!(runtime.sticky_bound_key_id.as_deref(), Some("key-00000"));
+            active.status = RequestCandidateStatus::Success;
+            active.finished_at_unix_ms = Some(crate::clock::current_unix_ms());
+            candidates.upsert(active).await.expect("finish stream");
+        };
+        let (candidate, ()) = tokio::join!(cursor.next_key(), release);
+        let candidate = candidate.expect("same sticky key");
+        assert_eq!(candidate.candidate.key_id, "key-00000");
+        assert!(!candidate.orchestration.pool_sticky_bound_key_ineligible);
+        assert!(candidate.orchestration.pool_sticky_init_owner.is_none());
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sticky_concurrency_wait_times_out_once_then_falls_back() {
+        let (app, group, _) = sticky_concurrency_fixture(Some(true), 120).await;
+        let mut cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+        let start = tokio::time::Instant::now();
+        let candidate = tokio::time::timeout(
+            app.frontdoor_runtime_guards
+                .local_execution_planning_timeout,
+            cursor.next_key(),
+        )
+        .await
+        .expect("must fall back before the outer planning guard expires")
+        .expect("fallback key after wait budget");
+        assert_eq!(candidate.candidate.key_id, "key-00001");
+        assert_eq!(start.elapsed(), super::POOL_STICKY_CONCURRENCY_WAIT_TIMEOUT);
+        assert!(candidate.orchestration.pool_sticky_bound_key_ineligible);
+        assert_eq!(
+            candidate
+                .orchestration
+                .pool_sticky_bound_key_ineligible_reason
+                .as_deref(),
+            Some("provider_key_concurrency_limit_reached")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sticky_concurrency_wait_respects_shorter_planning_budget() {
+        let (mut app, group, _) = sticky_concurrency_fixture(Some(true), 120).await;
+        app.frontdoor_runtime_guards
+            .local_execution_planning_timeout = Duration::from_secs(2);
+        let mut cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+        let start = tokio::time::Instant::now();
+        let candidate = tokio::time::timeout(
+            app.frontdoor_runtime_guards
+                .local_execution_planning_timeout,
+            cursor.next_key(),
+        )
+        .await
+        .expect("fallback before planning timeout")
+        .expect("fallback account");
+        assert_eq!(candidate.candidate.key_id, "key-00001");
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sticky_concurrency_wait_stops_when_account_enters_cooldown() {
+        let (app, group, _) = sticky_concurrency_fixture(Some(true), 120).await;
+        let config = pool_config_for_candidate(&group).unwrap();
+        let mut cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+        let start = tokio::time::Instant::now();
+        let cooldown = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            record_admin_provider_pool_error(
+                app.runtime_state.as_ref(),
+                "provider-pool",
+                "key-00000",
+                &config,
+                429,
+                None,
+                None,
+            )
+            .await;
+        };
+        let (candidate, ()) = tokio::join!(cursor.next_key(), cooldown);
+        let candidate = candidate.expect("fallback after cooldown");
+        assert_eq!(candidate.candidate.key_id, "key-00001");
+        assert_eq!(
+            candidate
+                .orchestration
+                .pool_sticky_bound_key_ineligible_reason
+                .as_deref(),
+            Some("pool_cooldown")
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sticky_concurrency_wait_cancellation_leaves_binding_and_init_lock_untouched() {
+        let (app, group, _) = sticky_concurrency_fixture(Some(true), 120).await;
+        let config = pool_config_for_candidate(&group).unwrap();
+        let mut cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), cursor.next_key())
+                .await
+                .is_err()
+        );
+        drop(cursor);
+        assert!(
+            !admin_provider_pool_sticky_session_init_exists(
+                app.runtime_state.as_ref(),
+                "provider-pool",
+                Some("session-1")
+            )
+            .await
+        );
+        let runtime = read_admin_provider_pool_runtime_state(
+            app.runtime_state.as_ref(),
+            "provider-pool",
+            &[],
+            &config,
+            Some("session-1"),
+        )
+        .await;
+        assert_eq!(runtime.sticky_bound_key_id.as_deref(), Some("key-00000"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sticky_concurrency_wait_requires_an_enabled_session_binding() {
+        for (ttl, token) in [
+            (0, Some("session-1")),
+            (120, None),
+            (120, Some("new-session")),
+        ] {
+            let (app, group, _) = sticky_concurrency_fixture(Some(true), ttl).await;
+            let mut cursor =
+                PoolKeyCursor::new(PlannerAppState::new(&app), group, token, None, None);
+            let start = tokio::time::Instant::now();
+            assert_eq!(
+                cursor.next_key().await.unwrap().candidate.key_id,
+                "key-00001"
+            );
+            assert_eq!(start.elapsed(), Duration::ZERO);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sticky_concurrency_wait_does_not_wait_for_routing_disallowed_account() {
+        let (app, group, _) = sticky_concurrency_fixture(Some(true), 120).await;
+        let mut cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            group,
+            Some("session-1"),
+            None,
+            None,
+        );
+        cursor.routing_overlay =
+            Some(routing_policy_with_allowed_keys(["key-00001"]).ranking_overlay);
+        let start = tokio::time::Instant::now();
+        let candidate = cursor.next_key().await.expect("allowed fallback");
+        assert_eq!(candidate.candidate.key_id, "key-00001");
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(
+            candidate
+                .orchestration
+                .pool_sticky_bound_key_ineligible_reason
+                .as_deref(),
+            Some(ROUTING_PROFILE_DISALLOWED_KEY_SKIP_REASON)
+        );
     }
 
     #[tokio::test]

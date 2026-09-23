@@ -61,6 +61,7 @@ describe('poolAdvancedDialog', () => {
       'account_self_check_enabled',
       'auto_remove_banned_keys',
       'skip_exhausted_accounts',
+      'sticky_concurrency_wait_enabled',
       'sticky_collateral_avoidance_enabled',
       'avoid_anonymous',
       'codex_quota_weekly_basis',
@@ -93,6 +94,11 @@ describe('poolAdvancedDialog', () => {
         key: 'skip_exhausted_accounts',
         label: '跳过额度耗尽账号',
         description: '当 Codex / Kiro 账号额度已耗尽时，直接标记为不可调度并在请求侧跳过。',
+      },
+      {
+        key: 'sticky_concurrency_wait_enabled',
+        label: '粘性并发等待',
+        description: '需启用会话粘性。原账号并发满时最多等待 15 秒，有空位则复用；超时或账号不可用时按原规则切换。默认关闭，关闭时直接选择其他账号。',
       },
       {
         key: 'sticky_collateral_avoidance_enabled',

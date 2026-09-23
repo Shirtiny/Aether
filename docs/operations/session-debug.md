@@ -587,3 +587,22 @@ Current interpretation:
   2026-06-25 16:56 +08, and check whether candidate/session/failover changes
   caused affected traffic to remain on non-stream Responses providers rather
   than using another working candidate.
+
+## 粘性账号并发等待
+
+号池「高级设置」中的 **粘性并发等待** 对应
+`pool_advanced.sticky_concurrency_wait_enabled`，默认 `false`，不改变已有号池行为。
+
+- 需同时启用会话粘性（`sticky_session_ttl_seconds > 0`），且请求已有会话绑定。
+- 关闭：绑定账号达到单账号并发上限时，立即按原规则选其他账号。
+- 开启：仅在绑定账号因 `provider_key_concurrency_limit_reached` 不可用时，
+  最多等待 15 秒，每 500 毫秒重新读取在途请求、会话绑定和账号状态。
+  等待还受现有调度超时一半的预算约束，给后续选号保留时间，不延长网关超时。
+  原账号释放并发槽后继续使用它；超时后恢复原有选号/重新绑定规则。
+- 冷却、额度耗尽、认证失效或请求不允许使用该账号等情况不等待，仍遵守原有跳过策略。
+- 等待本身不修改会话绑定、不占用粘性初始化锁；客户端取消时可直接取消等待。
+- 这是有界的优先等待，不是永久锁号或全局 FIFO 队列，也不绕过并发上限。
+
+日志事件 `pool_sticky_concurrency_wait_started` 和
+`pool_sticky_concurrency_wait_finished` 可用于确认等待行为；结束结果为
+`available`、`unavailable` 或 `timeout`。更改开关无需数据库迁移或新增环境变量。
