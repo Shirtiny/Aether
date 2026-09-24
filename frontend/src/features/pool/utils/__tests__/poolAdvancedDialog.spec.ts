@@ -21,14 +21,43 @@ describe('poolAdvancedDialog', () => {
     expect(profiles.every(profile => /\/0\.153\./.test(profile.user_agent))).toBe(true)
   })
 
-  it('rejects incomplete or duplicate Codex client header rows', () => {
+  it('rejects incomplete Codex client header rows', () => {
     expect(() => buildCodexClientHeadersConfig(true, [
       { user_agent: 'codex-tui/0.151.0', originator: '' },
     ])).toThrow('第 1 组')
     expect(() => buildCodexClientHeadersConfig(true, [
       { user_agent: 'codex-tui/0.151.0', originator: 'codex-tui' },
       { user_agent: ' codex-tui/0.151.0 ', originator: 'codex-tui' },
-    ])).toThrow('重复')
+      { user_agent: '   ', originator: 'codex-tui' },
+    ])).toThrow('第 3 组')
+    expect(() => buildCodexClientHeadersConfig(true, [
+      { user_agent: 'codex-tui/0.151.0', originator: '   ' },
+    ])).toThrow('第 1 组')
+  })
+
+  it.each([true, false])('preserves repeated Codex header rows when enabled=%s', (enabled) => {
+    const profile = { user_agent: 'codex-tui/0.153.4', originator: 'codex-tui' }
+    const other = { user_agent: 'codex_cli_rs/0.153.4', originator: 'codex_cli_rs' }
+    const profiles = [
+      profile,
+      { user_agent: ` ${profile.user_agent} `, originator: ` ${profile.originator} ` },
+      other,
+      { ...profile },
+    ]
+    const original = profiles.map(item => ({ ...item }))
+
+    expect(buildCodexClientHeadersConfig(enabled, profiles)).toEqual({
+      enabled,
+      profiles: [profile, profile, other, profile],
+    })
+    expect(profiles).toEqual(original)
+  })
+
+  it('keeps empty Codex header lists on the built-in defaults', () => {
+    expect(buildCodexClientHeadersConfig(true, [])).toEqual({
+      enabled: true,
+      profiles: undefined,
+    })
   })
 
   it('builds the Codex runtime identity switch with backend-aligned bounds', () => {

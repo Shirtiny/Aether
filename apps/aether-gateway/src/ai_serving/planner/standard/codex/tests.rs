@@ -711,29 +711,76 @@ fn builtin_codex_client_header_profiles_use_current_observed_versions() {
 }
 
 #[test]
-fn codex_client_header_refresh_config_rejects_incomplete_duplicate_or_disabled_profiles() {
+fn codex_client_header_refresh_config_accepts_repeated_profiles() {
     assert!(super::validate_codex_client_header_config(&json!({
         "enabled": true,
         "profiles": [
-            {"user_agent": "codex-tui/0.151.0", "originator": "codex-tui"}
+            {"user_agent": "codex-tui/0.153.4", "originator": "codex-tui"},
+            {"user_agent": " codex-tui/0.153.4 ", "originator": " codex-tui "},
+            {"user_agent": "codex_cli_rs/0.153.4", "originator": "codex_cli_rs"},
+            {"user_agent": "codex-tui/0.153.4", "originator": "codex-tui"}
         ]
     }))
     .is_ok());
+}
+
+#[test]
+fn codex_client_header_refresh_config_rejects_malformed_incomplete_or_disabled_profiles() {
     for invalid in [
+        json!(null),
         json!({"enabled": false}),
+        json!({"enabled": "true"}),
+        json!({"profiles": {}}),
+        json!({"profiles": [null]}),
+        json!({"profiles": [{"user_agent": 123, "originator": "codex-tui"}]}),
+        json!({"profiles": [{"user_agent": "   ", "originator": "codex-tui"}]}),
         json!({
             "enabled": true,
             "profiles": [{"user_agent": "codex-tui/0.151.0", "originator": ""}]
         }),
         json!({
             "enabled": true,
-            "profiles": [
-                {"user_agent": "codex-tui/0.151.0", "originator": "codex-tui"},
-                {"user_agent": " codex-tui/0.151.0 ", "originator": "codex-tui"}
-            ]
+            "profiles": [{"user_agent": "codex-tui/0.151.0", "originator": "   "}]
         }),
     ] {
         assert!(super::validate_codex_client_header_config(&invalid).is_err());
+    }
+}
+
+#[test]
+fn codex_client_header_refresh_config_accepts_builtin_defaults() {
+    for valid in [
+        json!({}),
+        json!({"enabled": true}),
+        json!({"profiles": null}),
+        json!({"profiles": []}),
+    ] {
+        assert!(super::validate_codex_client_header_config(&valid).is_ok());
+    }
+}
+
+#[test]
+fn codex_pool_repeated_client_headers_preserve_account_selection() {
+    let profiles = json!([
+        {"user_agent": "codex-tui/0.153.4", "originator": "codex-tui"},
+        {"user_agent": "codex_cli_rs/0.153.4", "originator": "codex_cli_rs"}
+    ]);
+    let unique = super::parse_codex_client_header_profiles(&profiles).unwrap();
+    let repeated = super::parse_codex_client_header_profiles(&json!([
+        profiles[0],
+        profiles[1],
+        {"user_agent": " codex-tui/0.153.4 ", "originator": " codex-tui "},
+        profiles[1],
+        profiles[0]
+    ]))
+    .unwrap();
+    assert_eq!(repeated.len(), 5);
+    for index in 0..100 {
+        let key = format!("account-{index}");
+        assert_eq!(
+            unique[super::stable_index_for_key(&key, &unique)],
+            repeated[super::stable_index_for_key(&key, &repeated)],
+        );
     }
 }
 

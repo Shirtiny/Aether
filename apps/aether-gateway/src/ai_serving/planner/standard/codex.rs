@@ -2,7 +2,7 @@
 #[path = "codex/tests.rs"]
 mod tests;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{LazyLock, OnceLock};
 use std::time::SystemTime;
 
@@ -451,26 +451,23 @@ pub(crate) fn validate_codex_client_header_config(value: &Value) -> Result<(), S
     let profiles = profiles
         .as_array()
         .ok_or_else(|| "codex_client_headers.profiles 必须是数组".to_string())?;
-    let mut seen = BTreeSet::new();
+    // Equal profiles have equal selection scores; repeated rows are valid.
     for (index, profile) in profiles.iter().enumerate() {
         let profile = profile
             .as_object()
             .ok_or_else(|| format!("第 {} 组 Codex 请求头必须是对象", index + 1))?;
-        let user_agent = profile
+        profile
             .get("user_agent")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| format!("第 {} 组 User-Agent 不能为空", index + 1))?;
-        let originator = profile
+        profile
             .get("originator")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| format!("第 {} 组 Originator 不能为空", index + 1))?;
-        if !seen.insert((user_agent, originator)) {
-            return Err(format!("第 {} 组 Codex 请求头与已有配置重复", index + 1));
-        }
     }
     Ok(())
 }

@@ -25,14 +25,7 @@ export function buildCodexClientHeadersConfig(
   if (invalidIndex >= 0) {
     throw new Error(`第 ${invalidIndex + 1} 组 User-Agent 和 Originator 必须同时填写`)
   }
-  const seen = new Set<string>()
-  for (const [index, profile] of normalized.entries()) {
-    const identity = `${profile.user_agent}\u0000${profile.originator}`
-    if (seen.has(identity)) {
-      throw new Error(`第 ${index + 1} 组 Codex 请求头与已有配置重复`)
-    }
-    seen.add(identity)
-  }
+  // Shared client headers are valid; preserve repeated rows instead of blocking saves.
   return {
     enabled,
     profiles: normalized.length > 0 ? normalized : undefined,
