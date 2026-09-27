@@ -10,7 +10,7 @@ services:
       POSTGRES_DB: aether
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${DB_PASSWORD}
-      TZ: America/New_York
+      TZ: Europe/Amsterdam
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
@@ -65,7 +65,7 @@ services:
       MYSQL_USER: ${MYSQL_USER:-aether}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-aether}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-aether_root}
-      TZ: America/New_York
+      TZ: Europe/Amsterdam
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
@@ -94,7 +94,7 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@postgres:5432/aether
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
-      TZ: America/New_York
+      TZ: Europe/Amsterdam
       AETHER_BASE_DIR: /opt/aether
       AETHER_UPDATE_STRATEGY: docker
       AETHER_DOCKER_UPDATE_COMMAND: ${AETHER_DOCKER_UPDATE_COMMAND:-./update.sh}
